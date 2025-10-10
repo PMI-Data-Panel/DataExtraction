@@ -1,0 +1,44 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.1
+    container_name: elasticsearch_service
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - elastic-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  api:
+    build: .
+    container_name: rag_api_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - PYTHONPATH=/app
+    networks:
+      - elastic-net
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+volumes:
+  esdata:
+    driver: local
+
+networks:
+  elastic-net:
+    driver: bridge

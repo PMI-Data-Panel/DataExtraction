@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+elasticsearch
+pandas
+
+# RAG Analyzer Dependencies
+anthropic>=0.18.0
+python-dotenv>=1.0.0
+sentence-transformers
+torch>=2.0.0
