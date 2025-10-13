@@ -57,11 +57,11 @@ class QueryOptimizer:
             logger.error(f"로그 저장 실패: {e}")
     
     def log_performance(self,
-                       query: str,
-                       analysis: QueryAnalysis,
-                       results: List[SearchResult],
-                       user_feedback: Optional[float] = None,
-                       auto_evaluated: bool = True):
+                    query: str,
+                    analysis: QueryAnalysis,
+                    results: List[SearchResult],
+                    user_feedback: Optional[float] = None,
+                    auto_evaluated: bool = True):
         """쿼리 성능 로깅
         
         Args:
@@ -118,7 +118,7 @@ class QueryOptimizer:
         # 2. 리랭킹 점수 분포 평가 (30%)
         if results and results[0].rerank_score is not None:
             rerank_scores = [r.rerank_score for r in results[:5] 
-                           if r.rerank_score is not None]
+                        if r.rerank_score is not None]
             if len(rerank_scores) > 1:
                 score_variance = np.var(rerank_scores)
                 # 분산이 적당히 있으면 좋음 (너무 작거나 크면 안좋음)
@@ -191,8 +191,8 @@ class QueryOptimizer:
                 keyword_freq[keyword] = keyword_freq.get(keyword, 0) + score
         
         suggested_keywords = sorted(keyword_freq.items(), 
-                                   key=lambda x: x[1], 
-                                   reverse=True)[:10]
+                                key=lambda x: x[1], 
+                                reverse=True)[:10]
         
         logger.info(f"🎯 유사 쿼리 {len(top_logs)}개 발견")
         

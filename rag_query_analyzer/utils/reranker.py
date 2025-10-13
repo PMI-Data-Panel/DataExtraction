@@ -45,9 +45,9 @@ class Reranker:
             logger.warning("⚠️ 모든 리랭킹 모델 로딩 실패")
     
     def rerank(self, 
-               query: str, 
-               results: List[SearchResult], 
-               top_k: Optional[int] = None) -> List[SearchResult]:
+            query: str, 
+            results: List[SearchResult], 
+            top_k: Optional[int] = None) -> List[SearchResult]:
         """검색 결과 리랭킹
         
         Args:

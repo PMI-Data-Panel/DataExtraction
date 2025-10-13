@@ -1,6 +1,7 @@
+from ast import Attribute
 import logging
 from typing import Dict, List, Tuple, Optional
-from ..models.entities import Entity, Relationship, Metric
+from ..models.entities import AttributeType, Entity, Relationship, Metric
 
 logger = logging.getLogger(__name__)
 
@@ -18,13 +19,46 @@ class SemanticModel:
         self._init_intent_patterns()
         self._init_metrics()
         logger.info("SemanticModel 초기화 완료")
+        
+    def get_attribute_by_name(self, name: str) -> Optional[Attribute]:
+        for entity in self.entities.values():
+            for attr in entity.attributes:
+                if attr.name.lower() == name.lower():
+                    return attr
+        return None
     
     def _init_entities(self):
         """엔티티 정의"""
         self.entities = {
             "respondent": Entity(
                 name="응답자",
-                attributes=["나이", "성별", "지역", "직업", "소득", "학력", "결혼상태", "가구구성"],
+                # "나이", "성별", "지역", "직업", "소득", "학력", "결혼상태", "가구구성"
+                attributes=[
+                    Attribute(name="결혼여부", attribute_type=AttributeType.CATEGORICAL, is_nested=True,
+                    nested_path="qa_pairs", identifier_field="qa_pairs.q_text",
+                    value_field="qa_pairs.answer_text.keyword"),
+                    
+                    Attribute(name="직업", attribute_type=AttributeType.CATEGORICAL, is_nested=True,
+                    nested_path="qa_pairs", identifier_field="qa_pairs.q_text",
+                    value_field="qa_pairs.answer_text.keyword"),
+                    
+                    Attribute(name="소득", attribute_type=AttributeType.CATEGORICAL, is_nested=True,
+                    nested_path="qa_pairs", identifier_field="qa_pairs.q_text",
+                    value_field="qa_pairs.answer_text.keyword"),
+                    
+                    Attribute(name="학력", attribute_type=AttributeType.CATEGORICAL, is_nested=True,
+                    nested_path="qa_pairs", identifier_field="qa_pairs.q_text",
+                    value_field="qa_pairs.answer_text.keyword"),
+                    
+                    Attribute(name="결혼상태", attribute_type=AttributeType.CATEGORICAL, is_nested=True,
+                    nested_path="qa_pairs", identifier_field="qa_pairs.q_text",
+                    value_field="qa_pairs.answer_text.keyword"),
+                    
+                    Attribute(name="가구구성", attribute_type=AttributeType.CATEGORICAL, is_nested=True,
+                    nested_path="qa_pairs", identifier_field="qa_pairs.q_text",
+                    value_field="qa_pairs.answer_text.keyword"),
+                    
+                ],
                 synonyms=["참가자", "설문자", "응답인", "피조사자", "참여자", "조사대상자"],
                 weight=1.0,
                 description="설문조사에 참여한 사람"

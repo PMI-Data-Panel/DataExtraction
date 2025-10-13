@@ -1,36 +1,64 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Any, Optional
 from datetime import datetime
+from enum import Enum
+
+
+# 필터의 종류(AND, OR, NOT)를 명시하기 위한 Enum
+class FilterClause(Enum):
+    MUST = "must"          # AND 조건
+    SHOULD = "should"        # OR 조건
+    MUST_NOT = "must_not"    # NOT 조건
+
+
+# 필터의 연산자(term, range 등)를 명시하기 위한 Enum
+class FilterOperator(Enum):
+    TERM = "term"          # 정확히 일치 (Categorical 데이터용)
+    RANGE = "range"        # 범위 (Numerical, Date 데이터용)
+    MATCH = "match"        # 전문 검색 (Text 데이터용)
+
+
+# 구조화된 검색 필터를 정의하기 위한 클래스
+@dataclass
+class FilterCondition:
+    """
+    Elasticsearch 필터 조건을 명확하게 정의하는 데이터 클래스.
+    "나이가 30대 이상"과 같은 조건을 기계가 이해할 수 있도록 구조화합니다.
+    """
+    field: str                      # 필터링할 대상 필드 (예: "age", "region.keyword")
+    operator: FilterOperator        # 사용할 연산자 (term, range 등)
+    value: Any                      # 필터링할 값 (예: "서울", {"gte": 30, "lt": 40})
+    clause: FilterClause = FilterClause.MUST # 기본값은 AND 조건
 
 
 @dataclass
 class QueryAnalysis:
     """쿼리 분석 결과를 담는 데이터 클래스"""
     
-    # 기본 분석 결과
+    # 기본 분석 결과 필터는 구조화된 객체로 관리
     intent: str                              # 검색 의도: exact_match, semantic_search, hybrid
     must_terms: List[str]                    # AND 조건 키워드
     should_terms: List[str]                  # OR 조건 키워드
     must_not_terms: List[str]                # 제외 키워드
-    
-    # 검색 파라미터
-    alpha: float                              # 하이브리드 검색 가중치 (0: 키워드, 1: 벡터)
-    
-    # 확장 정보
     expanded_keywords: Dict[str, List[str]]  # 키워드별 확장어
-    confidence: float                         # 분석 신뢰도 (0-1)
-    explanation: str                          # 분석 설명
     
+    filters: List[FilterCondition] = field(default_factory=list) # 구조화된 필터 조건
+    keywords: List[str] = field(default_factory=list)           # 전문 검색용 키워드
+    # 검색 파라미터
+    alpha: float = 0.5                            # 하이브리드 검색 가중치 (0: 키워드, 1: 벡터)
+    # 확장 정보
+    confidence: float = 1.0                    # 분석 신뢰도 (0-1)
+    explanation: str = ""                        # 분석 설명
     # 추가 메타데이터
     reasoning_steps: List[str] = field(default_factory=list)    # CoT 추론 과정
     rewritten_queries: List[str] = field(default_factory=list)  # 재작성된 쿼리들
     semantic_intent: str = "unknown"         # 의미론적 의도
     execution_time: float = 0.0              # 실행 시간 (초)
-    
     # 분석 메타데이터
     analyzer_used: str = ""                  # 사용된 분석기
     fallback_used: bool = False              # 폴백 사용 여부
     cache_hit: bool = False                  # 캐시 히트 여부
+    target_metric: Optional[str] = None # 계산해야 할 Metric의 이름
     
     def to_dict(self) -> dict:
         """딕셔너리로 변환"""
@@ -66,8 +94,6 @@ class QueryAnalysis:
         
         # 재작성 쿼리 추가
         self.rewritten_queries.extend(other.rewritten_queries)
-
-
 @dataclass
 class SearchResult:
     """검색 결과를 담는 데이터 클래스"""
@@ -102,3 +128,28 @@ class SearchResult:
             "answers": self.answers,
             "metadata": self.metadata
         }
+        
+
+
+# 집계(Aggregation) 결과를 담기 위한 클래스
+@dataclass
+class AggregationResult:
+    """
+    집계 분석 결과를 담는 데이터 클래스.
+    "평균 나이: 35.2세", "상위 활동: 달리기(500명)"와 같은 결과를 담습니다.
+    """
+    name: str              # 집계의 이름 (예: "average_age", "top_activities")
+    value: Any             # 집계 결과 값 (예: 35.2, [{"key": "달리기", "doc_count": 500}])
+
+
+# 모든 종류의 시스템 응답을 통합 관리하는 클래스
+@dataclass
+class SystemResponse:
+    """
+    RAG 시스템의 최종 응답을 통합적으로 담는 클래스.
+    문서 검색 결과와 집계 분석 결과를 모두 포함할 수 있습니다.
+    """
+    analysis: QueryAnalysis
+    documents: List[SearchResult] = field(default_factory=list)
+    aggregations: Dict[str, AggregationResult] = field(default_factory=dict)
+    final_answer: str = "결과를 찾았습니다." # LLM이 생성한 최종 자연어 답변

@@ -21,8 +21,8 @@ class QueryExpander:
         logger.info("QueryExpander 초기화 완료")
     
     def expand_with_context(self, 
-                           query: str, 
-                           survey_metadata: Dict = None) -> str:
+                        query: str, 
+                        survey_metadata: Dict = None) -> str:
         """설문 메타데이터를 활용한 쿼리 확장
         
         Args:

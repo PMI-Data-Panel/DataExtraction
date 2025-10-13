@@ -23,8 +23,8 @@ class MultiStepQueryRewriter:
         logger.info("MultiStepQueryRewriter 초기화 완료")
     
     def rewrite_query(self, 
-                     original_query: str, 
-                     survey_context: str = "") -> List[Tuple[str, str]]:
+                    original_query: str, 
+                    survey_context: str = "") -> List[Tuple[str, str]]:
         """원본 쿼리를 여러 변형으로 재작성
         
         Args:
@@ -81,8 +81,8 @@ class MultiStepQueryRewriter:
         return self._call_claude(prompt, max_tokens=300)
     
     def _rewrite_perspectives(self, 
-                             query: str, 
-                             context: str) -> List[Tuple[str, str]]:
+                            query: str, 
+                            context: str) -> List[Tuple[str, str]]:
         """다양한 관점에서 쿼리 재작성"""
         perspectives = [
             ("demographic", "인구통계학적 조건(나이, 성별, 지역, 직업 등)으로"),

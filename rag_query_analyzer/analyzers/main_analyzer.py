@@ -19,7 +19,7 @@ from ..core import (
 )
 from ..utils import Reranker, ElasticsearchQueryBuilder
 from ..config import Config
-
+import json 
 logger = logging.getLogger(__name__)
 
 
@@ -81,9 +81,9 @@ class AdvancedRAGQueryAnalyzer:
         ]
     
     def analyze_query(self, 
-                     query: str, 
-                     context: str = "",
-                     metadata: Dict = None) -> QueryAnalysis:
+                    query: str, 
+                    context: str = "",
+                    metadata: Dict = None) -> QueryAnalysis:
         """쿼리 분석 (메인 엔트리 포인트)
         
         Args:
@@ -154,9 +154,9 @@ class AdvancedRAGQueryAnalyzer:
         return self._create_default_analysis(query)
     
     def analyze_with_rewriting(self, 
-                              query: str, 
-                              context: str = "",
-                              metadata: Dict = None) -> Tuple[QueryAnalysis, List[str]]:
+                            query: str, 
+                            context: str = "",
+                            metadata: Dict = None) -> Tuple[QueryAnalysis, List[str]]:
         """쿼리 재작성을 포함한 종합 분석
         
         Args:
@@ -188,9 +188,9 @@ class AdvancedRAGQueryAnalyzer:
         return main_analysis, main_analysis.rewritten_queries
     
     def rerank_results(self, 
-                      query: str, 
-                      results: List[SearchResult],
-                      top_k: Optional[int] = None) -> List[SearchResult]:
+                    query: str, 
+                    results: List[SearchResult],
+                    top_k: Optional[int] = None) -> List[SearchResult]:
         """검색 결과 리랭킹
         
         Args:
@@ -207,10 +207,10 @@ class AdvancedRAGQueryAnalyzer:
         return self.reranker.rerank(query, results, top_k)
     
     def build_search_query(self, 
-                         analysis: QueryAnalysis,
-                         query_vector: Optional[List[float]] = None,
-                         size: Optional[int] = None,
-                         filters: List[Dict] = None) -> Dict:
+                        analysis: QueryAnalysis,
+                        query_vector: Optional[List[float]] = None,
+                        size: Optional[int] = None,
+                        filters: List[Dict] = None) -> Dict:
         """Elasticsearch 검색 쿼리 구성
         
         Args:
@@ -225,16 +225,21 @@ class AdvancedRAGQueryAnalyzer:
         if size is None:
             size = self.config.INITIAL_SEARCH_SIZE
 
-        return self.es_query_builder.build_complete_request(
+        # 1. 쿼리 빌더를 호출하여 최종 ES 쿼리를 변수에 저장합니다.
+        es_query = self.es_query_builder.build_complete_request(
             analysis=analysis,
             query_vector=query_vector,
             size=size,
             filters=filters
         )
+        logger.info(f"Final Elasticsearch Query Generated:\n{json.dumps(es_query, indent=2, ensure_ascii=False)}")
+
+        return es_query
+
     
     async def analyze_batch_async(self, 
-                                 queries: List[str],
-                                 context: str = "") -> List[QueryAnalysis]:
+                                queries: List[str],
+                                context: str = "") -> List[QueryAnalysis]:
         """배치 쿼리 비동기 분석
         
         Args:
@@ -266,10 +271,10 @@ class AdvancedRAGQueryAnalyzer:
         return results
     
     def log_performance(self, 
-                       query: str,
-                       analysis: QueryAnalysis,
-                       results: List[SearchResult],
-                       user_feedback: Optional[float] = None):
+                    query: str,
+                    analysis: QueryAnalysis,
+                    results: List[SearchResult],
+                    user_feedback: Optional[float] = None):
         """성능 로깅
         
         Args:

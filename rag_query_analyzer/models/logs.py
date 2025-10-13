@@ -1,32 +1,35 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 
 @dataclass
 class QueryPerformanceLog:
     """쿼리 성능 로그를 담는 데이터 클래스"""
     
-    # 쿼리 정보
+    session_id: str                          # 동일 사용자의 연속된 질문을 묶기 위한 ID
+    result_quality: float                    # 시스템 자체 평가 결과 품질 (0-1)
+    total_execution_time: float              # 총 소요 시간 (초)
     query: str                               # 원본 쿼리
-    intent: str                              # 분석된 의도
-    alpha: float                             # 사용된 alpha 값
-    keywords: List[str]                      # 사용된 키워드
+    user_id: Optional[str] = None            # 사용자 식별자
+    app_version: str = "1.0.0"               # 로그가 기록될 당시의 애플리케이션 버전
+
+    # QueryAnalysis 객체를 to_dict()로 변환하여 저장
+    analysis_plan: Dict[str, Any] = field(default_factory=dict)
+    performance_breakdown: Dict[str, float] = field(default_factory=dict)
     
-    # 성능 정보
-    result_quality: float                    # 결과 품질 (0-1)
-    timestamp: datetime                      # 실행 시간
-    execution_time: float                    # 소요 시간 (초)
-    
-    # 평가 정보
-    auto_evaluated: bool = False             # 자동 평가 여부
+    # --- 평가 정보 ---
     user_feedback: Optional[float] = None    # 사용자 피드백 (0-1)
-    
-    # 추가 정보
-    result_count: int = 0                    # 결과 수
-    cache_hit: bool = False                  # 캐시 히트 여부
-    error: Optional[str] = None              # 에러 메시지
-    
+
+    # --- 최종 결과 요약 ---
+    final_answer_snippet: str = ""           # 생성된 최종 답변의 일부 (앞 100자)
+
+    # --- 추가 메타데이터 ---
+    timestamp: datetime = field(default_factory=datetime.now)
+    result_count: int = 0
+    cache_hit: bool = False
+    error: Optional[str] = None
+
     def to_dict(self) -> dict:
         """딕셔너리로 변환 (JSON 직렬화용)"""
         return {

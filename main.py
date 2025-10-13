@@ -4,6 +4,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Depends
 from elasticsearch import Elasticsearch
 from sentence_transformers import SentenceTransformer
+import uvicorn
 
 # RAG Analyzer 모듈에서 핵심 컴포넌트들을 가져옵니다.
 from rag_query_analyzer.config import get_config, Config
@@ -41,7 +42,7 @@ except Exception as e:
     raise
 
 # --- FastAPI 시작 이벤트 ---
-@app.on_event("startup")
+@app.post("startup")
 async def startup_event():
     """애플리케이션 시작 시 데이터 자동 색인"""
     index_name = "survey_responses" # 고정된 인덱스 이름
@@ -97,7 +98,7 @@ def read_root():
 @app.get("/intelligent-search/", summary="지능형 설문 검색")
 def intelligent_search(
     query: str,
-    index_name: str = "survey_responses", # 기본 인덱스 이름 고정
+    index_name: str = "survey_responses_30000", 
     context: str = "",
     cfg: Config = Depends(get_config)
 ):
@@ -175,6 +176,5 @@ def system_status(cfg: Config = Depends(get_config)):
     }
 
 if __name__ == "__main__":
-    import uvicorn
     logger.info("🚀 FastAPI 서버를 시작합니다...")
     uvicorn.run(app, host="0.0.0.0", port=8000)

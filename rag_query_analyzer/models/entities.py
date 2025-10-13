@@ -1,7 +1,33 @@
 from dataclasses import dataclass
 from typing import List, Optional
+from enum import Enum
 
-
+# 속성의 데이터 타입을 정의하기 위한 Enum 클래스
+class AttributeType(Enum):
+    """
+    엔티티 속성의 데이터 타입을 정의합니다.
+    이 정보는 Elasticsearch 쿼리 생성 시 매우 중요하게 사용됩니다.
+    - CATEGORICAL: '서울', '여성' 처럼 정확히 일치하는 값을 필터링 (term 쿼리용)
+    - NUMERICAL: '나이', '점수' 처럼 범위로 필터링 (range 쿼리용)
+    - DATE: 날짜/시간을 기준으로 필터링 (date_range 쿼리용)
+    """
+    CATEGORICAL = "categorical"
+    NUMERICAL = "numerical"
+    DATE = "date"
+    
+# 속성을 더 구체적으로 정의하기 위한 클래스
+@dataclass
+class Attribute:
+    """엔티티의 개별 속성을 구체적으로 정의합니다."""
+    name: str                   # 속성의 이름 (예: "나이", "지역")
+    attribute_type: AttributeType # 속성의 데이터 타입 (쿼리 생성의 핵심)
+    field_name: str             # Elasticsearch에 저장된 실제 필드 이름 (예: "age", "region.keyword")
+    description: str = ""       # 속성에 대한 설명
+    
+    is_nested: bool = False             # 이 속성이 nested 필드 안에 있는지 여부
+    nested_path: Optional[str] = None   # nested 필드의 경로 (예: "qa_pairs")
+    identifier_field: Optional[str] = None # 속성을 식별하는 필드 (예: "qa_pairs.q_text")
+    value_field: Optional[str] = None      # 실제 값이 담긴 필드 (예: "qa_pairs.answer_text")
 @dataclass
 class Entity:
     """의미론적 모델의 엔티티
@@ -10,7 +36,7 @@ class Entity:
     예: '응답자', '응답', '행동' 등
     """
     name: str                    # 엔티티 이름
-    attributes: List[str]        # 엔티티의 속성들
+    attributes: List[Attribute]      # 엔티티의 속성들
     synonyms: List[str]          # 동의어/유사어
     weight: float = 1.0          # 중요도 가중치 (0-1)
     description: str = ""        # 설명
@@ -32,9 +58,9 @@ class Entity:
             if synonym.lower() in text_lower:
                 return True
         
-        # 속성 매칭
+        # 속성 '이름'으로 매칭 확인
         for attr in self.attributes:
-            if attr.lower() in text_lower:
+            if attr.name.lower() in text_lower:
                 return True
         
         return False
@@ -75,9 +101,9 @@ class Metric:
     """
     name: str                    # 메트릭 이름
     calculation: str             # 계산 방법 설명
+    aggregation_type:str        # 집계 유형 (avg, sum, count, etc.)
     related_entities: List[str]  # 관련 엔티티들
     unit: str = ""              # 단위 (%, 점 등)
-    aggregation_type: str = "avg"  # 집계 유형 (avg, sum, count, etc.)
     
     def requires_entity(self, entity: str) -> bool:
         """특정 엔티티가 필요한지 확인"""
