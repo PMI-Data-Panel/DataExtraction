@@ -8,7 +8,10 @@ from ..config import Config
 logger = logging.getLogger(__name__)
 
 
-class SemanticAnalyzer(BaseAnalyzer):
+class SemanticAnalyzer(BaseAnalyzer):  # 전부다 벡터값을 넣는게 아니니까 벡터값이 없는 거는 어떻게 하지?? 라는 의문 
+    # 그럼 다시 제조명해야 하는게 주관식과 객관식, 주관식 벡터로만!! 좋았다!! 주관식하고 객관식을 나눌 수 있지 않을까?? 
+    # 주관식은 필요하지 않아?? - 그거는 해봐야 할 것 같기한데 ㅇㅋㅇㅋ 벡터값이 없는 걸로!!한번 해보고 
+    # 그럼 코드방향성을 테스트할 수 있게끔 여려 가지로 만들어야 겠네 (벡터 없이도, 벡터넣어서도 해보고 )
     """의미론적 모델 기반 분석기
     
     도메인 지식을 활용하여 쿼리를 분석합니다.

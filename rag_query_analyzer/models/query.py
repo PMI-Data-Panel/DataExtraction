@@ -9,7 +9,7 @@ class QueryAnalysis:
     
     # 기본 분석 결과
     intent: str                              # 검색 의도: exact_match, semantic_search, hybrid
-    must_terms: List[str]                    # AND 조건 키워드
+    must_terms: List[str]                    # AND 조건 키워드  고민중!!
     should_terms: List[str]                  # OR 조건 키워드
     must_not_terms: List[str]                # 제외 키워드
     
