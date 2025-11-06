@@ -112,6 +112,7 @@ class QueryExpander:
             
             # 표준 확장 패턴
             standard_expansions = {
+                #question_list csv 파일 -  저도주 관련, 직업(서비스,직업)
                 # 나이 관련
                 "20대": ["20-29", "이십대", "20세~29세", "twenties"],
                 "30대": ["30-39", "삼십대", "30세~39세", "thirties"],
