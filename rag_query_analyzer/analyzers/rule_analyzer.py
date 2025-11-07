@@ -18,6 +18,8 @@ class RuleBasedAnalyzer(BaseAnalyzer):
         """초기화"""
         self.patterns = self._init_patterns()
         self.keyword_expansions = self._init_keyword_expansions()
+        self.meta_keywords = self._init_meta_keywords()
+        self.demographic_keywords = self._init_demographic_keywords()
         logger.info("RuleBasedAnalyzer 초기화 완료 (강화됨)")
     
     def get_name(self) -> str:
@@ -83,6 +85,38 @@ class RuleBasedAnalyzer(BaseAnalyzer):
             "가끔": ["때때로", "종종", "sometimes"]
         }
     
+    def _init_meta_keywords(self) -> set:
+        """메타 키워드 (검색 조건에서 제외)"""
+        return {
+            '설문조사', '설문', '데이터', '자료', '정보',
+            '보여줘', '보여주세요', '알려줘', '알려주세요',
+            '검색', '찾아줘', '찾아주세요', '조회',
+            '을', '를', '이', '가', '의', '에', '에서',
+            '와', '과', '에게', '한테', '명', '개', '건',
+            '사람', '인', '분', '중', '중에', '중에서'
+        }
+    
+    def _init_demographic_keywords(self) -> set:
+        """Demographics 키워드 (must 조건으로만 가야 함)"""
+        return {
+            # 연령
+            '10대', '20대', '30대', '40대', '50대', '60대', '70대',
+            '10-19', '20-29', '30-39', '40-49', '50-59', '60-69', '70-79',
+            '십대', '이십대', '삼십대', '사십대', '오십대', '육십대', '칠십대',
+            # 성별
+            '남성', '여성', '남자', '여자', '남', '여',
+            # 직업
+            '사무직', '전문직', '서비스직', '학생', '주부', '자영업',
+            '직장인', '생산직', '무직', '프리랜서', '사무원', '화이트칼라',
+            '대학생', '고등학생', '소상공인', '의사', '변호사', '회계사',
+            '서비스업', '판매직', '영업', '블루칼라',
+            # 지역
+            '서울', '부산', '대구', '인천', '광주', '대전', '울산',
+            '경기', '강원', '충북', '충남', '전북', '전남', '경북', '경남', '제주', '세종',
+            # 기타
+            '미혼', '기혼', '싱글', '결혼'
+        }
+    
     def analyze(self, query: str, context: str = "") -> QueryAnalysis:
         """강화된 규칙 기반 쿼리 분석
 
@@ -119,8 +153,12 @@ class RuleBasedAnalyzer(BaseAnalyzer):
 
                 intent_hints.append(pattern_info["type"])
 
-        # 추가 키워드 추출 (패턴 외)
-        additional_terms = self._extract_additional_keywords(query, must_terms)
+        # Demographics 키워드 분리 (must_terms에서 제거, 필터로만 처리)
+        demographic_terms = [t for t in must_terms if t in self.demographic_keywords]
+        must_terms = [t for t in must_terms if t not in self.demographic_keywords]
+        
+        # 추가 키워드 추출 (패턴 외, Demographics 제외)
+        additional_terms = self._extract_additional_keywords(query, must_terms + demographic_terms)
         must_terms.extend(additional_terms)
 
         # 의도 결정
@@ -150,30 +188,26 @@ class RuleBasedAnalyzer(BaseAnalyzer):
         )
 
     def _extract_additional_keywords(self, query: str, existing_terms: List[str]) -> List[str]:
-        """패턴 외 추가 키워드 추출"""
-        # 의미 있는 명사 추출 (간단한 휴리스틱)
+        """패턴 외 추가 키워드 추출
+        
+        Demographics와 메타 키워드 제외
+        """
         additional = []
-
-        # 불용어 제거
-        stop_words = ['사람', '인', '분', '중', '중에', '중에서', '의', '를', '을', '이', '가']
-
-        words = query.split()
-        for word in words:
-            # 이미 추출된 키워드는 스킵
-            if word in existing_terms:
+        
+        # 토큰화 (한글 단어 단위로 분리)
+        tokens = re.findall(r'\w+', query)
+        
+        for token in tokens:
+            # 제외 조건
+            if (token in existing_terms or 
+                token in self.meta_keywords or 
+                token in self.demographic_keywords or
+                len(token) <= 1):
                 continue
-
-            # 불용어는 스킵
-            if word in stop_words:
-                continue
-
-            # 너무 짧은 단어 스킵
-            if len(word) < 2:
-                continue
-
-            # 의미 있는 키워드로 판단
-            additional.append(word)
-
+            
+            additional.append(token)
+        
+        logger.info(f"🔑 실제 검색 키워드 (Demographics 제외): {additional}")
         return additional
     
     def _determine_intent(self, hints: List[str]) -> str:

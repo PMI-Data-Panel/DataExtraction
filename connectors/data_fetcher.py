@@ -26,7 +26,8 @@ class DataFetcher:
         self,
         index_name: str,
         query: Dict[str, Any],
-        size: int = 10
+        size: int = 10,
+        source_filter: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         OpenSearch에서 검색
@@ -35,6 +36,7 @@ class DataFetcher:
             index_name: 인덱스 이름
             query: OpenSearch 쿼리 DSL
             size: 반환할 문서 개수
+            source_filter: _source 필터링 (예: {"includes": ["user_id", "metadata"], "excludes": ["qa_pairs"]})
 
         Returns:
             검색 결과
@@ -47,9 +49,15 @@ class DataFetcher:
             import json
             logger.info(f"🔍 OpenSearch 쿼리:\n{json.dumps(query, indent=2, ensure_ascii=False)}")
 
+            # _source 필터링 추가
+            search_body = query.copy()
+            if source_filter:
+                search_body["_source"] = source_filter
+                logger.debug(f"  📋 _source 필터링 적용: {source_filter}")
+
             response = self.os_client.search(
                 index=index_name,
-                body=query
+                body=search_body
             )
 
             logger.info(f"✅ OpenSearch 검색 완료: {response['hits']['total']['value']}건")
