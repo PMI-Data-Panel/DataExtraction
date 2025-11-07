@@ -77,6 +77,17 @@ class OpenSearchHybridQueryBuilder:
                 size
             )
 
+    # Compatibility wrapper for existing call sites
+    def build_complete_request(
+        self,
+        analysis,
+        query_vector: Optional[List[float]] = None,
+        size: int = 10,
+        filters: Optional[List[Dict]] = None
+    ) -> Dict[str, Any]:
+        """Compat: delegate to build_query; filters are currently encoded in analysis."""
+        return self.build_query(analysis, query_vector=query_vector, size=size)
+
     def _extract_demographic_filters(self, analysis) -> List[str]:
         """must_terms에서 인구통계 키워드 추출 (qa_pairs.answer에서 검색용)"""
         demographic_terms = []
@@ -192,52 +203,72 @@ class OpenSearchHybridQueryBuilder:
         semantic_terms: Dict[str, List[str]],
         demographic_filters: List[str]
     ) -> Dict:
-        """키워드 검색 쿼리 (qa_pairs nested에서 검색, 각 키워드는 서로 다른 qa_pair에서 검색)"""
+        """키워드 검색 쿼리 (qa_pairs nested에서 검색, 각 키워드는 서로 다른 qa_pair에서 검색)
+        
+        ⚠️ 중요: Demographics 키워드는 필터로만 처리하고, semantic_terms에서 제외
+        """
 
         must_queries = []
+        
+        # Demographics 키워드 집합 (중복 방지용)
+        demographic_set = set(demographic_filters)
 
-        # 인구통계 조건 (각각 별도의 nested 쿼리)
-        if demographic_filters:
-            for term in demographic_filters:
-                must_queries.append({
-                    "nested": {
-                        "path": "qa_pairs",
-                        "query": {"match": {"qa_pairs.answer": term}},
-                        "score_mode": "max"
-                    }
-                })
+        # ⭐ 1. Demographics만 must 조건으로 (각각 독립)
+        #    - demographic_filters는 필터로만 처리 (이미 필터로 적용됨)
+        #    - 여기서는 키워드 검색에서 제외하므로 추가하지 않음
 
-        # 의미적 키워드 must 조건 (각각 별도의 nested 쿼리)
+        # ⭐ 2. 의미적 must 키워드 (Demographics가 아닌 것만)
         if semantic_terms["must"]:
             for term in semantic_terms["must"]:
-                must_queries.append({
-                    "nested": {
-                        "path": "qa_pairs",
-                        "query": {"match": {"qa_pairs.answer": term}},
-                        "score_mode": "max"
-                    }
-                })
+                # Demographics가 아닌지 재확인
+                if term not in demographic_set:
+                    must_queries.append({
+                        "nested": {
+                            "path": "qa_pairs",
+                            "query": {"match": {"qa_pairs.answer_text": term}},
+                            "score_mode": "max",
+                            "inner_hits": {
+                                "size": 3,
+                                "_source": {
+                                    "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
+                                }
+                            }
+                        }
+                    })
 
-        # should 조건 (하나의 nested 쿼리로 묶음)
+        # ⭐ 3. should 조건 (Demographics 제외, 있을 때만)
         should_query = None
         if semantic_terms["should"]:
-            should_query = {
-                "nested": {
-                    "path": "qa_pairs",
-                    "query": {
-                        "bool": {
-                            "should": [
-                                {"match": {"qa_pairs.answer": term}}
-                                for term in semantic_terms["should"]
-                            ],
-                            "minimum_should_match": 1
+            # Demographics 제외
+            should_terms_filtered = [
+                term for term in semantic_terms["should"]
+                if term not in demographic_set
+            ]
+            
+            if should_terms_filtered:
+                should_query = {
+                    "nested": {
+                        "path": "qa_pairs",
+                        "query": {
+                            "bool": {
+                                "should": [
+                                    {"match": {"qa_pairs.answer_text": term}}
+                                    for term in should_terms_filtered
+                                ],
+                                "minimum_should_match": 1
+                            }
+                        },
+                        "score_mode": "max",
+                        "inner_hits": {
+                            "size": 3,
+                            "_source": {
+                                "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
+                            }
                         }
-                    },
-                    "score_mode": "max"
+                    }
                 }
-            }
 
-        # 최종 쿼리 구성
+        # ⭐ 4. 최종 쿼리 구성
         if must_queries or should_query:
             bool_parts = {}
 
@@ -253,17 +284,27 @@ class OpenSearchHybridQueryBuilder:
                     {
                         "nested": {
                             "path": "qa_pairs",
-                            "query": {"match": {"qa_pairs.answer": term}}
+                            "query": {"match": {"qa_pairs.answer_text": term}}
                         }
                     }
                     for term in semantic_terms["must_not"]
+                    if term not in demographic_set  # Demographics 제외
                 ]
 
             query = {
                 "bool": bool_parts
             }
         else:
-            query = {"match_all": {}}
+            # ⭐ match_all 반환하지 않음 (필터만 있는 경우를 위해)
+            # None을 반환하면 호출자가 필터만 사용할 수 있음
+            query = None
+
+        logger.info(f"🔍 생성된 쿼리 구조:")
+        logger.info(f"  - Must 조건: {len(must_queries)}개 (Demographics 제외)")
+        logger.info(f"  - Should 조건: {'있음' if should_query else '없음'}")
+        logger.info(f"  - Demographics 필터: {len(demographic_filters)}개 (별도 필터로 처리)")
+        if query is None:
+            logger.info(f"  - ⚠️ 키워드 쿼리 없음 (필터만 사용)")
 
         return query
 
@@ -335,10 +376,20 @@ class OpenSearchHybridQueryBuilder:
         # 디버깅: 생성된 쿼리 로깅
         logger.info(f"Generated keyword query: {keyword_query}")
 
-        return {
-            "query": keyword_query,
-            "size": size
-        }
+        # ⭐ keyword_query가 None이면 None 반환 (필터만 사용하도록)
+        # match_none을 반환하면 필터와 함께 must에 들어가서 결과가 0건이 됨
+        if keyword_query is None:
+            # None을 반환하면 호출자가 필터만 사용할 수 있음
+            logger.info("⚠️ 키워드 쿼리가 없습니다. 필터만 사용하도록 None 반환")
+            return {
+                "query": None,  # None 반환하여 필터만 사용하도록
+                "size": size
+            }
+        else:
+            return {
+                "query": keyword_query,
+                "size": size
+            }
 
 
 def calculate_rrf_score(
@@ -348,8 +399,10 @@ def calculate_rrf_score(
 ) -> List[Dict]:
     """
     수동 RRF 점수 계산 (OpenSearch 2.10 미만용)
-
-    RRF 공식: score = Σ (1 / (k + rank_i))
+    
+    ⭐ Rank 정규화 적용: 결과 개수에 관계없이 일관된 점수 계산
+    RRF 공식: score = Σ (1 / (k + normalized_rank))
+    normalized_rank = (rank / total_results) * 100
 
     Args:
         keyword_results: 키워드 검색 결과 리스트
@@ -363,41 +416,65 @@ def calculate_rrf_score(
     # 문서별 점수 누적
     doc_scores = {}
 
+    # 키워드 결과 개수 (정규화용)
+    keyword_total = len(keyword_results) if keyword_results else 1
+    
     # 키워드 결과
     for rank, result in enumerate(keyword_results, start=1):
-        doc_id = result['_id']
-        score = 1.0 / (k + rank)
+        doc_id = result.get('_id', '')
+        if not doc_id:
+            # _id가 없으면 다른 방법으로 식별 시도
+            doc_id = result.get('id', '') or str(id(result))
+        
+        # ⭐ 정규화: rank를 0~100 사이로 변환
+        normalized_rank = (rank / keyword_total) * 100
+        score = 1.0 / (k + normalized_rank)
 
         if doc_id not in doc_scores:
             doc_scores[doc_id] = {
                 'doc': result,
                 'keyword_rank': rank,
+                'keyword_normalized_rank': normalized_rank,
                 'keyword_score': score,
                 'vector_rank': None,
+                'vector_normalized_rank': None,
                 'vector_score': 0.0,
                 'rrf_score': score
             }
         else:
             doc_scores[doc_id]['keyword_rank'] = rank
+            doc_scores[doc_id]['keyword_normalized_rank'] = normalized_rank
             doc_scores[doc_id]['keyword_score'] = score
             doc_scores[doc_id]['rrf_score'] += score
 
+    # 벡터 결과 개수 (정규화용)
+    vector_total = len(vector_results) if vector_results else 1
+    
     # 벡터 결과
     for rank, result in enumerate(vector_results, start=1):
-        doc_id = result['_id']
-        score = 1.0 / (k + rank)
+        doc_id = result.get('_id', '')
+        if not doc_id:
+            # _id가 없으면 다른 방법으로 식별 시도
+            doc_id = result.get('id', '') or str(id(result))
+        
+        # ⭐ 정규화: rank를 0~100 사이로 변환
+        normalized_rank = (rank / vector_total) * 100
+        score = 1.0 / (k + normalized_rank)
 
         if doc_id not in doc_scores:
             doc_scores[doc_id] = {
                 'doc': result,
                 'keyword_rank': None,
+                'keyword_normalized_rank': None,
                 'keyword_score': 0.0,
                 'vector_rank': rank,
+                'vector_normalized_rank': normalized_rank,
                 'vector_score': score,
                 'rrf_score': score
             }
         else:
             doc_scores[doc_id]['vector_rank'] = rank
+            doc_scores[doc_id]['vector_normalized_rank'] = normalized_rank
             doc_scores[doc_id]['vector_score'] = score
             doc_scores[doc_id]['rrf_score'] += score
 
@@ -409,9 +486,12 @@ def calculate_rrf_score(
     for item in ranked:
         doc = item['doc'].copy()
         doc['_score'] = item['rrf_score']
+        doc['rrf_score'] = item['rrf_score']  # 호환성을 위해 추가
         doc['_rrf_details'] = {
             'keyword_rank': item['keyword_rank'],
+            'keyword_normalized_rank': item.get('keyword_normalized_rank'),
             'vector_rank': item['vector_rank'],
+            'vector_normalized_rank': item.get('vector_normalized_rank'),
             'keyword_score': item['keyword_score'],
             'vector_score': item['vector_score']
         }
