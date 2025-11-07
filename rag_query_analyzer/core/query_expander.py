@@ -1,8 +1,18 @@
+"""
+⚠️ DEPRECATED: 이 모듈은 더 이상 사용되지 않습니다.
+
+하드코딩된 동의어 대신 `rag_query_analyzer.utils.synonym_expander.HybridSynonymExpander`를 사용하세요.
+- 정적 사전 기반 동의어 확장 (LLM 생성, 1회)
+- Qdrant 기반 동적 확장 (런타임, 유사 벡터 검색)
+- 결과 캐싱으로 성능 최적화
+"""
 import logging
 from typing import Dict, List, Optional
 from .semantic_model import SemanticModel
 
 logger = logging.getLogger(__name__)
+
+logger.warning("⚠️  QueryExpander는 deprecated되었습니다. HybridSynonymExpander를 사용하세요.")
 
 
 class QueryExpander:

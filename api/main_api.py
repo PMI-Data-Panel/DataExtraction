@@ -54,7 +54,7 @@ def create_app() -> FastAPI:
             use_ssl=config.OPENSEARCH_USE_SSL,
             verify_certs=False,
             ssl_show_warn=False,
-            request_timeout=30
+            request_timeout=60  # ⭐ 타임아웃 증가: 배치 조회 대응 (30초 → 60초)
         )
         logger.info("[OK] OpenSearch 클라이언트 초기화 완료")
 
@@ -88,6 +88,27 @@ def create_app() -> FastAPI:
             """애플리케이션 시작 시 연결 상태 확인"""
             logger.info("=" * 60)
             logger.info("RAG Query Analyzer API 시작")
+            logger.info("=" * 60)
+            
+            # 동의어 확장기 초기화 (정적 사전 + Qdrant 동적 확장)
+            try:
+                from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
+                expander = get_synonym_expander(
+                    qdrant_client=qdrant_client,
+                    embedding_model=embedding_model
+                )
+                stats = expander.get_stats()
+                logger.info("📚 동의어 확장기 정보:")
+                logger.info(f"   - Terms: {stats['total_terms']}개")
+                logger.info(f"   - 동의어: {stats['total_synonyms']}개")
+                logger.info(f"   - 평균: {stats['avg_synonyms']:.1f}개/term")
+                logger.info(f"   - 파일: {stats['loaded_from']}")
+                logger.info(f"   - Qdrant 동적 확장: {'활성화' if stats['dynamic_enabled'] else '비활성화'}")
+                if stats['dynamic_enabled']:
+                    logger.info(f"   - 동적 캐시 크기: {stats['dynamic_cache_size']}/{stats['cache_size_limit']}")
+            except Exception as e:
+                logger.warning(f"⚠️  동의어 확장기 초기화 실패: {e}")
+                logger.info(f"   생성 방법: python scripts/generate_synonyms.py")
             logger.info("=" * 60)
 
             # OpenSearch 연결 확인
