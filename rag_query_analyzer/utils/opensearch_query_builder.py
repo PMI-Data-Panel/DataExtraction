@@ -199,14 +199,14 @@ class OpenSearchHybridQueryBuilder:
             # must 조건
             if semantic_terms["must"]:
                 bool_clauses["must"] = [
-                    {"match": {"subjective_responses.answer_text": term}}
+                    {"match": {"qa_pairs.answer_text": term}}
                     for term in semantic_terms["must"]
                 ]
 
             # should 조건
             if semantic_terms["should"]:
                 bool_clauses["should"] = [
-                    {"match": {"subjective_responses.answer_text": term}}
+                    {"match": {"qa_pairs.answer_text": term}}
                     for term in semantic_terms["should"]
                 ]
                 bool_clauses["minimum_should_match"] = 1
@@ -214,16 +214,16 @@ class OpenSearchHybridQueryBuilder:
             # must_not 조건
             if semantic_terms["must_not"]:
                 bool_clauses["must_not"] = [
-                    {"match": {"subjective_responses.answer_text": term}}
+                    {"match": {"qa_pairs.answer_text": term}}
                     for term in semantic_terms["must_not"]
                 ]
 
             nested_query = {"bool": bool_clauses}
 
-        # Nested 래핑
+        # Nested 래핑 (qa_pairs 경로로 통일)
         query = {
             "nested": {
-                "path": "subjective_responses",
+                "path": "qa_pairs",
                 "query": nested_query,
                 "score_mode": "max",
                 "inner_hits": {
@@ -231,7 +231,7 @@ class OpenSearchHybridQueryBuilder:
                     "_source": ["q_text", "answer_text", "q_category"],
                     "highlight": {
                         "fields": {
-                            "subjective_responses.answer_text": {
+                            "qa_pairs.answer_text": {
                                 "fragment_size": 150,
                                 "number_of_fragments": 2
                             }
@@ -258,16 +258,16 @@ class OpenSearchHybridQueryBuilder:
         demographic_filters: List[Dict],
         k: int
     ) -> Dict:
-        """벡터 검색 쿼리"""
+        """벡터 검색 쿼리 (qa_pairs 경로로 통일)"""
 
         knn_query = {
             "nested": {
-                "path": "subjective_responses",
+                "path": "qa_pairs",
                 "query": {
                     "knn": {
-                        "subjective_responses.answer_vector": {
+                        "qa_pairs.answer_vector": {
                             "vector": query_vector,
-                            "k": k * 2  # 후보 많이 확보
+                            "k": k * 2
                         }
                     }
                 },
