@@ -1,6 +1,10 @@
 """검색 API 라우터"""
+import asyncio
+import json
 import logging
-from typing import List, Dict, Any, Optional
+from collections import defaultdict
+from time import perf_counter
+from typing import List, Dict, Any, Optional, Set, Tuple
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from opensearchpy import OpenSearch
@@ -8,9 +12,10 @@ from opensearchpy import OpenSearch
 # 분석기 및 쿼리 빌더
 from rag_query_analyzer.analyzers.main_analyzer import AdvancedRAGQueryAnalyzer
 from rag_query_analyzer.analyzers.demographic_extractor import DemographicExtractor
-from rag_query_analyzer.models.entities import DemographicType
+from rag_query_analyzer.models.entities import DemographicType, DemographicEntity
 from connectors.hybrid_searcher import OpenSearchHybridQueryBuilder, calculate_rrf_score
 from connectors.data_fetcher import DataFetcher
+from connectors.qdrant_helper import search_qdrant_async, search_qdrant_collections_async
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +23,9 @@ router = APIRouter(
     prefix="/search",
     tags=["Search"]
 )
+
+# ⚠️ 임시 확장 타임아웃 (중첩 필터 제거 전까지 8~10초 유지)
+DEFAULT_OS_TIMEOUT = 10
 
 
 class SearchRequest(BaseModel):
@@ -101,6 +109,15 @@ async def search_query(
         logger.info(f"   - should_terms: {query_analysis.should_terms}")
         logger.info(f"   - alpha: {query_analysis.alpha}")
 
+        timings: Dict[str, float] = {}
+        overall_start = perf_counter()
+        analyzer = AdvancedRAGQueryAnalyzer(config)
+        analysis = analyzer.analyze_query(request.query)
+        analyzer = AdvancedRAGQueryAnalyzer(config)
+        analysis = analyzer.analyze_query(request.query)
+
+        
+
         # 2단계: 쿼리 빌드
         logger.info("\n[2/3] 검색 쿼리 생성 중...")
         query_builder = OpenSearchHybridQueryBuilder(config)
@@ -127,7 +144,23 @@ async def search_query(
 
             # OpenSearch 키워드 검색
             logger.info("   - [1/3] OpenSearch 키워드 검색...")
-            data_fetcher = DataFetcher(opensearch_client=os_client)
+            
+            # OpenSearch _source filtering: 필요한 필드만 조회
+            source_filter = {
+                "includes": ["user_id", "metadata", "qa_pairs", "timestamp"],
+                "excludes": []
+            }
+
+            # ------------------------------------------------------------
+            # OpenSearch 검색 (필요시 병렬 실행)
+            # ------------------------------------------------------------
+           
+
+            data_fetcher = DataFetcher(
+                opensearch_client=os_client,
+                qdrant_client=getattr(router, 'qdrant_client', None),
+                async_opensearch_client=getattr(router, 'async_os_client', None)
+            )
             # ⭐ 필터가 있는 경우, 교집합을 위해 더 많은 결과를 가져와야 함
             has_filters = bool(os_query.get('query', {}).get('bool', {}).get('must'))
             
@@ -153,7 +186,8 @@ async def search_query(
                 index_name=request.index_name,
                 query=os_query,
                 size=search_size,
-                source_filter=source_filter
+                source_filter=source_filter,
+                request_timeout=DEFAULT_OS_TIMEOUT,
             )
             logger.info(f"      → OpenSearch: {len(os_response['hits']['hits'])}건")
 
@@ -244,7 +278,11 @@ async def search_query(
         else:
             # 기존 OpenSearch 단독 검색
             logger.info("   - OpenSearch 키워드 검색만 사용")
-            data_fetcher = DataFetcher(opensearch_client=os_client)
+            data_fetcher = DataFetcher(
+                opensearch_client=os_client,
+                qdrant_client=getattr(router, 'qdrant_client', None),
+                async_opensearch_client=getattr(router, 'async_os_client', None)
+            )
             search_response = data_fetcher.search_opensearch(
                 index_name=request.index_name,
                 query=os_query,
@@ -322,38 +360,111 @@ async def search_natural_language(
     자연어 입력에서 인구통계(연령/성별/직업)와 요청 수량을 추출하여
     검색 쿼리와 size에 반영한 뒤 결과를 반환합니다.
     """
+    analysis = None
     try:
+        logger.info("🟢 /search/nl 요청 시작")
+
         if not os_client or not os_client.ping():
             raise HTTPException(status_code=503, detail="OpenSearch 서버에 연결할 수 없습니다.")
 
         embedding_model = getattr(router, 'embedding_model', None)
         config = getattr(router, 'config', None)
+        data_fetcher = DataFetcher(
+            opensearch_client=os_client,
+            qdrant_client=getattr(router, 'qdrant_client', None),
+            async_opensearch_client=getattr(router, 'async_os_client', None)
+        )
+
+        timings: Dict[str, float] = {}
+        overall_start = perf_counter()
+
+        analyzer = AdvancedRAGQueryAnalyzer(config)
+        analysis = analyzer.analyze_query(request.query)
+
+        if analysis is None:
+            raise RuntimeError("Query analysis returned None")
 
         # 1) 추출: filters + size
         extractor = DemographicExtractor()
         extracted_entities, requested_size = extractor.extract_with_size(request.query)
-        filters = extracted_entities.to_filters()
+        filters: List[Dict[str, Any]] = []
+        for demo in extracted_entities.demographics:
+            metadata_only = demo.demographic_type in {DemographicType.AGE, DemographicType.GENDER}
+            include_nested_fallback = demo.demographic_type not in {DemographicType.OCCUPATION}
+            filter_clause = demo.to_opensearch_filter(
+                metadata_only=metadata_only,
+                include_qa_fallback=include_nested_fallback,
+            )
+            if filter_clause and filter_clause != {"match_all": {}}:
+                filters.append(filter_clause)
+        filters_for_response = list(filters)
         size = max(1, min(requested_size, 100))
         
-        # ⭐ 필터가 있는 경우, 교집합을 위해 더 많은 결과를 가져와야 함
-        # 이론상 교집합이 수백~수천 명일 수 있으므로 충분히 큰 size 사용
-        # 예: welcome_1st에서 5,192명, welcome_2nd에서 10,000명 이상
-        # → 각각 1,000개씩 가져와도 교집합이 충분히 나올 수 있음
-        search_size = size * 2  # 기본값
-        if filters:
-            # 필터가 있으면 더 많이 가져오기 (교집합을 위해)
-            # 최소 1,000개, 최대 5,000개 (성능 고려)
-            search_size = max(1000, min(size * 20, 5000))
-            logger.info(f"🔍 필터 적용: 검색 size를 {search_size}로 증가 (교집합 확보를 위해)")
+        age_gender_filters = [f for f in filters if is_age_or_gender_filter(f)]
+        occupation_filters = [f for f in filters if is_occupation_filter(f)]
+        other_filters = [f for f in filters if f not in age_gender_filters and f not in occupation_filters]
+
+        filters_os = age_gender_filters + other_filters
+        filters = filters_os  # 유지보수: 기존 로직과 호환성을 위해
+        has_demographic_filters = bool(filters_for_response)
+
+        logger.info("🔍 필터 상태 체크:")
+        logger.info(f"  - age_gender_filters: {len(age_gender_filters)}개")
+        logger.info(f"  - occupation_filters: {len(occupation_filters)}개")
+        logger.info(f"  - other_filters: {len(other_filters)}개")
+
+        two_phase_applicable = bool(age_gender_filters and occupation_filters)
+        two_phase_response: Optional[SearchResponse] = None
+        if two_phase_applicable:
+            logger.info("✅ 2단계 검색 조건 충족 – 두 단계 검색 시도")
+
+            try:
+                response = await run_two_phase_demographic_search(
+                    request=request,
+                    analysis=analysis,
+                    extracted_entities=extracted_entities,
+                    filters=filters_for_response,
+                    size=size,
+                    age_gender_filters=age_gender_filters,
+                    occupation_filters=occupation_filters,
+                    data_fetcher=data_fetcher,
+                    timings=timings,
+                    overall_start=overall_start,
+                )
+
+                if response is not None:
+                    two_phase_response = response
+                    logger.info("✅ 2단계 검색 성공! 결과 반환")
+                    logger.info(f"🔵 /search/nl 요청 완료: 결과 {len(response.results)}건, took_ms={response.took_ms}")
+            except Exception as e:
+                logger.warning(f"⚠️ 2단계 검색 중 오류: {e}, 기본 파이프라인으로 진행")
+
+        if two_phase_response is not None:
+            return two_phase_response
 
         # 2) 분석 + 쿼리 빌드
-        analyzer = AdvancedRAGQueryAnalyzer(config)
-        analysis = analyzer.analyze_query(request.query)
-        
         # ⭐ 최종 키워드 정제: 메타 키워드, 수량 패턴, Demographics 제거
         import re
-        
-        # 메타 키워드 정의 (검색 조건에서 제외)
+
+        def strip_korean_particles(term: str) -> str:
+            if not term:
+                return term
+            particles = [
+                '에는', '에서', '으로', '도', '은', '는', '이', '가',
+                '을', '를', '와', '과', '인'
+            ]
+            normalized = term
+            for _ in range(10):
+                changed = False
+                for particle in particles:
+                    if normalized.endswith(particle) and len(normalized) > len(particle):
+                        normalized = normalized[:-len(particle)]
+                        changed = True
+                        break
+                if not changed or len(normalized) <= 1:
+                    break
+            return normalized
+
         meta_keywords = {
             '설문조사', '설문', '데이터', '자료', '정보',
             '보여줘', '보여주세요', '알려줘', '알려주세요',
@@ -362,41 +473,50 @@ async def search_natural_language(
             '와', '과', '에게', '한테', '명', '개', '건',
             '사람', '인', '분', '중', '중에', '중에서'
         }
-        
-        # 수량 패턴("숫자+명/건") 제거
+
         quantity_pattern = re.compile(r'\d+\s*(명|건)')
-        
-        # 추출된 Demographics 키워드 집합
+
         extracted_keywords = set()
         for demo in extracted_entities.demographics:
             extracted_keywords.add(demo.raw_value)
             extracted_keywords.update(demo.synonyms)
-        
-        # 정제 전 키워드 저장 (로깅용)
+
+        extracted_keywords_stripped = set(strip_korean_particles(k) for k in extracted_keywords)
+
+        if analysis is None:
+            raise RuntimeError("Query analysis not initialized")
+
         original_must = analysis.must_terms.copy()
         original_should = analysis.should_terms.copy()
-        
-        # must_terms 정제
+
+        def is_demographic_term(term: str) -> bool:
+            if term in extracted_keywords:
+                return True
+            stripped = strip_korean_particles(term)
+            return stripped in extracted_keywords or stripped in extracted_keywords_stripped
+
         analysis.must_terms = [
             t for t in analysis.must_terms
-            if (t not in meta_keywords and
-                t not in extracted_keywords and
-                not quantity_pattern.search(t))
+            if (
+                t not in meta_keywords and
+                not quantity_pattern.search(t) and
+                not is_demographic_term(t)
+            )
         ]
-        
-        # should_terms 정제
+
         analysis.should_terms = [
             t for t in analysis.should_terms
-            if (t not in meta_keywords and
-                t not in extracted_keywords and
-                not quantity_pattern.search(t))
+            if (
+                t not in meta_keywords and
+                not quantity_pattern.search(t) and
+                not is_demographic_term(t)
+            )
         ]
-        
-        # 제거된 키워드 추적
+
         removed_meta = [t for t in (original_must + original_should) if t in meta_keywords]
-        removed_demo = [t for t in (original_must + original_should) if t in extracted_keywords]
+        removed_demo = [t for t in (original_must + original_should) if is_demographic_term(t)]
         removed_quantity = [t for t in (original_must + original_should) if quantity_pattern.search(t)]
-        
+
         logger.info(f"🔍 최종 키워드 정제:")
         logger.info(f"  - Must terms: {analysis.must_terms} (원본: {original_must})")
         logger.info(f"  - Should terms: {analysis.should_terms} (원본: {original_should})")
@@ -413,94 +533,15 @@ async def search_natural_language(
         if embedding_model:
             # 완전 동적 임베딩 기반 동의어 확장 (도메인 무관, 범용)
             def _enrich_query_vector() -> Optional[list]:
-                """
-                ExtractedEntities의 모든 엔티티(raw_value)에 대해
-                Qdrant에서 유사 벡터를 찾아 동의어를 자동 확장
-                정적 사전 없이 완전 동적 방식
-                """
-                import re
-                phrases = [request.query]  # 원본 쿼리 포함
-                qdrant_client = getattr(router, 'qdrant_client', None)
-                
-                if not qdrant_client:
-                    # Qdrant 없으면 원본 쿼리만 임베딩
-                    try:
-                        vec = embedding_model.encode(request.query).tolist()
-                        return vec
-                    except Exception:
-                        return None
-                
-                # 모든 추출된 엔티티에 대해 동적 확장
-                all_entity_values = []
-                
-                # Demographics: raw_value 수집
-                for demo in extracted_entities.demographics:
-                    if demo.raw_value:
-                        all_entity_values.append(demo.raw_value)
-                
-                # Topics: name + keywords 수집
-                for topic in extracted_entities.topics:
-                    if topic.name:
-                        all_entity_values.append(topic.name)
-                    all_entity_values.extend(list(topic.keywords)[:3])  # 상위 3개만
-                
-                # Questions: question_text 수집
-                for q in extracted_entities.questions:
-                    if q.question_text:
-                        all_entity_values.append(q.question_text)
-                
-                # 각 엔티티 값에 대해 Qdrant에서 유사 텍스트 수집
-                syn_candidates = set()  # 중복 제거용
-                collections = qdrant_client.get_collections()
-                
-                for entity_val in all_entity_values[:5]:  # 최대 5개 엔티티만 처리 (성능)
-                    try:
-                        base_vec = embedding_model.encode(entity_val).tolist()
-                        for col in collections.collections:
-                            try:
-                                results = qdrant_client.search(
-                                    collection_name=col.name,
-                                    query_vector=base_vec,
-                                    limit=10,  # 각 엔티티당 10개
-                                    score_threshold=0.3  # 최소 유사도
-                                )
-                                for r in results:
-                                    payload = getattr(r, 'payload', {}) or {}
-                                    txt = payload.get('answer_text') or payload.get('text') or payload.get('q_text')
-                                    if isinstance(txt, str) and len(txt.strip()) > 0:
-                                        # 긴 문장은 그대로 사용 (임베딩이 의미를 포착)
-                                        syn_candidates.add(txt.strip())
-                            except Exception:
-                                continue
-                    except Exception:
-                        continue
-                
-                # 수집된 유사 텍스트를 phrases에 추가 (최대 10개)
-                phrases.extend(list(syn_candidates)[:10])
-                
-                # 모든 phrases를 임베딩하여 평균
+                """임시: 동의어 확장 비활성화 (성능 최적화)"""
                 try:
-                    vecs = embedding_model.encode(phrases, convert_to_tensor=False)
-                    if hasattr(vecs, 'tolist'):
-                        vecs = vecs.tolist()
-                    if isinstance(vecs, list) and vecs:
-                        dim = len(vecs[0])
-                        avg = [0.0] * dim
-                        for v in vecs:
-                            for i in range(dim):
-                                avg[i] += v[i]
-                        avg = [x / len(vecs) for x in avg]
-                        return avg
+                    vec = embedding_model.encode(request.query).tolist()
+                    logger.info("  ⚠️ 동의어 확장 비활성화 (성능 최적화)")
+                    return vec
                 except Exception:
-                    # 실패 시 원본 쿼리만
-                    try:
-                        return embedding_model.encode(request.query).tolist()
-                    except Exception:
-                        return None
-                return None
+                    return None
 
-            if request.use_vector_search:
-                query_vector = _enrich_query_vector()
+            query_vector = _enrich_query_vector()
 
         base_query = query_builder.build_query(
             analysis=analysis,
@@ -601,9 +642,9 @@ async def search_natural_language(
             
             return cleaned
         
-        if filters:
+        if filters_os:
             # ⭐ inner_hits 제거 (중복 방지)
-            cleaned_filters = [remove_inner_hits(f) for f in filters]
+            cleaned_filters = [remove_inner_hits(f) for f in filters_os]
             
             filter_by_type = {}
             for f in cleaned_filters:
@@ -708,7 +749,7 @@ async def search_natural_language(
                     should_filters.append({
                         'bool': {
                             'should': type_filters,
-                            'minimum_should_match': 1
+                            "minimum_should_match": 1
                         }
                     })
             
@@ -742,17 +783,20 @@ async def search_natural_language(
         if 'size' not in final_query:
             final_query['size'] = size
 
-        # ⭐ 필터 적용 확인 로깅
-        if filters:
+        if filters_os:
             import json
-            logger.info(f"🔍 적용된 필터 ({len(filters)}개):")
-            for i, f in enumerate(filters, 1):
+            logger.info(f"🔍 적용된 필터 ({len(filters_os)}개):")
+            for i, f in enumerate(filters_os, 1):
                 logger.info(f"  필터 {i}: {json.dumps(f, ensure_ascii=False, indent=2)}")
             logger.info(f"🔍 최종 쿼리 구조:")
             logger.info(f"  {json.dumps(final_query, ensure_ascii=False, indent=2)}")
+        else:
+            import json
+            logger.info(f"🔍 최종 쿼리 구조 (필터 없음):")
+            logger.info(f"  {json.dumps(final_query, ensure_ascii=False, indent=2)}")
 
         # ⭐ Qdrant top-N 제한: 필터 유무에 따라 분기
-        has_filters = bool(filters)
+        has_filters = bool(filters_os or occupation_filters)
         if has_filters:
             # 필터 있음: 300~500개 (교집합 확보를 위해)
             qdrant_limit = min(500, max(300, size * 10))
@@ -766,7 +810,6 @@ async def search_natural_language(
 
         # 4) 실행: 하이브리드 (OpenSearch + 선택적 Qdrant) with RRF
         # ⭐ STEP 1: welcome_1st와 welcome_2nd를 각각 별도로 검색
-        data_fetcher = DataFetcher(opensearch_client=os_client)
         
         # OpenSearch _source filtering: 필요한 필드만 조회
         source_filter = {
@@ -798,164 +841,74 @@ async def search_natural_language(
         logger.info(f"  - 기타 인덱스 검색: {search_other_indices}")
         
         # ⭐ 인덱스별 필터 분리: welcome_1st는 연령/성별만, welcome_2nd는 직업만
-        welcome_1st_query = final_query.copy()
-        welcome_2nd_query = final_query.copy()
-        
-        if filters and 'query' in final_query:
+        logger.info(f"🔍 인덱스별 검색 전략:")
+        logger.info(f"  - welcome_1st 검색: {search_welcome_1st}")
+        logger.info(f"  - welcome_2nd 검색: {search_welcome_2nd}")
+        logger.info(f"  - 기타 인덱스 검색: {search_other_indices}")
+
+        def create_safe_query_template(size_value: int) -> Dict[str, Any]:
+            """안전한 기본 쿼리 생성"""
+            return {
+                'query': {'match_all': {}},
+                'size': size_value,
+                '_source': {
+                    'includes': ['user_id', 'metadata', 'qa_pairs', 'timestamp']
+                }
+            }
+
+        welcome_1st_query = create_safe_query_template(search_size)
+        welcome_2nd_query = create_safe_query_template(search_size)
+
+        if filters:
             logger.info(f"🔍 인덱스별 필터 분리 중...")
-            # 필터를 타입별로 분리
-            age_gender_filters = []
-            occupation_filters = []
-            
-            for demo in extracted_entities.demographics:
-                if demo.demographic_type in [DemographicType.AGE, DemographicType.GENDER]:
-                    # welcome_1st용 필터
-                    demo_filter = demo.to_opensearch_filter()
-                    if demo_filter:
-                        age_gender_filters.append(demo_filter)
-                elif demo.demographic_type == DemographicType.OCCUPATION:
-                    # welcome_2nd용 필터
-                    demo_filter = demo.to_opensearch_filter()
-                    if demo_filter:
-                        occupation_filters.append(demo_filter)
-            
-            # welcome_1st 쿼리: 연령/성별 필터만 적용
-            if age_gender_filters:
-                base_query = final_query['query'].get('bool', {}).get('must', [])
-                # match_all/match_none 제거
-                base_query = [q for q in base_query if q not in [{"match_all": {}}, {"match_none": {}}] and q is not None]
-                
-                # ⭐ 키워드 쿼리와 필터 분리
-                keyword_queries = []  # 키워드 검색 쿼리 (nested with match on answer_text)
-                filtered_base = []    # 연령/성별 필터만
-                
-                for q in base_query:
-                    if isinstance(q, dict):
-                        # 키워드 쿼리인지 확인 (nested + match on answer_text, 필터가 아닌 것)
-                        is_keyword_query = False
-                        if 'nested' in q:
-                            nested_query = q['nested'].get('query', {})
-                            # match 쿼리이고 answer_text를 검색하는 경우 (키워드 검색)
-                            if 'match' in nested_query:
-                                match_field = list(nested_query['match'].keys())[0]
-                                if 'answer_text' in match_field:
-                                    is_keyword_query = True
-                            # bool 쿼리 내부에 match가 있는 경우도 키워드 쿼리
-                            elif 'bool' in nested_query:
-                                for bool_type in ['must', 'should']:
-                                    if bool_type in nested_query['bool']:
-                                        for subq in nested_query['bool'][bool_type]:
-                                            if isinstance(subq, dict) and 'match' in subq:
-                                                match_field = list(subq['match'].keys())[0]
-                                                if 'answer_text' in match_field:
-                                                    is_keyword_query = True
-                                                    break
-                        
-                        if is_keyword_query:
-                            # 키워드 쿼리는 그대로 유지
-                            keyword_queries.append(q)
-                        else:
-                            # 필터인지 확인 (term, nested with q_text 등)
-                            is_age_gender = False
-                            for f in age_gender_filters:
-                                if q == f or (isinstance(q, dict) and isinstance(f, dict) and q.get('term') == f.get('term')):
-                                    is_age_gender = True
-                                    break
-                            if is_age_gender:
-                                filtered_base.append(q)
-                    else:
-                        # 기타 쿼리는 그대로 유지
-                        keyword_queries.append(q)
-                
-                # ⭐ 키워드 쿼리와 필터 결합
-                all_must_clauses = keyword_queries + filtered_base + age_gender_filters
-                if all_must_clauses:
-                    welcome_1st_query['query'] = {
-                        'bool': {
-                            'must': all_must_clauses
-                        }
+
+            age_gender_filters_split = [f for f in filters if is_age_or_gender_filter(f)]
+            occupation_filters_split = [f for f in filters if is_occupation_filter(f)]
+
+            logger.info(f"  - 연령/성별 필터: {len(age_gender_filters_split)}개")
+            logger.info(f"  - 직업 필터: {len(occupation_filters_split)}개")
+
+            if age_gender_filters_split:
+                welcome_1st_query['query'] = {
+                    'bool': {
+                        'must': age_gender_filters_split
                     }
-                    logger.info(f"  ✅ welcome_1st 쿼리: 키워드 {len(keyword_queries)}개 + 연령/성별 필터 {len(age_gender_filters)}개 적용")
-                elif age_gender_filters:
-                    # 필터만 있는 경우
-                    welcome_1st_query['query'] = {
-                        'bool': {
-                            'must': age_gender_filters
-                        }
+                }
+                logger.info(f"  ✅ welcome_1st: 연령/성별 필터 {len(age_gender_filters_split)}개 적용")
+            else:
+                logger.info(f"  ⚠️ welcome_1st: 필터 없음, match_all 사용")
+
+            if occupation_filters_split:
+                welcome_2nd_query['query'] = {
+                    'bool': {
+                        'must': occupation_filters_split
                     }
-                    logger.info(f"  ✅ welcome_1st 필터: 연령/성별 {len(age_gender_filters)}개만 적용")
-            
-            # welcome_2nd 쿼리: 직업 필터만 적용 (키워드 쿼리도 포함)
-            if occupation_filters:
-                base_query = final_query['query'].get('bool', {}).get('must', [])
-                base_query = [q for q in base_query if q not in [{"match_all": {}}, {"match_none": {}}] and q is not None]
-                
-                # ⭐ 키워드 쿼리와 필터 분리
-                keyword_queries_2nd = []  # 키워드 검색 쿼리
-                filtered_base_2nd = []    # 직업 필터만
-                
-                for q in base_query:
-                    if isinstance(q, dict):
-                        # 키워드 쿼리인지 확인
-                        is_keyword_query = False
-                        if 'nested' in q:
-                            nested_query = q['nested'].get('query', {})
-                            if 'match' in nested_query:
-                                match_field = list(nested_query['match'].keys())[0]
-                                if 'answer_text' in match_field:
-                                    is_keyword_query = True
-                            elif 'bool' in nested_query:
-                                for bool_type in ['must', 'should']:
-                                    if bool_type in nested_query['bool']:
-                                        for subq in nested_query['bool'][bool_type]:
-                                            if isinstance(subq, dict) and 'match' in subq:
-                                                match_field = list(subq['match'].keys())[0]
-                                                if 'answer_text' in match_field:
-                                                    is_keyword_query = True
-                                                    break
-                        
-                        if is_keyword_query:
-                            keyword_queries_2nd.append(q)
-                        else:
-                            # 필터인지 확인
-                            is_occupation = False
-                            for f in occupation_filters:
-                                if q == f or (isinstance(q, dict) and isinstance(f, dict) and q.get('term') == f.get('term')):
-                                    is_occupation = True
-                                    break
-                            if is_occupation:
-                                filtered_base_2nd.append(q)
-                    else:
-                        keyword_queries_2nd.append(q)
-                
-                # ⭐ 키워드 쿼리와 필터 결합
-                all_must_clauses_2nd = keyword_queries_2nd + filtered_base_2nd + occupation_filters
-                if all_must_clauses_2nd:
-                    welcome_2nd_query['query'] = {
-                        'bool': {
-                            'must': all_must_clauses_2nd
-                        }
-                    }
-                    logger.info(f"  ✅ welcome_2nd 쿼리: 키워드 {len(keyword_queries_2nd)}개 + 직업 필터 {len(occupation_filters)}개 적용")
-                elif occupation_filters:
-                    welcome_2nd_query['query'] = {
-                        'bool': {
-                            'must': occupation_filters
-                        }
-                    }
-                    logger.info(f"  ✅ welcome_2nd 필터: 직업 {len(occupation_filters)}개만 적용")
-        
-        # welcome_1st 검색
-        welcome_1st_keyword_results = []
-        welcome_1st_vector_results = []
+                }
+                logger.info(f"  ✅ welcome_2nd: 직업 필터 {len(occupation_filters_split)}개 적용")
+            else:
+                logger.info(f"  ⚠️ welcome_2nd: 필터 없음, match_all 사용")
+        else:
+            logger.info(f"  ⚠️ 필터 없음: 모든 인덱스에서 match_all 사용")
+
+        import json
+        logger.info(f"📋 최종 쿼리 확인:")
+        logger.info(f"  welcome_1st: {json.dumps(welcome_1st_query, ensure_ascii=False)[:200]}...")
+        logger.info(f"  welcome_2nd: {json.dumps(welcome_2nd_query, ensure_ascii=False)[:200]}...")
+
+        welcome_1st_keyword_results: List[Dict[str, Any]] = []
+        welcome_1st_vector_results: List[Dict[str, Any]] = []
         if search_welcome_1st:
             logger.info(f"📊 [1/3] welcome_1st 검색 중...")
             try:
+                if 'query' not in welcome_1st_query or not welcome_1st_query['query']:
+                    raise ValueError("welcome_1st_query에 'query' 키가 없습니다")
+
                 os_response_1st = data_fetcher.search_opensearch(
                     index_name="s_welcome_1st",
-                    query=welcome_1st_query,  # ⭐ 연령/성별 필터만 적용된 쿼리
+                    query=welcome_1st_query,
                     size=search_size,
-                    source_filter=source_filter
+                    source_filter=source_filter,
+                    request_timeout=DEFAULT_OS_TIMEOUT,
                 )
                 welcome_1st_keyword_results = os_response_1st['hits']['hits']
                 logger.info(f"  ✅ OpenSearch: {len(welcome_1st_keyword_results)}건")
@@ -983,16 +936,17 @@ async def search_natural_language(
                 logger.warning(f"  ⚠️ welcome_1st 검색 실패: {e}")
         
         # welcome_2nd 검색
-        welcome_2nd_keyword_results = []
-        welcome_2nd_vector_results = []
+        welcome_2nd_keyword_results: List[Dict[str, Any]] = []
+        welcome_2nd_vector_results: List[Dict[str, Any]] = []
         if search_welcome_2nd:
             logger.info(f"📊 [2/3] welcome_2nd 검색 중...")
             try:
                 os_response_2nd = data_fetcher.search_opensearch(
                     index_name="s_welcome_2nd",
-                    query=welcome_2nd_query,  # ⭐ 직업 필터만 적용된 쿼리
+                    query=welcome_2nd_query,
                     size=search_size,
-                    source_filter=source_filter
+                    source_filter=source_filter,
+                    request_timeout=DEFAULT_OS_TIMEOUT,
                 )
                 welcome_2nd_keyword_results = os_response_2nd['hits']['hits']
                 logger.info(f"  ✅ OpenSearch: {len(welcome_2nd_keyword_results)}건")
@@ -1020,8 +974,8 @@ async def search_natural_language(
                 logger.warning(f"  ⚠️ welcome_2nd 검색 실패: {e}")
         
         # 기타 인덱스 검색 (survey_* 등)
-        other_keyword_results = []
-        other_vector_results = []
+        other_keyword_results: List[Dict[str, Any]] = []
+        other_vector_results: List[Dict[str, Any]] = []
         if search_other_indices:
             logger.info(f"📊 [3/3] 기타 인덱스 검색 중...")
             # welcome_1st, welcome_2nd를 제외한 인덱스 검색
@@ -1040,11 +994,16 @@ async def search_natural_language(
             
             if search_other_indices:
                 try:
+                    other_query_body = final_query.copy()
+                    if not isinstance(other_query_body.get('query'), dict):
+                        logger.warning("  ⚠️ 기타 인덱스 쿼리가 비어 있어 match_all로 대체합니다")
+                        other_query_body['query'] = {"match_all": {}}
                     os_response_other = data_fetcher.search_opensearch(
                         index_name=other_index_pattern,
-                        query=final_query,
+                        query=other_query_body,
                         size=search_size,
-                        source_filter=source_filter
+                        source_filter=source_filter,
+                        request_timeout=DEFAULT_OS_TIMEOUT,
                     )
                     other_keyword_results = os_response_other['hits']['hits']
                     logger.info(f"  ✅ OpenSearch: {len(other_keyword_results)}건")
@@ -1184,7 +1143,9 @@ async def search_natural_language(
         logger.info(f"  - welcome_1st RRF: {len(welcome_1st_rrf)}건")
         logger.info(f"  - welcome_2nd RRF: {len(welcome_2nd_rrf)}건")
         logger.info(f"  - 기타 인덱스 RRF: {len(other_rrf)}건")
-        
+
+        rrf_start = perf_counter()
+
         # user_id 기준으로 그룹화하여 RRF 재결합
         user_rrf_map = {}  # user_id -> [doc1, doc2, ...]
         
@@ -1272,6 +1233,7 @@ async def search_natural_language(
         took_ms = 0  # 여러 검색의 합이므로 정확한 시간 측정은 어려움
         
         logger.info(f"  ✅ 인덱스 간 RRF 재결합 완료: {len(rrf_results)}건 (고유 user_id: {len(user_rrf_map)}개)")
+        timings['rrf_recombination_ms'] = (perf_counter() - rrf_start) * 1000
         
         # RRF 점수 디버깅: 상위 10개 출력
         if rrf_results:
@@ -1283,13 +1245,32 @@ async def search_natural_language(
                 logger.info(f"    {i}. doc_id={doc.get('_id', 'N/A')}, index={doc_index}, RRF={rrf_score:.6f}, "
                           f"keyword_rank={rrf_details.get('keyword_rank')}, vector_rank={rrf_details.get('vector_rank')}")
         
-        # 필터가 있는 경우, 필터 조건에 맞는 결과만 유지
-        final_hits = rrf_results
-        # 배치 조회 결과를 루프 밖에서 선언 (필터 재적용과 결과 포맷팅 모두에서 사용)
-        welcome_1st_batch = {}
-        welcome_2nd_batch = {}
-        
-        if filters:
+        demographic_filters: Dict[DemographicType, List["DemographicEntity"]] = defaultdict(list)
+        for demo in extracted_entities.demographics:
+            demographic_filters[demo.demographic_type].append(demo)
+
+        filtered_rrf_results: List[Dict[str, Any]] = rrf_results
+
+        occupation_display_map: Dict[str, str] = {}
+
+        if has_demographic_filters:
+            filter_start = perf_counter()
+
+            synonym_cache: Dict[str, List[str]] = {}
+            for demo in extracted_entities.demographics:
+                cache_key = f"{demo.demographic_type.value}:{demo.raw_value}"
+                if demo.demographic_type in {DemographicType.GENDER, DemographicType.OCCUPATION}:
+                    try:
+                        from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
+                        expander = get_synonym_expander()
+                        synonym_cache[cache_key] = expander.expand(demo.raw_value)
+                    except Exception:
+                        synonyms = [demo.raw_value]
+                        synonyms.extend([syn for syn in demo.synonyms if syn])
+                        synonym_cache[cache_key] = synonyms
+                else:
+                    synonym_cache[cache_key] = [demo.raw_value]
+            
             # 성능 최적화: 배치 조회를 위해 먼저 모든 user_id 수집
             user_ids_to_fetch = set()
             doc_user_map = {}  # doc -> user_id 매핑
@@ -1343,75 +1324,113 @@ async def search_natural_language(
                 batch_size = 200  # 배치 크기: 200건씩 분할
                 total_batches = (len(user_ids_list) + batch_size - 1) // batch_size
                 logger.info(f"🔍 배치 조회: welcome_1st/welcome_2nd {len(user_ids_list)}건 조회 중... (배치 크기: {batch_size}, 총 {total_batches}개 배치)")
-                
+
                 try:
-                    # welcome_1st 배치 조회 (분할)
-                    if user_ids_list:
-                        found_count = 0
-                        for batch_idx in range(0, len(user_ids_list), batch_size):
-                            batch_ids = user_ids_list[batch_idx:batch_idx + batch_size]
-                            batch_num = (batch_idx // batch_size) + 1
-                            try:
-                                mget_body = [{"_index": "s_welcome_1st", "_id": uid} for uid in batch_ids]
-                                mget_response = os_client.mget(body={"docs": mget_body}, ignore=[404], request_timeout=60)
-                                for item in mget_response.get('docs', []):
-                                    if item.get('found'):
-                                        welcome_1st_batch[item['_id']] = item['_source']
-                                        found_count += 1
-                                logger.debug(f"  📦 welcome_1st 배치 {batch_num}/{total_batches}: {len([d for d in mget_response.get('docs', []) if d.get('found')])}/{len(batch_ids)}건")
-                            except Exception as e:
-                                logger.warning(f"  ⚠️ welcome_1st 배치 {batch_num}/{total_batches} 실패: {e}")
-                                continue
-                        logger.info(f"  ✅ welcome_1st 배치 조회: {found_count}/{len(user_ids_list)}건 성공")
-                    
-                    # welcome_2nd 배치 조회 (분할)
-                    if user_ids_list:
-                        found_count = 0
-                        for batch_idx in range(0, len(user_ids_list), batch_size):
-                            batch_ids = user_ids_list[batch_idx:batch_idx + batch_size]
-                            batch_num = (batch_idx // batch_size) + 1
-                            try:
-                                mget_body = [{"_index": "s_welcome_2nd", "_id": uid} for uid in batch_ids]
-                                mget_response = os_client.mget(body={"docs": mget_body}, ignore=[404], request_timeout=60)
-                                for item in mget_response.get('docs', []):
-                                    if item.get('found'):
-                                        welcome_2nd_batch[item['_id']] = item['_source']
-                                        found_count += 1
-                                logger.debug(f"  📦 welcome_2nd 배치 {batch_num}/{total_batches}: {len([d for d in mget_response.get('docs', []) if d.get('found')])}/{len(batch_ids)}건")
-                            except Exception as e:
-                                logger.warning(f"  ⚠️ welcome_2nd 배치 {batch_num}/{total_batches} 실패: {e}")
-                                continue
-                        logger.info(f"  ✅ welcome_2nd 배치 조회: {found_count}/{len(user_ids_list)}건 성공")
-                    
+                    if data_fetcher.os_async_client:
+                        # 비동기 배치 조회
+                        raw_welcome_1st_docs = await data_fetcher.multi_get_documents_async(
+                            index_name="s_welcome_1st",
+                            doc_ids=user_ids_list,
+                            batch_size=batch_size
+                        ) or []
+                        welcome_1st_batch = data_fetcher.docs_to_user_map(raw_welcome_1st_docs)
+
+                        raw_welcome_2nd_docs = await data_fetcher.multi_get_documents_async(
+                            index_name="s_welcome_2nd",
+                            doc_ids=user_ids_list,
+                            batch_size=batch_size
+                        ) or []
+                        welcome_2nd_batch = data_fetcher.docs_to_user_map(raw_welcome_2nd_docs)
+                    else:
+                        # 기존 동기 방식 유지
+                        if user_ids_list:
+                            found_count = 0
+                            for batch_idx in range(0, len(user_ids_list), batch_size):
+                                batch_ids = user_ids_list[batch_idx:batch_idx + batch_size]
+                                batch_num = (batch_idx // batch_size) + 1
+                                try:
+                                    mget_body = [{"_index": "s_welcome_1st", "_id": uid} for uid in batch_ids]
+                                    mget_response = os_client.mget(body={"docs": mget_body}, ignore=[404], request_timeout=60)
+                                    for item in mget_response.get('docs', []):
+                                        if item.get('found'):
+                                            welcome_1st_batch[item['_id']] = item['_source']
+                                            found_count += 1
+                                    logger.debug(f"  📦 welcome_1st 배치 {batch_num}/{total_batches}: {len([d for d in mget_response.get('docs', []) if d.get('found')])}/{len(batch_ids)}건")
+                                except Exception as e:
+                                    logger.warning(f"  ⚠️ welcome_1st 배치 {batch_num}/{total_batches} 실패: {e}")
+                                    continue
+                            logger.info(f"  ✅ welcome_1st 배치 조회: {found_count}/{len(user_ids_list)}건 성공")
+
+                        if user_ids_list:
+                            found_count = 0
+                            for batch_idx in range(0, len(user_ids_list), batch_size):
+                                batch_ids = user_ids_list[batch_idx:batch_idx + batch_size]
+                                batch_num = (batch_idx // batch_size) + 1
+                                try:
+                                    mget_body = [{"_index": "s_welcome_2nd", "_id": uid} for uid in batch_ids]
+                                    mget_response = os_client.mget(body={"docs": mget_body}, ignore=[404], request_timeout=60)
+                                    for item in mget_response.get('docs', []):
+                                        if item.get('found'):
+                                            welcome_2nd_batch[item['_id']] = item['_source']
+                                            found_count += 1
+                                    logger.debug(f"  📦 welcome_2nd 배치 {batch_num}/{total_batches}: {len([d for d in mget_response.get('docs', []) if d.get('found')])}/{len(batch_ids)}건")
+                                except Exception as e:
+                                    logger.warning(f"  ⚠️ welcome_2nd 배치 {batch_num}/{total_batches} 실패: {e}")
+                                    continue
+                            logger.info(f"  ✅ welcome_2nd 배치 조회: {found_count}/{len(user_ids_list)}건 성공")
+
                     logger.info(f"  ✅ 배치 조회 완료: welcome_1st={len(welcome_1st_batch)}건, welcome_2nd={len(welcome_2nd_batch)}건")
-                    
-                    # ⭐ 배치 조회에서 찾지 못한 user_id에 대해 개별 조회 시도 (fallback) - 제한적으로만
+
+                    # ⭐ 배치 조회에서 찾지 못한 user_id에 대해 개별 조회 시도 (fallback)
                     missing_1st = user_ids_to_fetch - set(welcome_1st_batch.keys())
                     missing_2nd = user_ids_to_fetch - set(welcome_2nd_batch.keys())
-                    
-                    # 개별 조회는 최대 100건까지만 (성능 고려)
-                    if missing_1st and len(missing_1st) <= 100:
-                        logger.info(f"  🔍 welcome_1st 개별 조회 시도: {len(missing_1st)}건...")
-                        for uid in list(missing_1st)[:50]:  # 최대 50건만
-                            try:
-                                os_doc = os_client.get(index="s_welcome_1st", id=uid, ignore=[404], request_timeout=60)
-                                if os_doc.get('found'):
-                                    welcome_1st_batch[uid] = os_doc['_source']
-                            except Exception:
-                                continue
-                        logger.info(f"  ✅ welcome_1st 개별 조회: {len([k for k in missing_1st if k in welcome_1st_batch])}건 추가 성공")
-                    
-                    if missing_2nd and len(missing_2nd) <= 100:
-                        logger.info(f"  🔍 welcome_2nd 개별 조회 시도: {len(missing_2nd)}건...")
-                        for uid in list(missing_2nd)[:50]:  # 최대 50건만
-                            try:
-                                os_doc = os_client.get(index="s_welcome_2nd", id=uid, ignore=[404], request_timeout=60)
-                                if os_doc.get('found'):
-                                    welcome_2nd_batch[uid] = os_doc['_source']
-                            except Exception:
-                                continue
-                        logger.info(f"  ✅ welcome_2nd 개별 조회: {len([k for k in missing_2nd if k in welcome_2nd_batch])}건 추가 성공")
-                        
+
+                    if missing_1st and len(missing_1st) <= 1000:
+                        logger.info(f"  🔍 welcome_1st 추가 조회 시도: {len(missing_1st)}건...")
+                        missing_ids = list(missing_1st)
+                        if data_fetcher.os_async_client:
+                            extra_docs_raw = await data_fetcher.multi_get_documents_async(
+                                index_name="s_welcome_1st",
+                                doc_ids=missing_ids,
+                                batch_size=200
+                            )
+                            welcome_1st_batch.update(data_fetcher.docs_to_user_map(extra_docs_raw))
+                        else:
+                            response = os_client.mget(
+                                index="s_welcome_1st",
+                                body={"ids": missing_ids},
+                                _source=["metadata", "user_id", "qa_pairs"],
+                                request_timeout=60,
+                                ignore=[404]
+                            )
+                            for doc in response.get('docs', []):
+                                if doc.get('found'):
+                                    welcome_1st_batch[doc['_id']] = doc['_source']
+                        logger.info(f"  ✅ welcome_1st 추가 조회 후 총 {len(welcome_1st_batch)}건")
+
+                    if missing_2nd and len(missing_2nd) <= 1000:
+                        logger.info(f"  🔍 welcome_2nd 추가 조회 시도: {len(missing_2nd)}건...")
+                        missing_ids = list(missing_2nd)
+                        if data_fetcher.os_async_client:
+                            extra_docs_raw = await data_fetcher.multi_get_documents_async(
+                                index_name="s_welcome_2nd",
+                                doc_ids=missing_ids,
+                                batch_size=200
+                            )
+                            welcome_2nd_batch.update(data_fetcher.docs_to_user_map(extra_docs_raw))
+                        else:
+                            response = os_client.mget(
+                                index="s_welcome_2nd",
+                                body={"ids": missing_ids},
+                                _source=["metadata", "user_id", "qa_pairs"],
+                                request_timeout=60,
+                                ignore=[404]
+                            )
+                            for doc in response.get('docs', []):
+                                if doc.get('found'):
+                                    welcome_2nd_batch[doc['_id']] = doc['_source']
+                        logger.info(f"  ✅ welcome_2nd 추가 조회 후 총 {len(welcome_2nd_batch)}건")
+
                 except Exception as e:
                     logger.warning(f"  ⚠️ 배치 조회 실패: {e}, 개별 조회로 fallback")
             
@@ -1430,809 +1449,466 @@ async def search_natural_language(
                 logger.info(f"  샘플 {i+1}. user_id={user_id}, metadata={source.get('metadata', {}) if isinstance(source, dict) else 'N/A'}")
             
             # 필터 재적용
-            filtered_rrf_results = []
-            source_not_found_count = 0
-            low_score_count = 0
-            opposite_count = 0
-            
-            # 필터별 미충족 통계
-            age_filter_failed = 0
-            gender_filter_failed = 0
-            occupation_filter_failed = 0
-            both_filters_failed = 0
-            age_filter_failed_count = 0  # 디버깅용 카운터
-            
-            for doc in rrf_results:
-                # source 추출 (여러 경로 시도)
-                source = doc.get('_source', {})
-                if not source and 'doc' in doc:
-                    source = doc.get('doc', {}).get('_source', {})
-                
-                # Qdrant 결과인 경우 payload에서 추출
-                if not source or not isinstance(source, dict):
-                    payload = source.get('payload', {}) if isinstance(source, dict) else {}
-                    if isinstance(payload, dict) and payload:
-                        source = payload
-                
-                # user_id로 OpenSearch에서 실제 문서 조회 (필터 확인을 위해)
-                user_id = source.get('user_id') if isinstance(source, dict) else None
-                if not user_id:
-                    user_id = doc.get('_id', '')
-                
-                # OpenSearch에서 실제 문서 조회 (필터 확인을 위해)
-                if user_id and user_id in user_doc_map:
-                    source = user_doc_map[user_id]['source']
-                elif user_id:
-                    # 직접 조회 시도
+            PLACEHOLDER_TOKENS = {
+                "",
+                "미정",
+                "없음",
+                "무응답",
+                "해당없음",
+                "n/a",
+                "na",
+                "null",
+                "none",
+                "unknown",
+                "미선택",
+                "미기재",
+            }
+            PLACEHOLDER_TOKENS = {token.strip().lower() for token in PLACEHOLDER_TOKENS}
+
+            def normalize_value(value: Any) -> str:
+                if value is None:
+                    return ""
+                if isinstance(value, bool):
+                    value_str = str(value)
+                if isinstance(value, (int, float)):
                     try:
-                        for idx_name in [request.index_name] if request.index_name != '*' else ['s_welcome_2nd', 'survey_250106', 'survey_250107']:
-                            try:
-                                os_doc = os_client.get(index=idx_name, id=user_id, ignore=[404], request_timeout=60)
-                                if os_doc.get('found'):
-                                    source = os_doc['_source']
-                                    break
-                            except Exception:
-                                continue
-                    except Exception:
+                        if value.is_integer():  # type: ignore[attr-defined]
+                            value = int(value)
+                    except AttributeError:
                         pass
-                
-                if not source or not isinstance(source, dict):
-                    # source를 찾을 수 없으면 필터 통과 불가
+                    value_str = str(value)
+                else:
+                    value_str = str(value)
+
+                cleaned = value_str.strip()
+                lower = cleaned.lower()
+                if lower in PLACEHOLDER_TOKENS:
+                    return ""
+                return lower
+
+            def build_expected_values(demo: "DemographicEntity") -> Set[str]:
+                key = f"{demo.demographic_type.value}:{demo.raw_value}"
+                expected: Set[str] = set()
+                expected.add(demo.raw_value)
+                expected.add(demo.value)
+                expected.update(demo.synonyms or set())
+                expected.update(synonym_cache.get(key, []))
+                return {normalize_value(v) for v in expected if v}
+
+            def values_match(values: Set[str], expected: Set[str]) -> bool:
+                if not values or not expected:
+                    return False
+                for val in values:
+                    if not val:
+                        continue
+                    for exp in expected:
+                        if not exp:
+                            continue
+                        if val == exp or val in exp or exp in val:
+                            return True
+                return False
+
+            def expand_gender_aliases(values: Set[str]) -> None:
+                male_aliases = {"m", "남", "남성", "male", "man", "남자"}
+                female_aliases = {"f", "여", "여성", "female", "woman", "여자"}
+                if values & male_aliases:
+                    values.update(male_aliases)
+                if values & female_aliases:
+                    values.update(female_aliases)
+
+            def add_age_decade(values: Set[str], age_value: Any) -> None:
+                if age_value in (None, ""):
+                    return
+                try:
+                    age_int = int(age_value)
+                    decade = (age_int // 10) * 10
+                    for candidate in (f"{decade}대", f"{decade}s", str(age_int)):
+                        normalized_candidate = normalize_value(candidate)
+                        if normalized_candidate:
+                            values.add(normalized_candidate)
+                except (ValueError, TypeError):
+                    pass
+
+            def collect_doc_values(
+                user_id: str,
+                source: Dict[str, Any],
+                metadata_1st: Dict[str, Any],
+                metadata_2nd: Dict[str, Any],
+            ) -> Tuple[Dict[DemographicType, Set[str]], Dict[DemographicType, bool]]:
+                doc_values: Dict[DemographicType, Set[str]] = {
+                    DemographicType.GENDER: set(),
+                    DemographicType.AGE: set(),
+                    DemographicType.OCCUPATION: set(),
+                }
+                metadata_presence: Dict[DemographicType, bool] = {
+                    DemographicType.GENDER: False,
+                    DemographicType.AGE: False,
+                    DemographicType.OCCUPATION: False,
+                }
+
+                # Common metadata sources
+                metadata_candidates = [
+                    metadata_1st,
+                    metadata_2nd,
+                    source.get("metadata", {}) if isinstance(source, dict) else {},
+                ]
+
+                payload = {}
+                if isinstance(source, dict):
+                    payload_candidate = source.get("payload")
+                    if isinstance(payload_candidate, dict):
+                        payload = payload_candidate
+                if not payload and isinstance(source, dict) and "doc" in source:
+                    doc_payload = source.get("doc", {}).get("payload")
+                    if isinstance(doc_payload, dict):
+                        payload = doc_payload
+                if not payload and isinstance(source, dict):
+                    payload = source
+
+                if isinstance(payload, dict):
+                    metadata_candidates.append(payload.get("metadata", {}))
+
+                for candidate in metadata_candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+
+                    gender_val = candidate.get("gender") or candidate.get("gender_code")
+                    if gender_val:
+                        normalized_gender = normalize_value(gender_val)
+                        if normalized_gender:
+                            doc_values[DemographicType.GENDER].add(normalized_gender)
+                            metadata_presence[DemographicType.GENDER] = True
+
+                    age_group_val = candidate.get("age_group")
+                    if age_group_val:
+                        normalized_age_group = normalize_value(age_group_val)
+                        if normalized_age_group:
+                            doc_values[DemographicType.AGE].add(normalized_age_group)
+                            metadata_presence[DemographicType.AGE] = True
+
+                    age_val = candidate.get("age")
+                    if age_val:
+                        pre_count = len(doc_values[DemographicType.AGE])
+                        add_age_decade(doc_values[DemographicType.AGE], age_val)
+                        if len(doc_values[DemographicType.AGE]) > pre_count:
+                            metadata_presence[DemographicType.AGE] = True
+
+                    birth_year_val = candidate.get("birth_year")
+                    if birth_year_val:
+                        normalized_birth_year = normalize_value(birth_year_val)
+                        if normalized_birth_year:
+                            doc_values[DemographicType.AGE].add(normalized_birth_year)
+                            metadata_presence[DemographicType.AGE] = True
+
+                    occupation_val = candidate.get("occupation") or candidate.get("job")
+                    if occupation_val:
+                        normalized_occupation = normalize_value(occupation_val)
+                        if normalized_occupation:
+                            doc_values[DemographicType.OCCUPATION].add(normalized_occupation)
+                            metadata_presence[DemographicType.OCCUPATION] = True
+
+                    job_group_val = candidate.get("job_group") or candidate.get("occupation_group")
+                    if job_group_val:
+                        normalized_job_group = normalize_value(job_group_val)
+                        if normalized_job_group:
+                            doc_values[DemographicType.OCCUPATION].add(normalized_job_group)
+                            metadata_presence[DemographicType.OCCUPATION] = True
+
+                # QA 기반 보완 (직업) - 메타데이터가 비었을 때만 사용
+                if not metadata_presence[DemographicType.OCCUPATION]:
+                    qa_sources: List[List[Dict[str, Any]]] = []
+                    if isinstance(source, dict):
+                        qa_sources.append(source.get("qa_pairs", []) or [])
+                    welcome_2nd_doc = welcome_2nd_batch.get(user_id, {})
+                    if isinstance(welcome_2nd_doc, dict):
+                        qa_sources.append(welcome_2nd_doc.get("qa_pairs", []) or [])
+
+                    for qa_pairs in qa_sources:
+                        for qa in qa_pairs:
+                            if not isinstance(qa, dict):
+                                continue
+                            q_text = str(qa.get("q_text", "")).lower()
+                            answer_text = qa.get("answer") or qa.get("answer_text")
+                            if not answer_text:
+                                continue
+                            if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
+                                normalized_answer = normalize_value(answer_text)
+                                if normalized_answer:
+                                    doc_values[DemographicType.OCCUPATION].add(normalized_answer)
+
+                # Normalize
+                for demo_type, values in doc_values.items():
+                    normalized = {normalize_value(v) for v in values if v}
+                    if demo_type == DemographicType.GENDER:
+                        expand_gender_aliases(normalized)
+                    doc_values[demo_type] = normalized
+
+                return doc_values, metadata_presence
+
+            filtered_list: List[Dict[str, Any]] = []
+            source_not_found_count = 0
+            gender_filter_failed = 0
+            age_filter_failed = 0
+            occupation_filter_failed = 0
+            gender_metadata_missing = 0
+            age_metadata_missing = 0
+            occupation_metadata_missing = 0
+            for doc in rrf_results:
+                source = doc.get("_source")
+                if not source and "doc" in doc:
+                    source = doc.get("doc", {}).get("_source")
+                if not source and "payload" in doc:
+                    source = doc.get("payload")
+
+                if not isinstance(source, dict):
                     source_not_found_count += 1
                     continue
-                
-                # ⭐ 필터 조건 확인 (must: 모든 필터를 만족해야 함)
-                # welcome_1st: 연령/성별 정보, welcome_2nd: 직업 정보
-                # user_id로 인덱스 간 데이터를 연결하여 확인
-                matches_all_filters = True
-                
-                # user_id로 welcome_1st와 welcome_2nd에서 각각 정보 확인
-                user_id = source.get('user_id') if isinstance(source, dict) else None
+
+                user_id = source.get("user_id") or doc.get("_id") or doc.get("id")
+                if not user_id and "payload" in doc and isinstance(doc["payload"], dict):
+                    user_id = doc["payload"].get("user_id")
+
                 if not user_id:
-                    user_id = doc.get('_id', '')
-                    # doc_user_map에서도 확인
-                    if not user_id:
-                        user_id = doc_user_map.get(id(doc))
-                
-                # ⭐ 배치 조회 결과에서 가져오기 (캐시된 데이터 사용)
-                welcome_1st_source = welcome_1st_batch.get(user_id) if user_id else None
-                welcome_1st_found = welcome_1st_source is not None
-                
-                # ⭐ 배치 조회에서 찾지 못한 경우 개별 조회 시도 (fallback)
-                if not welcome_1st_found and user_id:
-                    try:
-                        os_doc = os_client.get(index="s_welcome_1st", id=user_id, ignore=[404], request_timeout=60)
-                        if os_doc.get('found'):
-                            welcome_1st_source = os_doc['_source']
-                            welcome_1st_batch[user_id] = welcome_1st_source  # 캐시에 추가
-                            welcome_1st_found = True
-                    except Exception:
-                        pass
-                
-                # welcome_2nd에서 직업 정보 확인 (현재 source가 welcome_2nd일 수 있음)
-                welcome_2nd_source = source if source.get('metadata', {}).get('occupation') != '미정' or any('직업' in str(qa.get('q_text', '')) for qa in source.get('qa_pairs', [])) else None
-                welcome_2nd_found = bool(welcome_2nd_source)
-                
-                # 배치 조회 결과에서 가져오기 (fallback)
-                if not welcome_2nd_source and user_id:
-                    welcome_2nd_source = welcome_2nd_batch.get(user_id)
-                    welcome_2nd_found = welcome_2nd_source is not None
-                
-                # ⭐ 배치 조회에서 찾지 못한 경우 개별 조회 시도 (fallback)
-                if not welcome_2nd_found and user_id:
-                    try:
-                        os_doc = os_client.get(index="s_welcome_2nd", id=user_id, ignore=[404], request_timeout=60)
-                        if os_doc.get('found'):
-                            welcome_2nd_source = os_doc['_source']
-                            welcome_2nd_batch[user_id] = welcome_2nd_source  # 캐시에 추가
-                            welcome_2nd_found = True
-                    except Exception:
-                        pass
-                
-                # 디버깅: welcome_1st/welcome_2nd 조회 결과 로깅 (처음 10개만)
-                # ⚠️ 연령 필터 실패가 많으므로 더 자세히 로깅
-                if opposite_count < 10 or (opposite_count < 20 and not welcome_1st_found):
-                    logger.warning(f"🔍 user_id={user_id}: welcome_1st={welcome_1st_found}, welcome_2nd={welcome_2nd_found}, source_index={source.get('_index', 'unknown')}")
-                    if not welcome_1st_found and user_id:
-                        logger.warning(f"   ⚠️ welcome_1st 조회 실패 (배치+개별 모두 시도했지만 찾지 못함): user_id={user_id}")
-                
-                # 각 demographic 필터 확인 (must: 모든 필터를 만족해야 함)
-                filter_match_details = {}  # 디버깅용
-                for demo in extracted_entities.demographics:
-                    matches_this_filter = False
-                    match_source = None  # 어디서 매칭되었는지 추적
-                    
-                    if demo.demographic_type == DemographicType.AGE:
-                        from datetime import datetime
-                        # ⭐ 1순위: welcome_1st에서 연령 정보 확인
-                        if welcome_1st_source:
-                            age_group = welcome_1st_source.get('metadata', {}).get('age_group', '')
-                            birth_year = welcome_1st_source.get('metadata', {}).get('birth_year', '')
-                            
-                            if age_group == demo.raw_value:
-                                matches_this_filter = True
-                                match_source = f"welcome_1st.metadata.age_group={age_group}"
-                            elif birth_year and birth_year != '미정':
-                                # 출생년도로 계산
-                                current_year = datetime.now().year
-                                try:
-                                    birth_year_int = int(birth_year)
-                                    age = current_year - birth_year_int
-                                    
-                                    if demo.raw_value == "30대" and 30 <= age < 40:
-                                        matches_this_filter = True
-                                        match_source = f"welcome_1st.metadata.birth_year={birth_year} (age={age})"
-                                    elif demo.raw_value == "20대" and 20 <= age < 30:
-                                        matches_this_filter = True
-                                        match_source = f"welcome_1st.metadata.birth_year={birth_year} (age={age})"
-                                    elif demo.raw_value == "40대" and 40 <= age < 50:
-                                        matches_this_filter = True
-                                        match_source = f"welcome_1st.metadata.birth_year={birth_year} (age={age})"
-                                except (ValueError, TypeError):
-                                    pass
-                        
-                        # ⭐ 연령 정보는 welcome_1st에만 있으므로, welcome_1st_source가 없으면 필터 통과 불가
-                        # 디버깅: 연령 필터 실패 시 상세 로깅 (처음 10개만)
-                        if not matches_this_filter and age_filter_failed_count < 10:
-                            logger.warning(f"🔍 [연령 필터 실패] user_id={user_id}:")
-                            logger.warning(f"   - 요청 연령: {demo.raw_value}")
-                            if welcome_1st_source:
-                                age_group = welcome_1st_source.get('metadata', {}).get('age_group', '')
-                                birth_year = welcome_1st_source.get('metadata', {}).get('birth_year', '')
-                                logger.warning(f"   - welcome_1st.age_group: '{age_group}'")
-                                logger.warning(f"   - welcome_1st.birth_year: '{birth_year}'")
-                                logger.warning(f"   - age_group 매칭: {age_group == demo.raw_value}")
-                                if birth_year and birth_year != '미정':
-                                    try:
-                                        age = datetime.now().year - int(birth_year)
-                                        logger.warning(f"   - 계산된 나이: {age}세")
-                                        logger.warning(f"   - 30대 범위 체크: {30 <= age < 40}")
-                                    except:
-                                        pass
-                            else:
-                                logger.warning(f"   - welcome_1st: 없음 (연령 정보는 welcome_1st에만 있음)")
-                        
-                        # ⭐ 필터 실패 시 카운터 증가
-                        if not matches_this_filter:
-                            age_filter_failed_count += 1
-                    
-                    elif demo.demographic_type == DemographicType.GENDER:
-                        # ⭐ 동의어 확장기 사용
-                        try:
-                            from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
-                            expander = get_synonym_expander()
-                            gender_synonyms = expander.expand(demo.raw_value)
-                        except Exception:
-                            # 동의어 확장기 실패 시 기본 동의어 사용
-                            gender_synonyms = [demo.raw_value]
-                            gender_synonyms.extend([syn for syn in demo.synonyms if syn])
-                        
-                        # welcome_1st에서 성별 정보 확인
-                        if welcome_1st_source:
-                            gender = welcome_1st_source.get('metadata', {}).get('gender', '')
-                            # ⭐ 동의어 확장된 값들과 매칭
-                            if gender in gender_synonyms:
-                                matches_this_filter = True
-                                match_source = f"welcome_1st.metadata.gender={gender}"
-                        
-                        # qa_pairs에서도 확인 (fallback)
-                        if not matches_this_filter:
-                            for src in [welcome_1st_source, source]:
-                                if not src:
-                                    continue
-                                qa_pairs_list = src.get('qa_pairs', [])
-                                if isinstance(qa_pairs_list, list):
-                                    for qa in qa_pairs_list:
-                                        if isinstance(qa, dict):
-                                            q_text = qa.get('q_text', '')
-                                            answer = qa.get('answer', qa.get('answer_text', ''))
-                                            
-                                            if '성별' in q_text or 'gender' in q_text.lower():
-                                                answer_str = str(answer).lower()
-                                                # ⭐ 동의어 확장된 값들과 매칭
-                                                if any(syn.lower() in answer_str or syn in str(answer) for syn in gender_synonyms):
-                                                    matches_this_filter = True
-                                                    match_source = f"qa_pairs.{q_text}={answer}"
-                                                    break
-                    
-                    elif demo.demographic_type == DemographicType.OCCUPATION:
-                        # ⭐ 동의어 확장기 사용
-                        try:
-                            from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
-                            expander = get_synonym_expander()
-                            occupation_synonyms = expander.expand(demo.raw_value)
-                        except Exception:
-                            # 동의어 확장기 실패 시 기본 동의어 사용
-                            occupation_synonyms = [demo.raw_value]
-                            occupation_synonyms.extend([syn for syn in demo.synonyms if syn])
-                        
-                        # ⭐ 직업 정보는 qa_pairs에서만 확인 (metadata.occupation 필드가 없거나 "미정"인 경우가 많음)
-                        # welcome_2nd_source 우선 확인
-                        if welcome_2nd_source:
-                            qa_pairs_list = welcome_2nd_source.get('qa_pairs', [])
-                            if isinstance(qa_pairs_list, list):
-                                for qa in qa_pairs_list:
-                                    if isinstance(qa, dict):
-                                        q_text = qa.get('q_text', '')
-                                        answer = qa.get('answer', qa.get('answer_text', ''))
-                                        
-                                        # 직업 질문 확인
-                                        if '직업' in q_text or 'occupation' in q_text.lower() or '직무' in q_text:
-                                            answer_str = str(answer).lower()
-                                            # ⭐ 동의어 확장된 값들과 매칭
-                                            if any(syn.lower() in answer_str or syn in str(answer) for syn in occupation_synonyms):
-                                                matches_this_filter = True
-                                                match_source = f"welcome_2nd.qa_pairs.{q_text}={answer}"
-                                                break
-                        
-                        # ⭐ welcome_2nd_source에서 못 찾으면 현재 source의 qa_pairs에서 확인 (fallback)
-                        if not matches_this_filter:
-                            for src in [source]:
-                                if not src:
-                                    continue
-                                qa_pairs_list = src.get('qa_pairs', [])
-                                if isinstance(qa_pairs_list, list):
-                                    for qa in qa_pairs_list:
-                                        if isinstance(qa, dict):
-                                            q_text = qa.get('q_text', '')
-                                            answer = qa.get('answer', qa.get('answer_text', ''))
-                                            
-                                            # 직업 질문 확인
-                                            if '직업' in q_text or 'occupation' in q_text.lower() or '직무' in q_text:
-                                                answer_str = str(answer).lower()
-                                                # ⭐ 동의어 확장된 값들과 매칭
-                                                if any(syn.lower() in answer_str or syn in str(answer) for syn in occupation_synonyms):
-                                                    matches_this_filter = True
-                                                    match_source = f"source.qa_pairs.{q_text}={answer}"
-                                                    break
-                    
-                    # 필터 매칭 결과 저장
-                    filter_match_details[demo.demographic_type.value] = {
-                        'matched': matches_this_filter,
-                        'source': match_source,
-                        'raw_value': demo.raw_value
-                    }
-                    
-                    # 하나라도 필터를 만족하지 않으면 제외
-                    if not matches_this_filter:
-                        matches_all_filters = False
-                        # 필터별 미충족 통계
-                        if demo.demographic_type == DemographicType.AGE:
-                            age_filter_failed += 1
-                        elif demo.demographic_type == DemographicType.GENDER:
-                            gender_filter_failed += 1
-                        elif demo.demographic_type == DemographicType.OCCUPATION:
-                            occupation_filter_failed += 1
-                        logger.debug(f"❌ user_id={user_id}: {demo.demographic_type.value} 필터 미충족 (요구: {demo.raw_value})")
-                        break
-                    else:
-                        logger.debug(f"✅ user_id={user_id}: {demo.demographic_type.value} 필터 충족 (요구: {demo.raw_value}, 매칭: {match_source})")
-                
-                # 모든 필터를 만족하는 문서만 포함 (for 루프 밖에서 확인)
-                if matches_all_filters:
-                    filtered_rrf_results.append(doc)
-                    logger.debug(f"✅ user_id={user_id}: 모든 필터 충족 - 포함됨")
-                else:
-                    opposite_count += 1
-                    # 두 필터 모두 미충족인지 확인
-                    age_matched = filter_match_details.get('age', {}).get('matched', False)
-                    occupation_matched = filter_match_details.get('occupation', {}).get('matched', False)
-                    if not age_matched and not occupation_matched:
-                        both_filters_failed += 1
-                    # ⭐ 제외된 문서 샘플 상세 로깅 (처음 10개만)
-                    if opposite_count <= 10:
-                        logger.warning(f"❌ 제외된 문서 샘플 {opposite_count}:")
-                        logger.warning(f"   user_id: {user_id}")
-                        logger.warning(f"   welcome_1st: {welcome_1st_source is not None}")
-                        logger.warning(f"   welcome_2nd: {welcome_2nd_source is not None}")
-                        if welcome_1st_source:
-                            metadata_1st = welcome_1st_source.get('metadata', {})
-                            logger.warning(f"   age_group: {metadata_1st.get('age_group', 'N/A')}")
-                            logger.warning(f"   gender: {metadata_1st.get('gender', 'N/A')}")
-                            logger.warning(f"   birth_year: {metadata_1st.get('birth_year', 'N/A')}")
-                        if welcome_2nd_source:
-                            metadata_2nd = welcome_2nd_source.get('metadata', {})
-                            logger.warning(f"   occupation (metadata): {metadata_2nd.get('occupation', 'N/A')}")
-                            qa_pairs = welcome_2nd_source.get('qa_pairs', [])
-                            qa_texts = [qa.get('q_text', '') for qa in qa_pairs[:5] if isinstance(qa, dict)]
-                            logger.warning(f"   qa_pairs (처음 5개): {qa_texts}")
-                        logger.warning(f"   필터 매칭 상세: {filter_match_details}")
-                    logger.debug(f"❌ user_id={user_id}: 필터 미충족 - 제외됨 (상세: {filter_match_details})")
-            
-            final_hits = filtered_rrf_results[:size]
-            logger.info(f"🔍 RRF 후 필터 재적용: {len(rrf_results)}건 → {len(filtered_rrf_results)}건")
-            logger.info(f"  - source를 찾지 못한 문서: {source_not_found_count}건")
-            logger.info(f"  - RRF 점수 낮음 (0.001 미만): {low_score_count}건")
-            logger.info(f"  - 필터 조건 미충족 문서: {opposite_count}건")
-            logger.info(f"  - 필터 조건 충족 문서: {len(filtered_rrf_results)}건 (요청 size: {size})")
-            logger.info(f"📊 필터별 미충족 통계:")
-            logger.info(f"  - 연령 필터 미충족: {age_filter_failed}건")
-            logger.info(f"  - 성별 필터 미충족: {gender_filter_failed}건")
-            logger.info(f"  - 직업 필터 미충족: {occupation_filter_failed}건")
-            logger.info(f"  - 두 필터 모두 미충족: {both_filters_failed}건")
-            
-            # 필터 조건 미충족 문서가 많으면 경고
-            if opposite_count > len(filtered_rrf_results) * 2:
-                logger.warning(f"⚠️ 필터 조건 미충족 문서가 많습니다 ({opposite_count}건). 필터 로직을 확인해주세요.")
-        else:
-            final_hits = rrf_results[:size]
-            logger.info(f"🔍 RRF 결과 사용 (필터 없음): {len(final_hits)}건")
-        
-        logger.info(f"🔍 최종 결과: {len(final_hits)}건")
-
-        results = []
-        for doc in final_hits:
-            # RRF 결과에서 user_id 추출 (여러 경로 시도)
-            source = doc.get('_source', {})
-            if not source and 'doc' in doc:
-                # RRF 결과 구조 확인
-                source = doc.get('doc', {}).get('_source', {})
-            
-            payload = source.get('payload', {}) if isinstance(source.get('payload'), dict) else {}
-            user_id = (
-                source.get('user_id') or 
-                payload.get('user_id') or 
-                doc.get('_id', '') or
-                doc.get('doc', {}).get('_id', '')
-            )
-            
-            # OpenSearch에서 실제 문서 조회
-            doc_id = doc.get('_id', '')
-            welcome_1st_source = None  # 연령/성별 정보용
-            welcome_2nd_source = None  # 직업 정보용
-            
-            if user_id in user_doc_map:
-                # user_id로 매핑된 경우
-                doc_data = user_doc_map[user_id]
-                source = doc_data['source']
-                inner_hits = doc_data['inner_hits']
-                highlight = doc_data['highlight']
-            elif doc_id in id_doc_map:
-                # _id로 매핑된 경우
-                doc_data = id_doc_map[doc_id]
-                source = doc_data['source']
-                inner_hits = doc_data['inner_hits']
-                highlight = doc_data['highlight']
-            else:
-                # Qdrant 결과인 경우, OpenSearch에서 조회 시도
-                source = {}
-                inner_hits = {}
-                highlight = None
-                
-                # Qdrant payload에서 index 정보 확인
-                qdrant_index = payload.get('index')
-                index_candidates = []
-                if qdrant_index:
-                    index_candidates.append(qdrant_index)
-                
-                # index_name에서 실제 인덱스 목록 추출
-                if request.index_name == '*':
-                    # 모든 인덱스 시도 (일반적인 인덱스 이름들)
-                    index_candidates.extend(['s_welcome_2nd', 'survey_250106', 'survey_250107'])
-                else:
-                    index_candidates.extend([idx.strip() for idx in request.index_name.split(',')])
-                
-                # 각 인덱스에서 문서 조회 시도
-                for idx_name in index_candidates:
-                    try:
-                        os_doc = os_client.get(index=idx_name, id=user_id, ignore=[404], request_timeout=60)
-                        if os_doc.get('found'):
-                            source = os_doc['_source']
-                            break
-                    except Exception:
-                        continue
-            
-            # ⭐ welcome_1st와 welcome_2nd에서 정보 조회 (결과에 포함하기 위해)
-            # 배치 조회 결과에서 가져오기 (이미 조회한 데이터 재사용)
-            welcome_1st_source = None
-            welcome_2nd_source = None
-            
-            # ⭐ 필터가 있는 경우, 최종 결과 포매팅 단계에서 필터 조건 재확인
-            if filters and extracted_entities:
-                # 필터 조건을 만족하는지 확인
-                matches_all_filters = True
-                
-                if user_id:
-                    # 배치 조회 결과에서 가져오기
-                    welcome_1st_source = welcome_1st_batch.get(user_id) if user_id in welcome_1st_batch else None
-                    welcome_2nd_source = welcome_2nd_batch.get(user_id) if user_id in welcome_2nd_batch else None
-                    
-                    # 개별 조회 fallback
-                    if not welcome_1st_source and user_id:
-                        try:
-                            os_doc = os_client.get(index="s_welcome_1st", id=user_id, ignore=[404], request_timeout=60)
-                            if os_doc.get('found'):
-                                welcome_1st_source = os_doc['_source']
-                        except Exception:
-                            pass
-                    
-                    if not welcome_2nd_source and user_id:
-                        try:
-                            os_doc = os_client.get(index="s_welcome_2nd", id=user_id, ignore=[404], request_timeout=60)
-                            if os_doc.get('found'):
-                                welcome_2nd_source = os_doc['_source']
-                        except Exception:
-                            pass
-                
-                # 각 필터 조건 확인
-                for demo in extracted_entities.demographics:
-                    matches_this_filter = False
-                    
-                    if demo.demographic_type == DemographicType.AGE:
-                        if welcome_1st_source:
-                            age_group = welcome_1st_source.get('metadata', {}).get('age_group', '')
-                            birth_year = welcome_1st_source.get('metadata', {}).get('birth_year', '')
-                            
-                            if age_group == demo.raw_value:
-                                matches_this_filter = True
-                            elif birth_year and birth_year != '미정':
-                                from datetime import datetime
-                                try:
-                                    age = datetime.now().year - int(birth_year)
-                                    if demo.raw_value == "30대" and 30 <= age < 40:
-                                        matches_this_filter = True
-                                    elif demo.raw_value == "20대" and 20 <= age < 30:
-                                        matches_this_filter = True
-                                    elif demo.raw_value == "40대" and 40 <= age < 50:
-                                        matches_this_filter = True
-                                except (ValueError, TypeError):
-                                    pass
-                        
-                        # qa_pairs에서도 확인 (fallback)
-                        if not matches_this_filter:
-                            for src in [welcome_1st_source, source]:
-                                if not src:
-                                    continue
-                                qa_pairs_list = src.get('qa_pairs', [])
-                                if isinstance(qa_pairs_list, list):
-                                    for qa in qa_pairs_list:
-                                        if isinstance(qa, dict):
-                                            q_text = qa.get('q_text', '')
-                                            answer = qa.get('answer', qa.get('answer_text', ''))
-                                            if any(kw in q_text for kw in ['출생년도', '출생', '연령', '나이', '연령대', 'age']):
-                                                # 동의어 확장 사용
-                                                try:
-                                                    from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
-                                                    expander = get_synonym_expander()
-                                                    age_synonyms = expander.expand(demo.raw_value)
-                                                except Exception:
-                                                    age_synonyms = [demo.raw_value]
-                                                    age_synonyms.extend([syn for syn in demo.synonyms if syn])
-                                                
-                                                answer_str = str(answer).lower()
-                                                if any(syn.lower() in answer_str or syn in str(answer) for syn in age_synonyms):
-                                                    matches_this_filter = True
-                                                    break
-                    
-                    elif demo.demographic_type == DemographicType.GENDER:
-                        # ⭐ 성별 필터 확인 추가
-                        # welcome_1st에서 성별 정보 확인
-                        if welcome_1st_source:
-                            gender = welcome_1st_source.get('metadata', {}).get('gender', '')
-                            # 동의어 확장 사용
-                            try:
-                                from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
-                                expander = get_synonym_expander()
-                                gender_synonyms = expander.expand(demo.raw_value)
-                            except Exception:
-                                gender_synonyms = [demo.raw_value]
-                                gender_synonyms.extend([syn for syn in demo.synonyms if syn])
-                            
-                            if gender in gender_synonyms:
-                                matches_this_filter = True
-                        
-                        # qa_pairs에서도 확인 (fallback)
-                        if not matches_this_filter:
-                            for src in [welcome_1st_source, source]:
-                                if not src:
-                                    continue
-                                qa_pairs_list = src.get('qa_pairs', [])
-                                if isinstance(qa_pairs_list, list):
-                                    for qa in qa_pairs_list:
-                                        if isinstance(qa, dict):
-                                            q_text = qa.get('q_text', '')
-                                            answer = qa.get('answer', qa.get('answer_text', ''))
-                                            if '성별' in q_text or 'gender' in q_text.lower():
-                                                # 동의어 확장 사용
-                                                try:
-                                                    from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
-                                                    expander = get_synonym_expander()
-                                                    gender_synonyms = expander.expand(demo.raw_value)
-                                                except Exception:
-                                                    gender_synonyms = [demo.raw_value]
-                                                    gender_synonyms.extend([syn for syn in demo.synonyms if syn])
-                                                
-                                                answer_str = str(answer).lower()
-                                                if any(syn.lower() in answer_str or syn in str(answer) for syn in gender_synonyms):
-                                                    matches_this_filter = True
-                                                    break
-                    
-                    elif demo.demographic_type == DemographicType.OCCUPATION:
-                        # welcome_2nd_source 우선 확인
-                        if welcome_2nd_source:
-                            qa_pairs_list = welcome_2nd_source.get('qa_pairs', [])
-                            if isinstance(qa_pairs_list, list):
-                                for qa in qa_pairs_list:
-                                    if isinstance(qa, dict):
-                                        q_text = qa.get('q_text', '')
-                                        answer = qa.get('answer', qa.get('answer_text', ''))
-                                        if '직업' in q_text or 'occupation' in q_text.lower() or '직무' in q_text:
-                                            # 동의어 확장 사용
-                                            try:
-                                                from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
-                                                expander = get_synonym_expander()
-                                                occupation_synonyms = expander.expand(demo.raw_value)
-                                            except Exception:
-                                                occupation_synonyms = [demo.raw_value]
-                                                occupation_synonyms.extend([syn for syn in demo.synonyms if syn])
-                                            
-                                            answer_str = str(answer).lower()
-                                            if any(syn.lower() in answer_str or syn in str(answer) for syn in occupation_synonyms):
-                                                matches_this_filter = True
-                                                break
-                        
-                        # welcome_2nd_source에서 못 찾으면 현재 source의 qa_pairs에서 확인 (fallback)
-                        if not matches_this_filter:
-                            for src in [source]:
-                                if not src:
-                                    continue
-                                qa_pairs_list = src.get('qa_pairs', [])
-                                if isinstance(qa_pairs_list, list):
-                                    for qa in qa_pairs_list:
-                                        if isinstance(qa, dict):
-                                            q_text = qa.get('q_text', '')
-                                            answer = qa.get('answer', qa.get('answer_text', ''))
-                                            if '직업' in q_text or 'occupation' in q_text.lower() or '직무' in q_text:
-                                                # 동의어 확장 사용
-                                                try:
-                                                    from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
-                                                    expander = get_synonym_expander()
-                                                    occupation_synonyms = expander.expand(demo.raw_value)
-                                                except Exception:
-                                                    occupation_synonyms = [demo.raw_value]
-                                                    occupation_synonyms.extend([syn for syn in demo.synonyms if syn])
-                                                
-                                                answer_str = str(answer).lower()
-                                                if any(syn.lower() in answer_str or syn in str(answer) for syn in occupation_synonyms):
-                                                    matches_this_filter = True
-                                                    break
-                    
-                    if not matches_this_filter:
-                        matches_all_filters = False
-                        break
-                
-                # 필터 조건을 만족하지 않으면 이 문서를 건너뛰기
-                if not matches_all_filters:
-                    logger.debug(f"⚠️ 최종 결과에서 제외: user_id={user_id} (필터 조건 미충족)")
+                    source_not_found_count += 1
                     continue
-            else:
-                # 필터가 없는 경우에만 welcome_1st/welcome_2nd 조회
-                if user_id:
-                    # welcome_1st: 배치 조회 결과 사용
-                    if user_id in welcome_1st_batch:
-                        welcome_1st_source = welcome_1st_batch[user_id]
+
+                welcome_1st_doc_full = welcome_1st_batch.get(user_id, {})
+                metadata_1st = welcome_1st_doc_full.get("metadata", {}) if isinstance(welcome_1st_doc_full, dict) else {}
+                welcome_2nd_doc_full = welcome_2nd_batch.get(user_id, {})
+                metadata_2nd = welcome_2nd_doc_full.get("metadata", {}) if isinstance(welcome_2nd_doc_full, dict) else {}
+
+                doc_values, metadata_presence = collect_doc_values(user_id, source, metadata_1st, metadata_2nd)
+
+                gender_pass = True
+                age_pass = True
+                occupation_pass = True
+
+                if demographic_filters.get(DemographicType.GENDER):
+                    expected = set()
+                    for demo in demographic_filters[DemographicType.GENDER]:
+                        expected.update(build_expected_values(demo))
+                    if not metadata_presence[DemographicType.GENDER]:
+                        gender_metadata_missing += 1
+                    gender_pass = values_match(doc_values[DemographicType.GENDER], expected)
+                    if not gender_pass:
+                        gender_filter_failed += 1
+
+                if gender_pass and demographic_filters.get(DemographicType.AGE):
+                    expected = set()
+                    for demo in demographic_filters[DemographicType.AGE]:
+                        expected.update(build_expected_values(demo))
+                    if not metadata_presence[DemographicType.AGE]:
+                        age_metadata_missing += 1
+                    age_pass = values_match(doc_values[DemographicType.AGE], expected)
+                    if not age_pass:
+                        age_filter_failed += 1
+
+                if gender_pass and age_pass and demographic_filters.get(DemographicType.OCCUPATION):
+                    expected = set()
+                    for demo in demographic_filters[DemographicType.OCCUPATION]:
+                        expected.update(build_expected_values(demo))
+                    if not metadata_presence[DemographicType.OCCUPATION]:
+                        occupation_metadata_missing += 1
+                    occupation_pass = values_match(doc_values[DemographicType.OCCUPATION], expected)
+                    if not occupation_pass:
+                        occupation_filter_failed += 1
                     else:
-                        # 배치 조회에서 못 찾은 경우에만 개별 조회 (fallback)
-                        try:
-                            os_doc = os_client.get(index='s_welcome_1st', id=user_id, ignore=[404], request_timeout=60)
-                            if os_doc.get('found'):
-                                welcome_1st_source = os_doc['_source']
-                        except Exception:
-                            pass
-                    
-                    # welcome_2nd: 배치 조회 결과 사용
-                    # 먼저 현재 source에서 직업 정보 확인
-                    if source and isinstance(source, dict):
-                        metadata = source.get('metadata', {})
-                        occupation = metadata.get('occupation', '')
-                        qa_pairs = source.get('qa_pairs', [])
-                        # metadata에 occupation이 있고 "미정"이 아니면 현재 source 사용
-                        if occupation and occupation != '미정':
-                            welcome_2nd_source = source
-                        # qa_pairs에 직업 정보가 있으면 현재 source 사용
-                        elif any('직업' in str(qa.get('q_text', '')) for qa in qa_pairs if isinstance(qa, dict)):
-                            welcome_2nd_source = source
-                    
-                    # 배치 조회 결과에서 가져오기
-                    if not welcome_2nd_source and user_id in welcome_2nd_batch:
-                        welcome_2nd_source = welcome_2nd_batch[user_id]
-                    
-                    # 배치 조회에서도 못 찾은 경우에만 개별 조회 (fallback)
-                    if not welcome_2nd_source:
-                        try:
-                            os_doc = os_client.get(index='s_welcome_2nd', id=user_id, ignore=[404], request_timeout=60)
-                            if os_doc.get('found'):
-                                welcome_2nd_source = os_doc['_source']
-                                # source가 없으면 welcome_2nd를 source로 사용
-                                if not source:
-                                    source = welcome_2nd_source
-                        except Exception:
-                            pass
+                        display_occupation = None
+                        occupation_candidates = [
+                            metadata_2nd.get("occupation"),
+                            metadata_2nd.get("job"),
+                            metadata_2nd.get("occupation_group"),
+                        ]
+                        for candidate in occupation_candidates:
+                            normalized_candidate = normalize_value(candidate)
+                            if normalized_candidate and values_match({normalized_candidate}, expected):
+                                display_occupation = str(candidate)
+                                break
+                        if not display_occupation:
+                            qa_sources: List[List[Dict[str, Any]]] = []
+                            if isinstance(source, dict):
+                                qa_sources.append(source.get("qa_pairs", []) or [])
+                            if isinstance(welcome_2nd_doc_full, dict):
+                                qa_sources.append(welcome_2nd_doc_full.get("qa_pairs", []) or [])
+                            for qa_pairs in qa_sources:
+                                for qa in qa_pairs:
+                                    if not isinstance(qa, dict):
+                                        continue
+                                    q_text = str(qa.get("q_text", "")).lower()
+                                    if not any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
+                                        continue
+                                    answer = qa.get("answer")
+                                    if answer is None:
+                                        answer = qa.get("answer_text")
+                                    if answer is None:
+                                        continue
+                                    candidate = str(answer)
+                                    normalized_candidate = normalize_value(candidate)
+                                    if normalized_candidate and values_match({normalized_candidate}, expected):
+                                        display_occupation = candidate
+                                        break
+                                if display_occupation:
+                                    break
+                        if display_occupation:
+                            occupation_display_map[user_id] = display_occupation
 
-            # matched_qa_pairs 추출 (inner_hits에서)
-            matched_qa = []
-            
-            # inner_hits가 dict인 경우
-            if isinstance(inner_hits, dict):
-                # 모든 nested path 순회 (qa_pairs, qa_pairs.answer 등)
-                for path_name, nested_data in inner_hits.items():
-                    if isinstance(nested_data, dict) and 'hits' in nested_data:
-                        hits_list = nested_data['hits'].get('hits', [])
-                        for inner_hit in hits_list:
-                            source = inner_hit.get('_source', {})
-                            if source:
-                                qa_data = {
-                                    'q_text': source.get('q_text', ''),
-                                    'answer': source.get('answer', source.get('answer_text', '')),
-                                    'answer_text': source.get('answer_text', source.get('answer', '')),
-                                    'match_score': inner_hit.get('_score', 0.0)
-                                }
-                                if 'highlight' in inner_hit:
-                                    qa_data['highlights'] = inner_hit['highlight']
-                                matched_qa.append(qa_data)
-            
-            # RRF 결과에서 직접 inner_hits 확인 (fallback)
-            if not matched_qa and 'inner_hits' in doc:
-                doc_inner_hits = doc.get('inner_hits', {})
-                if isinstance(doc_inner_hits, dict):
-                    for path_name, nested_data in doc_inner_hits.items():
-                        if isinstance(nested_data, dict) and 'hits' in nested_data:
-                            hits_list = nested_data['hits'].get('hits', [])
-                            for inner_hit in hits_list:
-                                source = inner_hit.get('_source', {})
-                                if source:
-                                    qa_data = {
-                                        'q_text': source.get('q_text', ''),
-                                        'answer': source.get('answer', source.get('answer_text', '')),
-                                        'answer_text': source.get('answer_text', source.get('answer', '')),
-                                        'match_score': inner_hit.get('_score', 0.0)
-                                    }
-                                    if 'highlight' in inner_hit:
-                                        qa_data['highlights'] = inner_hit['highlight']
-                                    matched_qa.append(qa_data)
-            
-            # ⭐ 필터 매칭 결과도 추출 (qa_pairs에서 직접 찾기)
-            if not matched_qa and source and 'qa_pairs' in source:
-                qa_pairs_list = source.get('qa_pairs', [])
-                if isinstance(qa_pairs_list, list):
-                    # 추출된 엔티티와 매칭되는 qa_pairs 찾기
-                    for demo in extracted_entities.demographics:
-                        demo_raw = demo.raw_value
-                        demo_value = demo.value
-                        
-                        # qa_pairs에서 매칭되는 항목 찾기
-                        for qa in qa_pairs_list:
-                            if isinstance(qa, dict):
-                                q_text = qa.get('q_text', '')
-                                answer = qa.get('answer', qa.get('answer_text', ''))
-                                
-                                # 질문 키워드 매칭
-                                is_demo_question = False
-                                if demo.demographic_type == DemographicType.AGE:
-                                    is_demo_question = any(kw in q_text for kw in ['연령', '나이', '연령대', 'age', '출생'])
-                                elif demo.demographic_type == DemographicType.GENDER:
-                                    is_demo_question = any(kw in q_text for kw in ['성별', 'gender'])
-                                elif demo.demographic_type == DemographicType.OCCUPATION:
-                                    is_demo_question = any(kw in q_text for kw in ['직업', 'occupation', '직무'])
-                                
-                                # 답변 매칭 (raw_value 또는 value 포함)
-                                if is_demo_question and answer:
-                                    answer_str = str(answer).lower()
-                                    if (demo_raw.lower() in answer_str or 
-                                        demo_value.lower() in answer_str or
-                                        any(syn.lower() in answer_str for syn in demo.synonyms)):
-                                        # 중복 체크
-                                        if not any(m.get('q_text') == q_text and m.get('answer') == answer for m in matched_qa):
-                                            matched_qa.append({
-                                                'q_text': q_text,
-                                                'answer': answer,
-                                                'answer_text': answer,
-                                                'match_score': 1.0,  # 필터 매칭은 높은 점수
-                                                'match_type': 'filter'
-                                            })
+                if gender_pass and age_pass and occupation_pass:
+                    filtered_list.append(doc)
 
-            # ⭐ welcome_1st와 welcome_2nd 정보를 결과에 포함
-            # 연령/성별 정보 (welcome_1st)
+            filter_duration_ms = (perf_counter() - filter_start) * 1000
+            timings["post_filter_ms"] = filter_duration_ms
+            filtered_rrf_results = filtered_list
+
+            logger.info(f"  - 소스 누락 문서: {source_not_found_count}건")
+            if demographic_filters.get(DemographicType.GENDER):
+                logger.info(f"  - 성별 metadata 없음: {gender_metadata_missing}건")
+            logger.info(f"  - 성별 필터 미충족: {gender_filter_failed}건")
+            if demographic_filters.get(DemographicType.AGE):
+                logger.info(f"  - 연령 metadata 없음: {age_metadata_missing}건")
+            logger.info(f"  - 연령 필터 미충족: {age_filter_failed}건")
+            if demographic_filters.get(DemographicType.OCCUPATION):
+                logger.info(f"  - 직업 metadata 없음: {occupation_metadata_missing}건")
+            logger.info(f"  - 직업 필터 미충족: {occupation_filter_failed}건")
+            logger.info(f"  - 필터 조건 충족 문서: {len(filtered_rrf_results)}건")
+
+        lazy_join_start = perf_counter()
+        final_hits = filtered_rrf_results[:size]
+        results: List[SearchResult] = []
+
+        for doc in final_hits:
+            source = doc.get("_source")
+            if not source and "doc" in doc:
+                source = doc.get("doc", {}).get("_source")
+            if not source and "payload" in doc:
+                source = doc.get("payload")
+            if not isinstance(source, dict):
+                source = {}
+
+            payload = {}
+            payload_candidate = source.get("payload")
+            if isinstance(payload_candidate, dict):
+                payload = payload_candidate
+            elif isinstance(doc.get("payload"), dict):
+                payload = doc["payload"]
+
+            user_id = (
+                source.get("user_id")
+                or payload.get("user_id")
+                or doc.get("_id")
+                or doc.get("id")
+            )
+
+            metadata_2nd = source.get("metadata", {}) if isinstance(source, dict) else {}
+            if not metadata_2nd and isinstance(payload, dict):
+                metadata_2nd = payload.get("metadata", {}) or {}
+
+            welcome_1st_doc = welcome_1st_batch.get(user_id, {}) if user_id else {}
+            metadata_1st = (
+                welcome_1st_doc.get("metadata", {}) if isinstance(welcome_1st_doc, dict) else {}
+            )
+
+            welcome_2nd_doc = welcome_2nd_batch.get(user_id, {}) if user_id else {}
+            metadata_2nd_cached = (
+                welcome_2nd_doc.get("metadata", {}) if isinstance(welcome_2nd_doc, dict) else {}
+            )
+
             demographic_info = {}
-            if welcome_1st_source:
-                metadata_1st = welcome_1st_source.get('metadata', {})
-                demographic_info['age_group'] = metadata_1st.get('age_group', '미정')
-                demographic_info['gender'] = metadata_1st.get('gender', '미정')
-                demographic_info['birth_year'] = metadata_1st.get('birth_year', '미정')
-            
-            # ⭐ 직업 정보 (qa_pairs에서만 추출 - metadata.occupation 필드가 없거나 "미정"인 경우가 많음)
-            occupation_value = '미정'
-            
-            # welcome_2nd_source의 qa_pairs에서 추출
-            if welcome_2nd_source:
-                qa_pairs_list = welcome_2nd_source.get('qa_pairs', [])
-                if isinstance(qa_pairs_list, list):
-                    for qa in qa_pairs_list:
-                        if isinstance(qa, dict):
-                            q_text = qa.get('q_text', '')
-                            answer = str(qa.get('answer', qa.get('answer_text', '')))
-                            
-                            # "직업" 질문에서 답변 추출
-                            if '직업' in q_text or 'occupation' in q_text.lower() or '직무' in q_text:
-                                if answer and answer != '미정':
-                                    # 직업 타입 매핑
-                                    answer_lower = answer.lower()
-                                    if '사무직' in answer:
-                                        occupation_value = 'office'
-                                    elif '전문직' in answer:
-                                        occupation_value = 'professional'
-                                    elif '서비스' in answer or '서비스직' in answer:
-                                        occupation_value = 'service'
-                                    elif '학생' in answer or '대학생' in answer or '대학원생' in answer:
-                                        occupation_value = 'student'
-                                    elif '주부' in answer:
-                                        occupation_value = 'housewife'
-                                    elif '자영업' in answer:
-                                        occupation_value = 'self_employed'
-                                    elif '무직' in answer or '없음' in answer:
-                                        occupation_value = 'unemployed'
-                                    else:
-                                        # 원본 값 사용 (20자 제한)
-                                        occupation_value = answer[:20]
-                                    break
-            
-            # welcome_2nd_source에서 못 찾은 경우, 현재 source의 qa_pairs에서 확인
-            if occupation_value == '미정' and source:
-                qa_pairs_list = source.get('qa_pairs', [])
-                if isinstance(qa_pairs_list, list):
-                    for qa in qa_pairs_list:
-                        if isinstance(qa, dict):
-                            q_text = qa.get('q_text', '')
-                            answer = str(qa.get('answer', qa.get('answer_text', '')))
-                            
-                            # "직업" 질문에서 답변 추출
-                            if '직업' in q_text or 'occupation' in q_text.lower() or '직무' in q_text:
-                                if answer and answer != '미정':
-                                    # 직업 타입 매핑
-                                    answer_lower = answer.lower()
-                                    if '사무직' in answer:
-                                        occupation_value = 'office'
-                                    elif '전문직' in answer:
-                                        occupation_value = 'professional'
-                                    elif '서비스' in answer or '서비스직' in answer:
-                                        occupation_value = 'service'
-                                    elif '학생' in answer or '대학생' in answer or '대학원생' in answer:
-                                        occupation_value = 'student'
-                                    elif '주부' in answer:
-                                        occupation_value = 'housewife'
-                                    elif '자영업' in answer:
-                                        occupation_value = 'self_employed'
-                                    elif '무직' in answer or '없음' in answer:
-                                        occupation_value = 'unemployed'
-                                    else:
-                                        # 원본 값 사용 (20자 제한)
-                                        occupation_value = answer[:20]
-                                    break
-            
-            demographic_info['occupation'] = occupation_value
-            
-            # user_id가 없으면 doc_id 사용
-            final_user_id = user_id or doc_id or 'unknown'
-            
+            if metadata_1st:
+                demographic_info["age_group"] = metadata_1st.get("age_group")
+                demographic_info["gender"] = metadata_1st.get("gender")
+                demographic_info["birth_year"] = metadata_1st.get("birth_year")
+
+            occupation_candidate = metadata_2nd.get("occupation") if isinstance(metadata_2nd, dict) else None
+            if not occupation_candidate and isinstance(metadata_2nd_cached, dict):
+                occupation_candidate = metadata_2nd_cached.get("occupation")
+            if not occupation_candidate and isinstance(payload, dict):
+                occupation_candidate = payload.get("occupation")
+            if occupation_candidate:
+                demographic_info["occupation"] = occupation_candidate
+
+            occupation_expected = set()
+            for demo in demographic_filters.get(DemographicType.OCCUPATION, []):
+                occupation_expected.update(build_expected_values(demo))
+
+            if ("occupation" not in demographic_info or not demographic_info["occupation"]) and user_id:
+                mapped_occupation = occupation_display_map.get(user_id) if has_demographic_filters else None
+                if mapped_occupation:
+                    demographic_info["occupation"] = mapped_occupation
+
+            def occupation_matches(candidate: str) -> bool:
+                normalized_candidate = normalize_value(candidate)
+                if not normalized_candidate:
+                    return False
+                for expected in occupation_expected:
+                    if not expected:
+                        continue
+                    if normalized_candidate == expected or normalized_candidate in expected or expected in normalized_candidate:
+                        return True
+                return False
+
+            if ("occupation" not in demographic_info or not demographic_info["occupation"]) and isinstance(source, dict):
+                qa_pairs_for_occ = source.get("qa_pairs", [])
+                for qa in qa_pairs_for_occ:
+                    if not isinstance(qa, dict):
+                        continue
+                    q_text = str(qa.get("q_text", "")).lower()
+                    answer = qa.get("answer")
+                    if answer is None:
+                        answer = qa.get("answer_text")
+                    if answer is None:
+                        continue
+                    answer_str = str(answer)
+                    if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")) and occupation_matches(answer_str):
+                        demographic_info["occupation"] = answer_str
+                        break
+
+            matched_qa: List[Dict[str, Any]] = []
+            inner_hits = (
+                doc.get("inner_hits", {})
+                .get("qa_pairs", {})
+                .get("hits", {})
+                .get("hits", [])
+            )
+            for inner_hit in inner_hits:
+                qa_data = inner_hit.get("_source", {}).copy()
+                qa_data["match_score"] = inner_hit.get("_score")
+                if "highlight" in inner_hit:
+                    qa_data["highlights"] = inner_hit["highlight"]
+                matched_qa.append(qa_data)
+
             results.append(
                 SearchResult(
-                    user_id=final_user_id,
-                    score=doc.get('_score', 0.0),
-                    timestamp=source.get('timestamp'),
-                    demographic_info=demographic_info if demographic_info else None,  # ⭐ 인구통계 정보 추가
-                    qa_pairs=source.get('qa_pairs', [])[:5] if source else [],
+                    user_id=user_id,
+                    score=doc.get("_score", 0.0),
+                    timestamp=source.get("timestamp") if isinstance(source, dict) else None,
+                    demographic_info=demographic_info if demographic_info else None,
+                    qa_pairs=source.get("qa_pairs", [])[:5] if isinstance(source, dict) else [],
                     matched_qa_pairs=matched_qa,
-                    highlights=highlight,
+                    highlights=doc.get("highlight"),
                 )
             )
 
-        # ⭐ total_hits 수정: 실제 결과 개수 사용 (RRF 후 결과 개수)
-        actual_total_hits = len(results)
-        
+        timings["lazy_join_ms"] = (perf_counter() - lazy_join_start) * 1000
+        timings.setdefault('post_filter_ms', timings.get('post_filter_ms', 0.0))
+        timings.setdefault('rrf_recombination_ms', 0.0)
+        timings.setdefault('qdrant_parallel_ms', 0.0)
+        timings.setdefault('opensearch_parallel_ms', timings.get('two_phase_stage1_ms', 0.0) + timings.get('two_phase_stage2_ms', 0.0))
+
+        total_duration_ms = (perf_counter() - overall_start) * 1000
+        timings['total_ms'] = total_duration_ms
+
+        logger.info("📈 성능 측정 요약 (ms):")
+        for key in sorted(timings.keys()):
+            logger.info(f"  - {key}: {timings[key]:.2f}")
+
+        response_took_ms = int(total_duration_ms)
+        total_hits = len(filtered_rrf_results)
+        max_score = final_hits[0].get('_score', 0.0) if final_hits else 0.0
+
         return SearchResponse(
             query=request.query,
-            total_hits=actual_total_hits,  # ⭐ 실제 결과 개수
-            max_score=final_hits[0].get('_score', 0.0) if final_hits else 0.0,
+            total_hits=total_hits,
+            max_score=max_score,
             results=results,
             query_analysis={
                 "intent": analysis.intent,
@@ -2241,10 +1917,11 @@ async def search_natural_language(
                 "alpha": analysis.alpha,
                 "confidence": analysis.confidence,
                 "extracted_entities": extracted_entities.to_dict(),
-                "filters": filters,
+                "filters": filters_for_response,
                 "size": size,
+                "timings_ms": timings,
             },
-            took_ms=took_ms,
+            took_ms=response_took_ms,
         )
 
     except HTTPException:
@@ -2740,3 +2417,380 @@ async def get_search_stats(
     except Exception as e:
         logger.error(f"[ERROR] 통계 조회 중 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _filter_to_string(filter_dict: Dict[str, Any]) -> str:
+    try:
+        return json.dumps(filter_dict, ensure_ascii=False)
+    except Exception:
+        return str(filter_dict)
+
+
+AGE_GENDER_KEYWORDS = [
+    "metadata.age_group", "metadata.gender", "birth_year", "연령", "나이", "성별"
+]
+OCCUPATION_KEYWORDS = [
+    "metadata.occupation", "occupation", "직업", "직무"
+]
+
+
+def is_age_or_gender_filter(filter_dict: Dict[str, Any]) -> bool:
+    filter_str = _filter_to_string(filter_dict)
+    return any(keyword in filter_str for keyword in AGE_GENDER_KEYWORDS)
+
+
+def is_occupation_filter(filter_dict: Dict[str, Any]) -> bool:
+    filter_str = _filter_to_string(filter_dict)
+    return any(keyword in filter_str for keyword in OCCUPATION_KEYWORDS)
+
+
+async def run_two_phase_demographic_search(
+    request,
+    analysis,
+    extracted_entities,
+    filters: List[Dict[str, Any]],
+    size: int,
+    age_gender_filters: List[Dict[str, Any]],
+    occupation_filters: List[Dict[str, Any]],
+    data_fetcher: "DataFetcher",
+    timings: Dict[str, float],
+    overall_start: float,
+) -> Optional[SearchResponse]:
+    """두 단계 검색으로 user_id를 먼저 좁히고 정밀 조회"""
+    logger.info("🚀 두 단계 인구통계 최적화 실행")
+
+    async_client = data_fetcher.os_async_client
+    sync_client = data_fetcher.os_client
+    if not (async_client or sync_client):
+        logger.warning("⚠️ OpenSearch 클라이언트가 없어 2단계 검색을 건너뜁니다")
+        return None
+
+    stage1_start = perf_counter()
+    stage1_query_size = min(max(size * 50, 2000), 10000)
+    stage1_query = {
+        "query": {
+            "bool": {
+                "must": age_gender_filters
+            }
+        },
+        "size": stage1_query_size,
+        "_source": ["user_id"],
+        "track_total_hits": True
+    }
+
+    try:
+        if async_client:
+            response_1st = await data_fetcher.search_opensearch_async(
+                index_name="s_welcome_1st",
+                query=stage1_query,
+                size=stage1_query_size,
+                source_filter=None,
+                request_timeout=DEFAULT_OS_TIMEOUT,
+            )
+        else:
+            response_1st = data_fetcher.search_opensearch(
+                index_name="s_welcome_1st",
+                query=stage1_query,
+                size=stage1_query_size,
+                source_filter=None,
+                request_timeout=DEFAULT_OS_TIMEOUT,
+            )
+    except Exception as e:
+        logger.warning(f"⚠️ 2단계 검색 Stage1 실패: {e}")
+        return None
+
+    timings['two_phase_stage1_ms'] = (perf_counter() - stage1_start) * 1000
+    hits_1st = response_1st.get('hits', {}).get('hits', [])
+    total_stage1 = response_1st.get('hits', {}).get('total', {}).get('value', len(hits_1st))
+
+    if not hits_1st:
+        logger.info("   ⚠️ Stage1에서 조건을 만족하는 user_id가 없습니다")
+        total_time = (perf_counter() - overall_start) * 1000
+        timings['total_ms'] = total_time
+        timings.setdefault('two_phase_stage2_ms', 0.0)
+        timings.setdefault('two_phase_fetch_demographics_ms', 0.0)
+        timings.setdefault('lazy_join_ms', 0.0)
+        timings.setdefault('post_filter_ms', 0.0)
+        timings.setdefault('rrf_recombination_ms', 0.0)
+        timings.setdefault('qdrant_parallel_ms', 0.0)
+        timings.setdefault('opensearch_parallel_ms', timings['two_phase_stage1_ms'])
+        logger.info("📈 성능 측정 요약 (ms):")
+        for key in sorted(timings.keys()):
+            logger.info(f"  - {key}: {timings[key]:.2f}")
+        return SearchResponse(
+            query=request.query,
+            total_hits=0,
+            max_score=0.0,
+            results=[],
+            query_analysis={
+                "intent": analysis.intent,
+                "must_terms": analysis.must_terms,
+                "should_terms": analysis.should_terms,
+                "alpha": analysis.alpha,
+                "confidence": analysis.confidence,
+                "extracted_entities": extracted_entities.to_dict(),
+                "filters": filters,
+                "size": size,
+                "timings_ms": timings,
+            },
+            took_ms=int(total_time)
+        )
+
+    user_ids_filtered = []
+    for hit in hits_1st:
+        src = hit.get('_source', {})
+        uid = src.get('user_id') or hit.get('_id')
+        if uid:
+            user_ids_filtered.append(uid)
+    user_ids_filtered = list(dict.fromkeys(user_ids_filtered))
+
+    logger.info(f"   ✅ Stage1 user_id 추출: {len(user_ids_filtered)}/{total_stage1}건")
+    if total_stage1 > len(user_ids_filtered):
+        logger.warning("   ⚠️ Stage1 size 제한으로 일부 user_id가 제외되었습니다")
+
+    if not user_ids_filtered:
+        total_time = (perf_counter() - overall_start) * 1000
+        timings['two_phase_stage2_ms'] = 0.0
+        timings['two_phase_fetch_demographics_ms'] = 0.0
+        timings['lazy_join_ms'] = 0.0
+        timings['post_filter_ms'] = 0.0
+        timings['rrf_recombination_ms'] = 0.0
+        timings.setdefault('opensearch_parallel_ms', timings['two_phase_stage1_ms'])
+        timings['total_ms'] = total_time
+        logger.info("📈 성능 측정 요약 (ms):")
+        for key in sorted(timings.keys()):
+            logger.info(f"  - {key}: {timings[key]:.2f}")
+        return SearchResponse(
+            query=request.query,
+            total_hits=0,
+            max_score=0.0,
+            results=[],
+            query_analysis={
+                "intent": analysis.intent,
+                "must_terms": analysis.must_terms,
+                "should_terms": analysis.should_terms,
+                "alpha": analysis.alpha,
+                "confidence": analysis.confidence,
+                "extracted_entities": extracted_entities.to_dict(),
+                "filters": filters,
+                "size": size,
+                "timings_ms": timings,
+            },
+            took_ms=int(total_time)
+        )
+
+    max_terms = 10000
+    if len(user_ids_filtered) > max_terms:
+        logger.warning(f"   ⚠️ user_id가 {len(user_ids_filtered)}건입니다. 상위 {max_terms}건만 사용합니다")
+        user_ids_filtered = user_ids_filtered[:max_terms]
+
+    detail_size = max(size * 2, min(len(user_ids_filtered), 500))
+    stage2_query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"terms": {"_id": user_ids_filtered}},
+                ]
+            }
+        },
+        "size": detail_size,
+        "_source": {
+            "includes": ["user_id", "metadata", "qa_pairs", "timestamp"]
+        },
+        "track_total_hits": True
+    }
+
+    stage2_start = perf_counter()
+    try:
+        if async_client:
+            response_2nd = await data_fetcher.search_opensearch_async(
+                index_name="s_welcome_2nd",
+                query=stage2_query,
+                size=detail_size,
+                source_filter=None,
+                request_timeout=DEFAULT_OS_TIMEOUT,
+            )
+        else:
+            response_2nd = data_fetcher.search_opensearch(
+                index_name="s_welcome_2nd",
+                query=stage2_query,
+                size=detail_size,
+                source_filter=None,
+                request_timeout=DEFAULT_OS_TIMEOUT,
+            )
+    except Exception as e:
+        logger.warning(f"⚠️ 2단계 검색 Stage2 실패: {e}")
+        return None
+
+    timings['two_phase_stage2_ms'] = (perf_counter() - stage2_start) * 1000
+    hits_2nd = response_2nd.get('hits', {}).get('hits', [])
+    total_stage2 = response_2nd.get('hits', {}).get('total', {}).get('value', len(hits_2nd))
+    logger.info(f"   ✅ Stage2 결과: {len(hits_2nd)}건 (총 {total_stage2}건)")
+
+    if not hits_2nd:
+        total_time = (perf_counter() - overall_start) * 1000
+        timings.setdefault('two_phase_fetch_demographics_ms', 0.0)
+        timings['lazy_join_ms'] = 0.0
+        timings['post_filter_ms'] = 0.0
+        timings['rrf_recombination_ms'] = 0.0
+        timings.setdefault('opensearch_parallel_ms', timings.get('two_phase_stage1_ms', 0.0))
+        timings['total_ms'] = total_time
+        logger.info("📈 성능 측정 요약 (ms):")
+        for key in sorted(timings.keys()):
+            logger.info(f"  - {key}: {timings[key]:.2f}")
+        return SearchResponse(
+            query=request.query,
+            total_hits=0,
+            max_score=0.0,
+            results=[],
+            query_analysis={
+                "intent": analysis.intent,
+                "must_terms": analysis.must_terms,
+                "should_terms": analysis.should_terms,
+                "alpha": analysis.alpha,
+                "confidence": analysis.confidence,
+                "extracted_entities": extracted_entities.to_dict(),
+                "filters": filters,
+                "size": size,
+                "timings_ms": timings,
+            },
+            took_ms=int(total_time)
+        )
+
+    final_hits = hits_2nd[:size]
+    final_user_ids = [hit.get('_id') or hit.get('_source', {}).get('user_id') for hit in final_hits]
+
+    fetch_start = perf_counter()
+    welcome_1st_docs: Dict[str, Dict[str, Any]] = {}
+    welcome_2nd_docs: Dict[str, Dict[str, Any]] = {}
+
+    if final_user_ids:
+        if async_client:
+            welcome_1st_docs = await data_fetcher.multi_get_documents_async(
+                index_name="s_welcome_1st",
+                doc_ids=final_user_ids,
+                batch_size=200
+            )
+            welcome_2nd_docs = await data_fetcher.multi_get_documents_async(
+                index_name="s_welcome_2nd",
+                doc_ids=final_user_ids,
+                batch_size=200
+            )
+        else:
+            response = sync_client.mget(index="s_welcome_1st", body={"ids": final_user_ids}, _source=["metadata", "user_id", "qa_pairs"])
+            for doc in response.get('docs', []):
+                if doc.get('found'):
+                    welcome_1st_docs[doc['_id']] = doc['_source']
+            response = sync_client.mget(index="s_welcome_2nd", body={"ids": final_user_ids}, _source=["metadata", "user_id", "qa_pairs"])
+            for doc in response.get('docs', []):
+                if doc.get('found'):
+                    welcome_2nd_docs[doc['_id']] = doc['_source']
+    timings['two_phase_fetch_demographics_ms'] = (perf_counter() - fetch_start) * 1000
+
+    results: List[SearchResult] = []
+    lazy_join_start = perf_counter()
+    final_hits = final_hits if 'final_hits' in locals() else []
+    for doc in final_hits:
+        source = doc.get('_source', {}) or {}
+        user_id = source.get('user_id') or hit.get('_id', '')
+        metadata_2nd = source.get('metadata', {}) if isinstance(source, dict) else {}
+        welcome_1st_doc = welcome_1st_docs.get(user_id, {})
+        metadata_1st = welcome_1st_doc.get('metadata', {}) if isinstance(welcome_1st_doc, dict) else {}
+
+        demographic_info = {}
+        if metadata_1st:
+            demographic_info['age_group'] = metadata_1st.get('age_group')
+            demographic_info['gender'] = metadata_1st.get('gender')
+            demographic_info['birth_year'] = metadata_1st.get('birth_year')
+        if metadata_2nd:
+            demographic_info['occupation'] = metadata_2nd.get('occupation')
+
+        if 'occupation' not in demographic_info or not demographic_info['occupation']:
+            qa_pairs_for_occ = source.get('qa_pairs', []) if isinstance(source, dict) else []
+            for qa in qa_pairs_for_occ:
+                if isinstance(qa, dict):
+                    q_text = qa.get('q_text', '')
+                    answer = str(qa.get('answer', qa.get('answer_text', '')))
+                    if '직업' in q_text or 'occupation' in q_text.lower() or '직무' in q_text:
+                        if answer:
+                            demographic_info['occupation'] = answer
+                        break
+
+        matched_qa = []
+        inner_hits = hit.get('inner_hits', {}).get('qa_pairs', {}).get('hits', {}).get('hits', [])
+        for inner_hit in inner_hits:
+            qa_data = inner_hit.get('_source', {}).copy()
+            qa_data['match_score'] = inner_hit.get('_score')
+            if 'highlight' in inner_hit:
+                qa_data['highlights'] = inner_hit['highlight']
+            matched_qa.append(qa_data)
+
+        results.append(
+            SearchResult(
+                user_id=user_id,
+                score=hit.get('_score', 0.0),
+                timestamp=source.get('timestamp') if isinstance(source, dict) else None,
+                demographic_info=demographic_info if demographic_info else None,
+                qa_pairs=source.get('qa_pairs', [])[:5] if isinstance(source, dict) else [],
+                matched_qa_pairs=matched_qa,
+                highlights=hit.get('highlight'),
+            )
+        )
+    timings['lazy_join_ms'] = (perf_counter() - lazy_join_start) * 1000
+
+    timings.setdefault('post_filter_ms', 0.0)
+    timings.setdefault('rrf_recombination_ms', 0.0)
+    timings.setdefault('qdrant_parallel_ms', 0.0)
+    timings.setdefault('opensearch_parallel_ms', timings.get('two_phase_stage1_ms', 0.0) + timings.get('two_phase_stage2_ms', 0.0))
+
+    total_duration_ms = (perf_counter() - overall_start) * 1000
+    timings['total_ms'] = total_duration_ms
+
+    logger.info("📈 성능 측정 요약 (ms):")
+    for key in sorted(timings.keys()):
+        logger.info(f"  - {key}: {timings[key]:.2f}")
+
+    response_took_ms = int(total_duration_ms)
+    total_hits = len(final_hits)
+    max_score = final_hits[0].get('_score', 0.0) if final_hits else 0.0
+
+    response_payload = SearchResponse(
+        query=request.query,
+        total_hits=total_hits,
+        max_score=max_score,
+        results=results,
+        query_analysis={
+            "intent": analysis.intent,
+            "must_terms": analysis.must_terms,
+            "should_terms": analysis.should_terms,
+            "alpha": analysis.alpha,
+            "confidence": analysis.confidence,
+            "extracted_entities": extracted_entities.to_dict(),
+            "filters": filters,
+            "size": size,
+            "timings_ms": timings,
+        },
+        took_ms=response_took_ms,
+    )
+    return response_payload
+
+def get_user_id_from_doc(doc: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(doc, dict):
+        return None
+    source = doc.get('_source')
+    if isinstance(source, dict):
+        uid = source.get('user_id')
+        if uid:
+            return uid
+        payload = source.get('payload')
+        if isinstance(payload, dict):
+            uid = payload.get('user_id')
+            if uid:
+                return uid
+    uid = doc.get('_id')
+    if uid:
+        return uid
+    payload = doc.get('payload')
+    if isinstance(payload, dict):
+        return payload.get('user_id')
+    return None
