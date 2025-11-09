@@ -155,7 +155,10 @@ class DemographicExtractor:
         - 단위(명|건)가 붙은 경우만 size로 인정해 '30대' 같은 숫자와 구분
         반환값은 1..max_size 범위로 클램핑.
         """
-        m = re.search(r"(\d{1,4})\s*(명|건)", text)
+        m = re.search(
+            r"(\d{1,4})\s*(?:명|건)(?:[을를이가은는도만의께]*|(?:만큼|정도|가량|쯤))?",
+            text,
+        )
         if not m:
             return default_size
         try:
