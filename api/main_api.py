@@ -87,6 +87,7 @@ def create_app() -> FastAPI:
         search_router.async_os_client = async_os_client
         search_router.qdrant_client = qdrant_client
         search_router.embedding_model = embedding_model
+        search_router.embedding_model_factory = lambda: embedding_model
         search_router.config = config
 
         # 시작 이벤트 등록
