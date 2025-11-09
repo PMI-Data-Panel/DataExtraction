@@ -1,9 +1,14 @@
-# tasks/__init__.py
+# redis_celery/tasks/__init__.py
 """
-Celery 작업 모듈
+Celery Tasks 패키지
 """
 
+from redis_celery.tasks.search_tasks import (
+    search_with_rrf_task
+)
+
 __all__ = [
-    'search_with_rrf_task',
     'simple_search_task',
+    'search_nl_task',
+    'search_with_rrf_task'
 ]
