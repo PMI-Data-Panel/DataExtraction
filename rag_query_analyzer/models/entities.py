@@ -151,7 +151,7 @@ class DemographicEntity(BaseEntity):
             query_value == self.value or
             query_value == self.raw_value
         )
-    
+
     def _build_answer_match_query(self) -> Dict:
         """qa_pairs 답변 매칭 쿼리 생성 (최적화: 중복 제거)
         
@@ -244,14 +244,14 @@ class DemographicEntity(BaseEntity):
             }
         }
 
-    def to_opensearch_filter(self) -> Dict:
+    def to_opensearch_filter(self, *, metadata_only: bool = False, include_qa_fallback: bool = True) -> Dict:
         """OpenSearch 필터로 변환 (Metadata 우선, qa_pairs fallback)
         
         인덱스별 구조:
         - welcome_1st: 성별, 출생정보(연령) → metadata 필드
         - welcome_2nd: 직업 → metadata 필드
         - 나머지 설문조사: qa_pairs에서 찾기
-        
+
         Returns:
             {
                 "bool": {
@@ -319,69 +319,84 @@ class DemographicEntity(BaseEntity):
         # 2️⃣ Metadata 필터 (1순위) - welcome_1st, welcome_2nd 등에서 사용
         # ⚠️ 중요: welcome_1st의 metadata.age_group은 이미 "30대" 형식이므로
         # value가 "30s"가 아니라 raw_value인 "30대"를 사용해야 함!
-        metadata_value = self.value
-        
-        # welcome_1st의 경우: age_group과 gender는 raw_value 사용
-        if self.demographic_type == DemographicType.AGE:
-            # metadata.age_group은 "30대" 형식이므로 raw_value 사용
-            metadata_value = self.raw_value
-        elif self.demographic_type == DemographicType.GENDER:
-            # metadata.gender는 "여성", "남성" 형식이므로 raw_value 사용
-            metadata_value = self.raw_value
-        
-        metadata_filter = {
-            "term": {
-                config["field"]: metadata_value
-            }
-        }
-        
-        # 3️⃣ QA Pairs 필터 (2순위, fallback) - 나머지 설문조사 데이터에서 사용
-        qa_filter = {
-            "nested": {
-                "path": "qa_pairs",
-                "query": {
-                    "bool": {
-                        "must": [
-                            # 질문 매칭 (여러 키워드 OR)
-                            {
-                                "bool": {
-                                    "should": [
-                                        {"match": {"qa_pairs.q_text": q}}
-                                        for q in config["qa_questions"]
-                                    ],
-                                    "minimum_should_match": 1
-                                }
-                            },
-                            # 답변 매칭 (raw_value와 synonyms 모두 고려)
-                            # ⚠️ 출생년도는 숫자("2001")로 저장되므로, 연령대를 출생년도 범위로 변환 필요
-                            self._build_answer_match_query()
-                        ]
+        metadata_values = []
+        if self.value:
+            metadata_values.append(self.value)
+        if self.raw_value and self.raw_value not in metadata_values:
+            metadata_values.append(self.raw_value)
+
+        metadata_should = []
+        keyword_field = config.get("field")
+        base_field = None
+        if keyword_field and keyword_field.endswith(".keyword"):
+            base_field = keyword_field[:-8]
+        else:
+            base_field = keyword_field
+
+        for value in metadata_values:
+            if keyword_field:
+                metadata_should.append({"term": {keyword_field: value}})
+            if base_field and base_field != keyword_field:
+                metadata_should.append({"match_phrase": {base_field: value}})
+                metadata_should.append({
+                    "match": {
+                        base_field: {
+                            "query": value,
+                            "operator": "and"
+                        }
                     }
-                },
-                "inner_hits": {
-                    "size": 3,
-                    "_source": {
-                        "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
+                })
+
+        if metadata_only:
+            include_qa_fallback = False
+
+        metadata_filter = {
+            "bool": {
+                "should": metadata_should,
+                "minimum_should_match": 1
+            }
+        } if metadata_should else None
+
+        qa_filter = None
+        if include_qa_fallback:
+            qa_filter = {
+                "nested": {
+                    "path": "qa_pairs",
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "bool": {
+                                        "should": [
+                                            {"match": {"qa_pairs.q_text": q}}
+                                            for q in config["qa_questions"]
+                                        ],
+                                        "minimum_should_match": 1
+                                    }
+                                },
+                                self._build_answer_match_query()
+                            ]
+                        }
+                    },
+                    "inner_hits": {
+                        "size": 3,
+                        "_source": {
+                            "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
+                        }
                     }
                 }
             }
-        }
-        
-        # 4️⃣ Bool 쿼리: metadata OR qa_pairs
-        # ⚠️ OCCUPATION은 metadata.occupation 필드가 없거나 "미정"인 경우가 많으므로 qa_pairs만 사용
-        if self.demographic_type == DemographicType.OCCUPATION:
-            # qa_pairs만 사용 (metadata 제거)
-            return qa_filter
-        
-        # 인덱스별로 자동으로 적절한 필드를 찾음:
-        # - welcome_1st, welcome_2nd: metadata 필드 매칭
-        # - 나머지: qa_pairs에서 매칭
+
+        filters = [f for f in [metadata_filter, qa_filter] if f]
+
+        if not filters:
+            return {"match_all": {}}
+        if len(filters) == 1:
+            return filters[0]
+
         return {
             "bool": {
-                "should": [
-                    metadata_filter,
-                    qa_filter
-                ],
+                "should": filters,
                 "minimum_should_match": 1
             }
         }
