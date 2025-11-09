@@ -14,10 +14,10 @@ from ..core import (
     SemanticModel,
     MultiStepQueryRewriter,
     QueryOptimizer,
-    QueryExpander,
     LRUCachedAnalyzer
 )
-from ..utils import Reranker, ElasticsearchQueryBuilder
+from ..utils import Reranker
+from connectors.hybrid_searcher import OpenSearchHybridQueryBuilder
 from ..config import Config
 
 logger = logging.getLogger(__name__)
@@ -57,8 +57,8 @@ class AdvancedRAGQueryAnalyzer:
         self.semantic_model = SemanticModel()
         self.query_rewriter = MultiStepQueryRewriter(self.config)
         self.query_optimizer = QueryOptimizer(self.config)
-        self.query_expander = QueryExpander(self.semantic_model)
-        self.es_query_builder = ElasticsearchQueryBuilder(self.config)
+        # ⚠️ QueryExpander 제거: 하드코딩된 동의어 대신 HybridSynonymExpander 사용
+        self.es_query_builder = OpenSearchHybridQueryBuilder(self.config)
         
         # 캐시
         if self.config.ENABLE_CACHE:
@@ -102,10 +102,6 @@ class AdvancedRAGQueryAnalyzer:
             if cached:
                 cached.execution_time = time.time() - start_time
                 return cached
-        
-        # 쿼리 확장 (메타데이터 활용)
-        if metadata:
-            query = self.query_expander.expand_with_context(query, metadata)
         
         # 폴백 체인으로 분석
         analysis = self._analyze_with_fallback(query, context)

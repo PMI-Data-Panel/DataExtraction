@@ -18,25 +18,43 @@ def create_index_if_not_exists(es_client, index_name: str):
         mappings = {
             "properties": {
                 "user_id": {"type": "keyword"},
-                "timestamp": {"type": "date"},
-                "qa_pairs": {
+                "demographics": {
+                    "type": "object",
+                    "enabled": True
+                },
+                "other_objectives": {
+                    "type": "object",
+                    "enabled": True
+                },
+                "subjective_responses": {
                     "type": "nested",
                     "properties": {
-                        "q_code": {"type": "keyword"},
                         "q_text": {"type": "text", "analyzer": "nori"},
-                        "q_type": {"type": "keyword"},
+                        "q_code": {"type": "keyword"},
+                        "q_category": {"type": "keyword"},
                         "answer_text": {"type": "text", "analyzer": "nori"},
-                        "embedding_text": {
-                            "type": "text",
-                            "analyzer": "nori",
-                            "index": False,
-                        },
                         "answer_vector": {
                             "type": "dense_vector",
                             "dims": config.EMBEDDING_DIM,
                         },
+                        "answer_length": {"type": "integer"}
                     },
                 },
+                "all_subjective_text": {
+                    "type": "text",
+                    "analyzer": "nori"
+                },
+                "metadata": {
+                    "type": "object",
+                    "properties": {
+                        "timestamp": {"type": "date"},
+                        "total_questions": {"type": "integer"},
+                        "demographic_count": {"type": "integer"},
+                        "objective_count": {"type": "integer"},
+                        "subjective_count": {"type": "integer"},
+                        "avg_answer_length": {"type": "float"}
+                    }
+                }
             }
         }
 
