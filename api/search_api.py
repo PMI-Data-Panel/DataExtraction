@@ -57,6 +57,7 @@ class SearchResponse(BaseModel):
     took_ms: int
 
 
+
 @router.get("/", summary="Search API 상태")
 def search_root():
     """Search API 기본 정보"""
@@ -68,6 +69,7 @@ def search_root():
             "/search/similar"
         ]
     }
+
 
 
 @router.post("/query", response_model=SearchResponse, summary="검색 쿼리 실행")
