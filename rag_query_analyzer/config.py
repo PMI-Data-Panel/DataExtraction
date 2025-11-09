@@ -19,8 +19,6 @@ class Config:
     OPENSEARCH_USE_SSL: bool = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
     OPENSEARCH_VERSION: float = float(os.getenv("OPENSEARCH_VERSION", "2.11"))
 
-    # --- Elasticsearch (레거시) ---
-    ES_HOST: str = os.getenv("ES_HOST", "http://localhost:9200")
 
     # --- Embedding & Reranking ---
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nlpai-lab/KURE-v1")

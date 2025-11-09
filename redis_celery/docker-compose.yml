@@ -1,0 +1,134 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # Redis (메시지 브로커: 0번, 백엔드: 1번, 캐시: 2번)
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: surveypilot-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+
+  # ============================================
+  # Celery Worker (검색 작업 처리)
+  # ============================================
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: surveypilot-celery-worker
+    volumes:
+      - ./:/app
+      - ./logs:/app/logs
+    environment:
+      # REDIS_URL은 CACHE_URL로 변경하거나, 사용하지 않으면 제거합니다.
+      - CACHE_URL=redis://redis:6379/2          # 일반 캐시용 DB 2번 (용도 명확화)
+      - CELERY_BROKER_URL=redis://redis:6379/0  # 브로커용 DB 0번
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1 # 백엔드용 DB 1번
+      - OPENSEARCH_HOST=${OPENSEARCH_HOST:-localhost}
+      - OPENSEARCH_PORT=${OPENSEARCH_PORT:-9200}
+      - QDRANT_HOST=${QDRANT_HOST:-localhost}
+      - QDRANT_PORT=${QDRANT_PORT:-6333}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A celery_app worker --loglevel=info --concurrency=4
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+
+  # ============================================
+  # Celery Beat (스케줄 작업 - Celery Worker와 DB 설정 통일)
+  # ============================================
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: surveypilot-celery-beat
+    volumes:
+      - ./:/app
+      - ./logs:/app/logs
+    environment:
+      - CACHE_URL=redis://redis:6379/2           # 캐시 설정 통일 (선택 사항)
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1 # DB 1번으로 수정
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A celery_app beat --loglevel=info
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    profiles:
+      - with-beat
+
+  # ============================================
+  # Flower (Celery 모니터링 - Celery Worker와 DB 설정 통일)
+  # ============================================
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: surveypilot-flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1 # DB 1번으로 수정
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A celery_app flower --port=5555
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    profiles:
+      - with-flower
+
+  # ============================================
+  # Redis Commander (Redis GUI - 개발용)
+  # ============================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: surveypilot-redis-commander
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    profiles:
+      - dev
+
+# ============================================
+# 네트워크
+# ============================================
+networks:
+  surveypilot-network:
+    driver: bridge
+
+# ============================================
+# 볼륨
+# ============================================
+volumes:
+  redis_data:
+    driver: local

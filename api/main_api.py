@@ -207,6 +207,21 @@ def create_app() -> FastAPI:
 # 앱 인스턴스 생성
 app = create_app()
 
+@app.post("/search/celery-test")
+def search(query: str):
+    task = simple_search_task.delay(query)
+    return {"task_id": task.id}
+
+from redis_celery.tasks.search_tasks import simple_search_task
+@app.get("/task/{task_id}")
+def get_task(task_id: str):
+    from celery.result import AsyncResult
+    task = AsyncResult(task_id)
+    return {
+        "task_id": task_id,
+        "status": task.status,
+        "result": task.result if task.ready() else None
+    }
 
 if __name__ == "__main__":
     import uvicorn
