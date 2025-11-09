@@ -33,7 +33,6 @@ DataExtraction/
 │   ├── 🎯 core/                # 핵심 컴포넌트
 │   │   ├── __init__.py
 │   │   ├── query_complexity.py # 쿼리 복잡도 평가
-│   │   ├── query_expander.py   # 쿼리 확장
 │   │   ├── query_optimizer.py  # 쿼리 최적화
 │   │   ├── query_rewriter.py   # 쿼리 재작성
 │   │   ├── semantic_model.py   # 도메인 의미 모델
