@@ -11,8 +11,16 @@ class Config:
     # --- 환경 ---
     APP_ENV: str = os.getenv("APP_ENV", "development")
 
-    # --- Elasticsearch ---
-    ES_HOST: str = os.getenv("ES_HOST", "http://elasticsearch:9200")
+    # --- OpenSearch ---
+    OPENSEARCH_HOST: str = os.getenv("OPENSEARCH_HOST", "localhost")
+    OPENSEARCH_PORT: int = int(os.getenv("OPENSEARCH_PORT", "9200"))
+    OPENSEARCH_USER: str = os.getenv("OPENSEARCH_USER", "admin")
+    OPENSEARCH_PASSWORD: str = os.getenv("OPENSEARCH_PASSWORD", "admin")
+    OPENSEARCH_USE_SSL: bool = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
+    OPENSEARCH_VERSION: float = float(os.getenv("OPENSEARCH_VERSION", "2.11"))
+
+    # --- Elasticsearch (레거시) ---
+    ES_HOST: str = os.getenv("ES_HOST", "http://localhost:9200")
 
     # --- Embedding & Reranking ---
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nlpai-lab/KURE-v1")
@@ -20,6 +28,11 @@ class Config:
     ENABLE_RERANKING: bool = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
     RERANKER_MODELS: List[str] = field(default_factory=lambda: os.getenv("RERANKER_MODELS", "BAAI/bge-reranker-base,cross-encoder/ms-marco-MiniLM-L-12-v2").split(","))
     RERANK_TOP_K: int = int(os.getenv("RERANK_TOP_K", 5))
+
+    # --- 벡터 검색 엔진 ---
+    VECTOR_ENGINE: str = os.getenv("VECTOR_ENGINE", "nmslib")  # nmslib 또는 faiss
+    HNSW_EF_CONSTRUCTION: int = int(os.getenv("HNSW_EF_CONSTRUCTION", "128"))
+    HNSW_M: int = int(os.getenv("HNSW_M", "16"))
 
     # --- Claude API ---
     CLAUDE_API_KEY: str = os.getenv("CLAUDE_API_KEY")
