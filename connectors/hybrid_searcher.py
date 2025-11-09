@@ -218,6 +218,8 @@ class OpenSearchHybridQueryBuilder:
         #    - 여기서는 키워드 검색에서 제외하므로 추가하지 않음
 
         # ⭐ 2. 의미적 must 키워드 (Demographics가 아닌 것만)
+        inner_hit_counter = 0
+
         if semantic_terms["must"]:
             for term in semantic_terms["must"]:
                 # Demographics가 아닌지 재확인
@@ -228,6 +230,7 @@ class OpenSearchHybridQueryBuilder:
                             "query": {"match": {"qa_pairs.answer_text": term}},
                             "score_mode": "max",
                             "inner_hits": {
+                                "name": f"must_{inner_hit_counter}",
                                 "size": 3,
                                 "_source": {
                                     "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
@@ -235,6 +238,7 @@ class OpenSearchHybridQueryBuilder:
                             }
                         }
                     })
+                    inner_hit_counter += 1
 
         # ⭐ 3. should 조건 (Demographics 제외, 있을 때만)
         should_query = None
@@ -260,6 +264,7 @@ class OpenSearchHybridQueryBuilder:
                         },
                         "score_mode": "max",
                         "inner_hits": {
+                            "name": f"should_{inner_hit_counter}",
                             "size": 3,
                             "_source": {
                                 "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
@@ -267,6 +272,7 @@ class OpenSearchHybridQueryBuilder:
                         }
                     }
                 }
+                inner_hit_counter += 1
 
         # ⭐ 4. 최종 쿼리 구성
         if must_queries or should_query:

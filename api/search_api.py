@@ -140,6 +140,13 @@ async def search_query(
         # 3단계: 검색 실행
         logger.info("\n[3/3] 검색 실행 중...")
 
+        # OpenSearch는 body에 반드시 객체 형태의 query가 있어야 합니다.
+        # 하이브리드 빌더가 키워드가 없을 때 {'query': None}을 돌려주는 경우가 있어,
+        # 그대로 전달하면 parsing_exception이 발생하므로 match_all로 치환합니다.
+        if os_query.get("query") in (None, {}):
+            logger.warning("⚠️ 검색 쿼리가 비어 있어 match_all 로 대체합니다")
+            os_query["query"] = {"match_all": {}}
+
         # 하이브리드 검색 (OpenSearch + Qdrant + RRF)
         if request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
             logger.info("   - 하이브리드 검색 모드 (OpenSearch + Qdrant + RRF)")
