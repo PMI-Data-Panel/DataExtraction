@@ -103,11 +103,6 @@ class AdvancedRAGQueryAnalyzer:
                 cached.execution_time = time.time() - start_time
                 return cached
         
-        # 쿼리 확장 (메타데이터 활용)
-        # ⚠️ QueryExpander.expand_with_context 제거: 필요시 별도 구현
-        # if metadata:
-        #     query = self.query_expander.expand_with_context(query, metadata)
-        
         # 폴백 체인으로 분석
         analysis = self._analyze_with_fallback(query, context)
         

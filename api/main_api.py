@@ -1,9 +1,12 @@
+# api/main_api.py
 """메인 FastAPI 애플리케이션"""
 import os
 import logging
 import torch
+from typing import Optional
 from fastapi import FastAPI
 from opensearchpy import OpenSearch
+from opensearchpy._async.client import AsyncOpenSearch
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 
@@ -22,6 +25,7 @@ logger = logging.getLogger(__name__)
 # --- 전역 변수 ---
 config: Config = None
 os_client: OpenSearch = None
+async_os_client: Optional[AsyncOpenSearch] = None
 qdrant_client: QdrantClient = None
 embedding_model: SentenceTransformer = None
 
@@ -33,7 +37,7 @@ def create_app() -> FastAPI:
     Returns:
         초기화된 FastAPI 앱 인스턴스
     """
-    global config, os_client, qdrant_client, embedding_model
+    global config, os_client, async_os_client, qdrant_client, embedding_model
 
     try:
         # 설정 로드
@@ -48,7 +52,7 @@ def create_app() -> FastAPI:
 
         # OpenSearch 클라이언트 초기화
         logger.info("OpenSearch 클라이언트 초기화 중...")
-        os_client = OpenSearch(
+        common_os_kwargs = dict(
             hosts=[{'host': config.OPENSEARCH_HOST, 'port': config.OPENSEARCH_PORT}],
             http_auth=(config.OPENSEARCH_USER, config.OPENSEARCH_PASSWORD),
             use_ssl=config.OPENSEARCH_USE_SSL,
@@ -56,7 +60,11 @@ def create_app() -> FastAPI:
             ssl_show_warn=False,
             request_timeout=60  # ⭐ 타임아웃 증가: 배치 조회 대응 (30초 → 60초)
         )
-        logger.info("[OK] OpenSearch 클라이언트 초기화 완료")
+        os_client = OpenSearch(**common_os_kwargs)
+        logger.info("OpenSearch client initialized with settings: %s", common_os_kwargs)
+        async_os_client = AsyncOpenSearch(**common_os_kwargs)
+        logger.info("AsyncOpenSearch client initialized with settings: %s", common_os_kwargs)
+        logger.info("[OK] OpenSearch 클라이언트 초기화 완료 (sync/async)")
 
         # Qdrant 클라이언트 초기화
         logger.info("Qdrant 클라이언트 초기화 중...")
@@ -78,6 +86,7 @@ def create_app() -> FastAPI:
         indexer_router.os_client = os_client
         indexer_router.embedding_model = embedding_model
         search_router.os_client = os_client
+        search_router.async_os_client = async_os_client
         search_router.qdrant_client = qdrant_client
         search_router.embedding_model = embedding_model
         search_router.config = config
@@ -123,6 +132,13 @@ def create_app() -> FastAPI:
             except Exception as e:
                 logger.warning(f"[WARNING] OpenSearch 연결 실패: {e}")
 
+            # Async OpenSearch 연결 확인
+            try:
+                if async_os_client and await async_os_client.ping():
+                    logger.info("[OK] Async OpenSearch 연결 성공")
+            except Exception as e:
+                logger.warning(f"[WARNING] Async OpenSearch 연결 실패: {e}")
+
             logger.info("\n사용 가능한 엔드포인트:")
             logger.info("   - GET  /                          : API 환영 메시지")
             logger.info("   - GET  /health                    : 헬스 체크")
@@ -133,6 +149,17 @@ def create_app() -> FastAPI:
             logger.info("   - GET  /docs                      : API 문서 (Swagger UI)")
             logger.info("   - GET  /redoc                     : API 문서 (ReDoc)")
             logger.info("=" * 60 + "\n")
+
+        @app.on_event("shutdown")
+        async def shutdown_event():
+            """리소스 정리"""
+            logger.info("🛑 애플리케이션 종료: 리소스 정리 중...")
+            try:
+                if async_os_client:
+                    await async_os_client.close()
+                    logger.info("[OK] Async OpenSearch 클라이언트 종료")
+            except Exception as e:
+                logger.warning(f"⚠️ Async OpenSearch 종료 실패: {e}")
 
         # 기본 엔드포인트
         @app.get("/", summary="API 환영 메시지")
@@ -207,21 +234,21 @@ def create_app() -> FastAPI:
 # 앱 인스턴스 생성
 app = create_app()
 
-@app.post("/search/celery-test")
-def search(query: str):
-    task = simple_search_task.delay(query)
-    return {"task_id": task.id}
+# @app.post("/search/celery-test")
+# def search(query: str):
+#     task = simple_search_task.delay(query)
+#     return {"task_id": task.id}
 
-from redis_celery.tasks.search_tasks import simple_search_task
-@app.get("/task/{task_id}")
-def get_task(task_id: str):
-    from celery.result import AsyncResult
-    task = AsyncResult(task_id)
-    return {
-        "task_id": task_id,
-        "status": task.status,
-        "result": task.result if task.ready() else None
-    }
+# from redis_celery.tasks.search_tasks import simple_search_task
+# @app.get("/task/{task_id}")
+# def get_task(task_id: str):
+#     from celery.result import AsyncResult
+#     task = AsyncResult(task_id)
+#     return {
+#         "task_id": task_id,
+#         "status": task.status,
+#         "result": task.result if task.ready() else None
+#     }
 
 if __name__ == "__main__":
     import uvicorn

@@ -8,12 +8,12 @@ pandas==2.2.3
 numpy==1.26.4
 
 # OpenSearch & Vector DB
-opensearch-py==2.4.2
+opensearch-py==3.0.0
 qdrant-client==1.7.0
 
 # Embedding & ML
 sentence-transformers==3.2.1
-torch==2.4.1
+torch==2.9.0
 transformers==4.44.2
 
 # Utilities
@@ -24,3 +24,4 @@ pydantic>=2.0.0
 anthropic
 celery
 redis
+
