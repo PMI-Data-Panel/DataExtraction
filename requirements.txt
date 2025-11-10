@@ -8,7 +8,7 @@ pandas==2.2.3
 numpy==1.26.4
 
 # OpenSearch & Vector DB
-opensearch-py==3.0.0
+opensearch-py[async]==3.0.0
 qdrant-client==1.15.1
 
 # Embedding & ML

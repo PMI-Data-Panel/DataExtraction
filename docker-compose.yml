@@ -1,0 +1,355 @@
+services:
+  # ============================================
+  # Redis (메시지 브로커 + 백엔드 + 캐시)
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: surveypilot-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    # ✅  메모리 제한 추가 (OOM 방지)
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+
+  fastapi-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: surveypilot-fastapi-server
+    volumes:
+      - ./:/app
+    ports:
+      - "8000:8000" # 외부 포트:내부 포트
+    environment:
+      # 💡  Celery Task 호출에 필요한 Redis 설정 (FastAPI가 Celery를 호출할 때 사용)
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CACHE_DB=2
+      # 💡  OpenSearch/Qdrant 등 외부 서비스 연결을 위해 .env 변수 주입
+      - OPENSEARCH_HOST=${OPENSEARCH_HOST}
+      - QDRANT_HOST=${QDRANT_HOST}
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      redis:
+        condition: service_healthy # Redis가 준비된 후에 시작
+    # 💡  Uvicorn을 사용하여 api/main_api.py의 app 인스턴스를 실행
+    command: >
+      uvicorn api.main_api:app
+      --host 0.0.0.0
+      --port 8000
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5' # 1.0 -> 0.5 (4코어에 맞춤)
+          memory: 1G
+  # ============================================
+  # 고우선순위 Worker (단일 인덱스 검색)
+  # ============================================
+  celery-worker-high:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - ./logs:/app/logs
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CACHE_DB=2
+      - OPENSEARCH_HOST=${OPENSEARCH_HOST}
+      - OPENSEARCH_PORT=${OPENSEARCH_PORT}
+      - OPENSEARCH_USER=${OPENSEARCH_USER}
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD}
+      - QDRANT_HOST=${QDRANT_HOST}
+      - QDRANT_PORT=${QDRANT_PORT}
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - PYTHONPATH=/app
+      # ✅  Worker 식별용
+      - CELERY_WORKER_NAME=high-priority
+    depends_on:
+      redis:
+        condition: service_healthy
+    # ✅  우선순위 큐만 처리 + 동시성 증가
+    command: >
+      celery -A redis_celery.celery_app worker
+      --loglevel=info
+      --concurrency=3
+      --queues=search_high
+      --pool=prefork
+      --max-memory-per-child=500000
+      --max-tasks-per-child=1000
+      --hostname=high@%h
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    # ✅  헬스체크 추가
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A redis_celery.celery_app inspect ping -d celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # ✅  리소스 제한
+    deploy:
+      replicas: 2  # ✅  3개 Worker로 확장
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ============================================
+  # 중간우선순위 Worker (전체 검색 오케스트레이터)
+  # ============================================
+  celery-worker-medium:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - ./logs:/app/logs
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CACHE_DB=2
+      - OPENSEARCH_HOST=${OPENSEARCH_HOST}
+      - OPENSEARCH_PORT=${OPENSEARCH_PORT}
+      - OPENSEARCH_USER=${OPENSEARCH_USER}
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD}
+      - QDRANT_HOST=${QDRANT_HOST}
+      - QDRANT_PORT=${QDRANT_PORT}
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - PYTHONPATH=/app
+      - CELERY_WORKER_NAME=medium-priority
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A redis_celery.celery_app worker
+      --loglevel=info
+      --concurrency=1
+      --queues=search_medium
+      --pool=prefork
+      --max-memory-per-child=500000
+      --max-tasks-per-child=1000
+      --hostname=medium@%h
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A redis_celery.celery_app inspect ping -d celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '0.4'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+  # ============================================
+  # 저우선순위 Worker (RRF 결합 + 캐싱)
+  # ============================================
+  celery-worker-low:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - ./logs:/app/logs
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CACHE_DB=2
+      - OPENSEARCH_HOST=${OPENSEARCH_HOST}
+      - OPENSEARCH_PORT=${OPENSEARCH_PORT}
+      - OPENSEARCH_USER=${OPENSEARCH_USER}
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD}
+      - QDRANT_HOST=${QDRANT_HOST}
+      - QDRANT_PORT=${QDRANT_PORT}
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - PYTHONPATH=/app
+      - CELERY_WORKER_NAME=low-priority
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A redis_celery.celery_app worker
+      --loglevel=info
+      --concurrency=1
+      --queues=search_low
+      --pool=prefork
+      --max-memory-per-child=500000
+      --max-tasks-per-child=1000
+      --hostname=low@%h
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A redis_celery.celery_app inspect ping -d celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+  # ============================================
+  # Celery Beat (스케줄 작업 - 필요시만 활성화)
+  # ============================================
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: surveypilot-celery-beat
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - ./logs:/app/logs
+      - celerybeat-schedule:/app/celerybeat-schedule  # ✅  스케줄 영속화
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CACHE_DB=2
+      - PYTHONPATH=/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A redis_celery.celery_app beat
+      --loglevel=infoa
+      --schedule=/app/celerybeat-schedule/celerybeat-schedule
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    profiles:
+      - with-beat  # ✅  필요시만: docker-compose --profile with-beat up
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ============================================
+  # Flower (Celery 모니터링)
+  # ============================================
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: surveypilot-flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - PYTHONPATH=/app
+      # ✅  Flower 인증 추가 (프로덕션 필수)
+      - FLOWER_BASIC_AUTH=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A redis_celery.celery_app flower
+      --port=5555
+      --max_tasks=10000
+      --persistent=True
+      --db=/app/flower.db
+    volumes:
+      - ./:/app
+      - flower-data:/app/flower.db  # ✅  Flower 데이터 영속화
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    profiles:
+      - with-flower
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5555/api/workers || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ============================================
+  # Redis Commander (Redis GUI - 개발용)
+  # ============================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: surveypilot-redis-commander
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+      - HTTP_USER=${REDIS_COMMANDER_USER:-admin}
+      - HTTP_PASSWORD=${REDIS_COMMANDER_PASSWORD:-admin}
+    depends_on:
+      - redis
+    networks:
+      - surveypilot-network
+    restart: unless-stopped
+    profiles:
+      - dev
+
+  # ============================================
+  # 네트워크
+  # ============================================
+networks:
+  surveypilot-network:
+    driver: bridge
+
+# ============================================
+# 볼륨
+# ============================================
+volumes:
+  redis_data:
+    driver: local
+  celerybeat-schedule:  # ✅  Beat 스케줄 영속화
+    driver: local
+  flower-data:  # ✅  Flower 데이터 영속화
+    driver: local
