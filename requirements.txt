@@ -9,7 +9,7 @@ numpy==1.26.4
 
 # OpenSearch & Vector DB
 opensearch-py==3.0.0
-qdrant-client==1.7.0
+qdrant-client==1.15.1
 
 # Embedding & ML
 sentence-transformers==3.2.1

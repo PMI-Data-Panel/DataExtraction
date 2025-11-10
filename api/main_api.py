@@ -15,7 +15,7 @@ from rag_query_analyzer.config import get_config, Config
 from indexer.router import router as indexer_router
 from .search_api import router as search_router
 from .visualization_api import router as visualization_router
-
+from .celery_api import router as celery_router
 # --- 로깅 설정 ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -222,6 +222,7 @@ def create_app() -> FastAPI:
         app.include_router(indexer_router)
         app.include_router(search_router)
         app.include_router(visualization_router)
+        app.include_router(celery_router)
 
         return app
 
