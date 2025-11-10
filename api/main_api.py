@@ -1,12 +1,10 @@
-# api/main_api.py
 """메인 FastAPI 애플리케이션"""
 import os
 import logging
 import torch
 from typing import Optional
 from fastapi import FastAPI
-from opensearchpy import OpenSearch
-from opensearchpy._async.client import AsyncOpenSearch
+from opensearchpy import OpenSearch, AsyncOpenSearch
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 
@@ -89,6 +87,7 @@ def create_app() -> FastAPI:
         search_router.async_os_client = async_os_client
         search_router.qdrant_client = qdrant_client
         search_router.embedding_model = embedding_model
+        search_router.embedding_model_factory = lambda: embedding_model
         search_router.config = config
 
         # 시작 이벤트 등록
@@ -234,21 +233,6 @@ def create_app() -> FastAPI:
 # 앱 인스턴스 생성
 app = create_app()
 
-# @app.post("/search/celery-test")
-# def search(query: str):
-#     task = simple_search_task.delay(query)
-#     return {"task_id": task.id}
-
-# from redis_celery.tasks.search_tasks import simple_search_task
-# @app.get("/task/{task_id}")
-# def get_task(task_id: str):
-#     from celery.result import AsyncResult
-#     task = AsyncResult(task_id)
-#     return {
-#         "task_id": task_id,
-#         "status": task.status,
-#         "result": task.result if task.ready() else None
-#     }
 
 if __name__ == "__main__":
     import uvicorn

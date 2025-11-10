@@ -12,7 +12,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
     Filter, FieldCondition, MatchValue,
-    SearchRequest
+    SearchRequest, QueryResponse
 )
 from dotenv import load_dotenv
 

@@ -1,4 +1,5 @@
 """클라우드 데이터 페처 - OpenSearch 및 Qdrant에서 데이터 조회"""
+import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 from opensearchpy import OpenSearch, AsyncOpenSearch
@@ -140,35 +141,72 @@ class DataFetcher:
         self,
         index_name: str,
         doc_ids: List[str],
-        batch_size: int = 200,
-        request_timeout: int = 60
+        batch_size: Optional[int] = None,
+        request_timeout: int = 60,
+        source_fields: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """비동기 문서 일괄 조회 (배치) -> raw docs 리스트 반환"""
-        if not self.os_async_client:
-            raise ValueError("Async OpenSearch 클라이언트가 초기화되지 않았습니다")
-
         if not doc_ids:
             return []
 
-        results: List[Dict[str, Any]] = []
-        total_batches = (len(doc_ids) + batch_size - 1) // batch_size
-        for batch_idx in range(0, len(doc_ids), batch_size):
-            batch_ids = doc_ids[batch_idx:batch_idx + batch_size]
-            batch_num = (batch_idx // batch_size) + 1
+        if batch_size is None:
+            if len(doc_ids) <= 100:
+                batch_size = 50
+            elif len(doc_ids) <= 500:
+                batch_size = 100
+            else:
+                batch_size = 200
+
+        batches = [
+            doc_ids[i:i + batch_size]
+            for i in range(0, len(doc_ids), batch_size)
+        ]
+
+        logger.info(f"📦 [async] {index_name} 배치 조회: {len(doc_ids)}건 → {len(batches)}개 배치 (크기: {batch_size})")
+
+        async def fetch_batch(batch_ids: List[str], batch_num: int) -> List[Dict[str, Any]]:
+            if not batch_ids:
+                return []
             mget_body = [{"_index": index_name, "_id": uid} for uid in batch_ids]
             try:
-                response = await self.os_async_client.mget(
-                    body={"docs": mget_body},
-                    ignore=[404],
-                    request_timeout=request_timeout
-                )
+                if self.os_async_client:
+                    response = await self.os_async_client.mget(
+                        body={"docs": mget_body},
+                        ignore=[404],
+                        request_timeout=request_timeout,
+                        _source=source_fields
+                    )
+                else:
+                    loop = asyncio.get_event_loop()
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda: self.os_client.mget(
+                            body={"docs": mget_body},
+                            ignore=[404],
+                            request_timeout=request_timeout,
+                            _source=source_fields
+                        )
+                    )
                 docs = response.get('docs', [])
                 found = sum(1 for item in docs if item.get('found'))
-                results.extend(docs)
-                logger.debug(f"  📦 [async] {index_name} 배치 {batch_num}/{total_batches}: {found}/{len(batch_ids)}건")
+                logger.debug(f"  ✅ [async] {index_name} 배치 {batch_num}: {found}/{len(batch_ids)}건")
+                return docs
             except Exception as e:
-                logger.warning(f"  ⚠️ [async] {index_name} 배치 {batch_num}/{total_batches} 실패: {e}")
-                continue
+                logger.warning(f"  ⚠️ [async] {index_name} 배치 {batch_num} 실패: {e}")
+                return []
+
+        results: List[Dict[str, Any]] = []
+        max_concurrent = 3
+        for i in range(0, len(batches), max_concurrent):
+            batch_group = batches[i:i + max_concurrent]
+            tasks = [
+                fetch_batch(batch, i + j + 1)
+                for j, batch in enumerate(batch_group)
+            ]
+            batch_results = await asyncio.gather(*tasks)
+            for docs in batch_results:
+                results.extend(docs)
+
         logger.info(f"  ✅ [async] {index_name} 배치 조회 완료: {len(results)}/{len(doc_ids)}건 (raw docs)")
         return results
 

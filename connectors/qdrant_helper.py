@@ -71,5 +71,4 @@ async def search_qdrant_collections_async(
             formatted[name] = []
         else:
             formatted[name] = result
-
     return formatted
