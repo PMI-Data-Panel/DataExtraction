@@ -12,10 +12,11 @@ import asyncio
 import json
 import logging
 import hashlib
+import os
+
 from typing import Dict, Any, List, Tuple, Optional
 from time import perf_counter
-from celery import group, chord
-from redis import StrictRedis
+from celery import group, chord, signals
 
 from redis_celery.celery_app import celery_app
 from opensearchpy import OpenSearch
@@ -24,13 +25,83 @@ from connectors.data_fetcher import DataFetcher
 from connectors.hybrid_searcher import calculate_rrf_score
 from rag_query_analyzer.config import get_config
 from sentence_transformers import SentenceTransformer
-import os
+from redis import ConnectionPool, StrictRedis
 
 logger = logging.getLogger(__name__)
+_os_client = None
+_qdrant_client = None
+_redis_pool = None
+_embedding_model = None
+_config = None
 
 # ==========================================
 # 📌 1. 쿼리 캐싱 유틸리티
 # ==========================================
+@signals.worker_process_init.connect
+def setup_worker_environment(**kwargs):
+    """
+    Worker 프로세스 시작 시 클라이언트와 모델을 로드하여 캐시합니다.
+    이 함수는 Task 실행 비용을 획기적으로 줄여줍니다.
+    """
+    global _os_client, _qdrant_client, _redis_pool, _embedding_model, _config
+
+    try:
+        # 1. 설정 로드 (Task 실행 비용이 아님)
+        os.environ['SENTENCE_TRANSFORMERS_HOME'] = '/app/.cache/models'
+        _config = get_config()
+        
+        # 2. 클라이언트 연결 풀 생성
+        # Docker Compose 환경에서는 'redis' 서비스 이름 사용
+        _redis_pool = ConnectionPool(
+            host=os.getenv('REDIS_HOST', 'redis'), 
+            port=int(os.getenv('REDIS_PORT', '6379')),
+            db=int(os.getenv('CACHE_DB', '2')),
+            decode_responses=True, max_connections=20,
+            socket_connect_timeout=5, socket_timeout=5
+        )
+        _redis_client = StrictRedis(connection_pool=_redis_pool) # 이 인스턴스는 Task에서 사용
+
+        # 3. OpenSearch 클라이언트 생성 (인라인 통합)
+        _os_client = OpenSearch(
+            hosts=[{
+                'host': os.getenv('OPENSEARCH_HOST', 'redis'), # Docker service name fix
+                'port': int(os.getenv('OPENSEARCH_PORT', '9200'))
+            }],
+            http_auth=(os.getenv('OPENSEARCH_USER', 'admin'), os.getenv('OPENSEARCH_PASSWORD', 'admin')),
+            use_ssl=False, verify_certs=False, timeout=30,
+        )
+        
+        # 4. Qdrant 클라이언트 생성 (인라인 통합)
+        _qdrant_client = QdrantClient(
+            host=os.getenv('QDRANT_HOST', 'redis'), 
+            port=int(os.getenv('QDRANT_PORT', '6333')), 
+            timeout=30
+        )
+
+        logger.info("[OK] External Clients (OS/Qdrant) initialized.")
+        load_model_flag = os.getenv('LOAD_EMBEDDING_MODEL', 'False').lower() == 'true'
+        
+        if load_model_flag:
+            model_name = _config.EMBEDDING_MODEL
+            _embedding_model = SentenceTransformer(model_name)
+            logger.info(f"✅ Worker 시작: 임베딩 모델 '{model_name}' 로드 완료")
+        else:
+            logger.info("ℹ️ Worker 시작: 임베딩 모델 로드를 건너뜁니다 (LOAD_EMBEDDING_MODEL=False)")
+        
+        logger.info(f"✅ Worker 시작: 임베딩 모델 '{model_name}' 로드 완료")
+
+    except Exception as e:
+        logger.critical(f"❌ Worker 초기화 실패: {e}")
+        raise # Worker가 초기화 실패하면 죽도록 강제 (Healthcheck 실패 유도)
+
+
+def get_redis_client() -> StrictRedis:
+    """Task에서 캐시된 Redis 연결 풀을 사용하여 클라이언트 반환"""
+    global _redis_pool
+    if _redis_pool is None:
+        raise RuntimeError("Redis Pool not initialized.")
+    return StrictRedis(connection_pool=_redis_pool)
+
 
 def get_cache_key(query: str, index_name: str, filters: List[Dict] = None) -> str:
     """캐시 키 생성 (쿼리 해시)"""
@@ -67,27 +138,6 @@ def cache_results(redis_client: StrictRedis, cache_key: str, results: Dict, ttl:
     except Exception as e:
         logger.warning(f"캐시 저장 실패: {e}")
 
-# ✅ Redis 연결 풀 추가
-_redis_pool = None
-
-def get_redis_client() -> StrictRedis:
-    """Redis 클라이언트 (연결 풀 재사용)"""
-    global _redis_pool
-    
-    if _redis_pool is None:
-        from redis.connection import ConnectionPool
-        _redis_pool = ConnectionPool(
-            host=os.getenv('REDIS_HOST', 'localhost'),
-            port=int(os.getenv('REDIS_PORT', '6379')),
-            db=int(os.getenv('CACHE_DB', '2')),
-            max_connections=20,
-            socket_connect_timeout=5,
-            socket_timeout=5,
-            decode_responses=True
-        )
-    
-    return StrictRedis(connection_pool=_redis_pool)
-
 # ==========================================
 # 📌 2. 단일 인덱스 검색 Task (Worker 분산 처리)
 # ==========================================
@@ -110,25 +160,23 @@ def search_single_index_task(
     task_id = self.request.id
     start_time = perf_counter()
     
-    # ✅ EventLoop 안전한 실행
-    loop = None
     try:
         logger.info(f"🔍 [{task_id}] {index_name} 검색 시작")
         
         # Redis 캐시 확인
         redis_client = get_redis_client()
+        os_client, qdrant_client = get_search_clients() # 캐시된 클라이언트 반환
+
         cache_key = get_cache_key(query, index_name, filters)
         cached = get_cached_results(redis_client, cache_key)
         if cached:
             return cached
         
-        # OpenSearch & Qdrant 클라이언트 초기화
-        os_client, qdrant_client = get_search_clients()
-        
         # ✅ EventLoop 생성 및 실행
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
+        loop_start = perf_counter()
         keyword_results, vector_results = loop.run_until_complete(
             execute_hybrid_search_async(
                 os_client=os_client,
@@ -290,6 +338,13 @@ def search_qdrant_sync(
 # ==========================================
 # 📌 3. 전체 인덱스 병렬 검색 Orchestrator
 # ==========================================
+def get_cached_config_model():
+    """캐시된 Config 및 SentenceTransformer 객체를 반환합니다."""
+    # 🚨 이 함수는 파일 상단의 전역 변수 _config와 _embedding_model을 참조합니다.
+    global _config, _embedding_model
+    if _config is None or _embedding_model is None:
+        raise RuntimeError("Worker environment failed to initialize model/config.")
+    return _config, _embedding_model
 
 @celery_app.task(
     name='tasks.parallel_hybrid_search_orchestrator',
@@ -313,8 +368,7 @@ def parallel_hybrid_search_orchestrator(
     
     try:
         # 1. 설정 및 쿼리 분석
-        config = get_config()
-        embedding_model = SentenceTransformer(config.EMBEDDING_MODEL)
+        config, embedding_model = get_cached_config_model()
         
         from rag_query_analyzer.analyzers.main_analyzer import AdvancedRAGQueryAnalyzer
         from rag_query_analyzer.analyzers.demographic_extractor import DemographicExtractor
@@ -480,12 +534,7 @@ def combine_results_task(
         logger.info(f"  ✅ RRF 재결합 완료: {len(combined_results)}건")
         
         # 3. Redis 캐싱
-        redis_client = StrictRedis(
-            host=os.getenv('REDIS_HOST', 'localhost'),
-            port=int(os.getenv('REDIS_PORT', '6379')),
-            db=int(os.getenv('CACHE_DB', '2')),
-            decode_responses=True
-        )
+        redis_client = get_redis_client()
         
         cache_results_to_redis(
             redis_client=redis_client,
@@ -515,30 +564,18 @@ def combine_results_task(
 # ==========================================
 # 📌 유틸리티 함수들
 # ==========================================
-
 def get_search_clients() -> Tuple[OpenSearch, QdrantClient]:
-    """OpenSearch & Qdrant 클라이언트 초기화"""
-    os_client = OpenSearch(
-        hosts=[{
-            'host': os.getenv('OPENSEARCH_HOST', 'localhost'),
-            'port': int(os.getenv('OPENSEARCH_PORT', '9200'))
-        }],
-        http_auth=(
-            os.getenv('OPENSEARCH_USER', 'admin'),
-            os.getenv('OPENSEARCH_PASSWORD', 'admin')
-        ),
-        use_ssl=False,
-        verify_certs=False,
-        timeout=30,
-    )
+    """OpenSearch & Qdrant 클라이언트 초기화 (Worker 캐시 반환으로 대체)"""
+    # 💡 Worker 시작 시 _os_client, _qdrant_client가 생성되었다고 가정
+    global _os_client, _qdrant_client
     
-    qdrant_client = QdrantClient(
-        host=os.getenv('QDRANT_HOST', 'localhost'),
-        port=int(os.getenv('QDRANT_PORT', '6333')),
-        timeout=30
-    )
+    if _os_client is None:
+        # 초기화 실패 시 예외를 발생시켜 Task가 정상 종료되도록 함
+        logger.error("Search clients not initialized. Worker setup failed.")
+        # 🚨 여기서 RuntimeError를 발생시키지 않으면 Task 실패 로그가 명확하지 않을 수 있음
+        raise RuntimeError("Search clients not initialized. Worker setup failed.")
     
-    return os_client, qdrant_client
+    return _os_client, _qdrant_client
 
 
 def get_all_survey_indices(os_client: OpenSearch) -> List[str]:

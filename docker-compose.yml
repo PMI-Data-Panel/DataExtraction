@@ -1,4 +1,6 @@
 services:
+
+  
   # ============================================
   # Redis (메시지 브로커 + 백엔드 + 캐시)
   # ============================================
@@ -23,9 +25,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
-        reservations:
           memory: 512M
+        reservations:
+          memory: 256M
 
 
   fastapi-server:
@@ -62,12 +64,13 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.5' # 1.0 -> 0.5 (4코어에 맞춤)
-          memory: 1G
+          cpus: '2' # 1.0 -> 0.5 (4코어에 맞춤)
+          memory: 2G
   # ============================================
   # 고우선순위 Worker (단일 인덱스 검색)
   # ============================================
-  celery-worker-high:
+  celery-worker-high: 
+    
     build:
       context: .
       dockerfile: Dockerfile
@@ -91,6 +94,7 @@ services:
       - PYTHONPATH=/app
       # ✅  Worker 식별용
       - CELERY_WORKER_NAME=high-priority
+      - LOAD_EMBEDDING_MODEL=True
     depends_on:
       redis:
         condition: service_healthy
@@ -101,7 +105,6 @@ services:
       --concurrency=3
       --queues=search_high
       --pool=prefork
-      --max-memory-per-child=500000
       --max-tasks-per-child=1000
       --hostname=high@%h
     networks:
@@ -109,7 +112,7 @@ services:
     restart: unless-stopped
     # ✅  헬스체크 추가
     healthcheck:
-      test: ["CMD-SHELL", "celery -A redis_celery.celery_app inspect ping -d celery@$$HOSTNAME"]
+      test: ["CMD-SHELL", "celery -A redis_celery.celery_app inspect ping -d high@$$HOSTNAME"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -120,10 +123,10 @@ services:
       resources:
         limits:
           cpus: '1.5'
-          memory: 1G
+          memory: 2.5G
         reservations:
           cpus: '0.5'
-          memory: 512M
+          memory: 1G
 
   # ============================================
   # 중간우선순위 Worker (전체 검색 오케스트레이터)
@@ -167,7 +170,7 @@ services:
       - surveypilot-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "celery -A redis_celery.celery_app inspect ping -d celery@$$HOSTNAME"]
+      test: ["CMD-SHELL", "celery -A redis_celery.celery_app inspect ping -d medium@$$HOSTNAME"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -177,7 +180,7 @@ services:
       resources:
         limits:
           cpus: '0.4'
-          memory: 1G
+          memory: 512M
         reservations:
           cpus: '0.25'
           memory: 256M
@@ -223,7 +226,7 @@ services:
       - surveypilot-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "celery -A redis_celery.celery_app inspect ping -d celery@$$HOSTNAME"]
+      test: ["CMD-SHELL", "celery -A redis_celery.celery_app inspect ping -d low@$$HOSTNAME"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -232,8 +235,8 @@ services:
       replicas: 1
       resources:
         limits:
-          cpus: '1'
-          memory: 1G
+          cpus: '0.1'
+          memory: 512M
         reservations:
           cpus: '0.25'
           memory: 256M
@@ -261,7 +264,7 @@ services:
         condition: service_healthy
     command: >
       celery -A redis_celery.celery_app beat
-      --loglevel=infoa
+      --loglevel=info
       --schedule=/app/celerybeat-schedule/celerybeat-schedule
     networks:
       - surveypilot-network
@@ -314,7 +317,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 256M
 
   # ============================================
   # Redis Commander (Redis GUI - 개발용)

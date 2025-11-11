@@ -21,7 +21,7 @@ celery_app = Celery(
 celery_app.config_from_object('redis_celery.celeryconfig')
 
 # 💡 Task 자동 발견 설정 (유지)
-celery_app.autodiscover_tasks(['redis_celery.tasks'])
+celery_app.autodiscover_tasks(['redis_celery.tasks.search_tasks'])
 
 
 if __name__ == '__main__':

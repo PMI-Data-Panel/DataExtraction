@@ -72,13 +72,13 @@ def create_app() -> FastAPI:
         logger.info(f"[OK] Qdrant 클라이언트 초기화 완료: {qdrant_host}:{qdrant_port}")
 
         # 임베딩 모델 로딩 (KURE-v1)
-        logger.info(f"임베딩 모델 로딩 중: {config.EMBEDDING_MODEL}")
-        embedding_model = SentenceTransformer(
-            config.EMBEDDING_MODEL,
-            device='cuda' if torch.cuda.is_available() else 'cpu'
-        )
-        embedding_model.max_seq_length = 512
-        logger.info(f"[OK] KURE-v1 모델 로드 완료 (차원: {config.EMBEDDING_DIM}, 장치: {embedding_model.device})")
+        # logger.info(f"임베딩 모델 로딩 중: {config.EMBEDDING_MODEL}")
+        # embedding_model = SentenceTransformer(
+        #     config.EMBEDDING_MODEL,
+        #     device='cuda' if torch.cuda.is_available() else 'cpu'
+        # )
+        # embedding_model.max_seq_length = 512
+        # logger.info(f"[OK] KURE-v1 모델 로드 완료 (차원: {config.EMBEDDING_DIM}, 장치: {embedding_model.device})")
 
         # 라우터에 의존성 주입
         indexer_router.os_client = os_client
