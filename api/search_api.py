@@ -304,7 +304,10 @@ def reorder_with_matches(full_list: List[Dict[str, Any]], matched: List[Dict[str
 class SearchRequest(BaseModel):
     """검색 요청"""
     query: str = Field(..., description="검색 쿼리")
-    index_name: str = Field(default="*", description="검색할 인덱스 이름 (와일드카드 지원, 기본값: 전체 인덱스 '*')")
+    index_name: str = Field(
+        default="welcome_all",
+        description="검색할 인덱스 이름 (기본값: alias 'welcome_all'; 와일드카드 사용 가능)"
+    )
     size: int = Field(default=10, ge=1, le=100, description="반환할 결과 개수")
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
 
@@ -434,7 +437,7 @@ async def search_query(
             
             # OpenSearch _source filtering: 필요한 필드만 조회
             source_filter = {
-                "includes": ["user_id", "metadata", "qa_pairs", "timestamp"],
+                "includes": ["user_id", "metadata", "timestamp"],
                 "excludes": []
             }
 
@@ -465,7 +468,7 @@ async def search_query(
             
             # OpenSearch _source filtering: 필요한 필드만 조회
             source_filter = {
-                "includes": ["user_id", "metadata", "qa_pairs", "timestamp"],
+                "includes": ["user_id", "metadata", "timestamp"],
                 "excludes": []  # 필요시 제외할 필드 추가
             }
             
@@ -765,7 +768,10 @@ async def search_query(
 class NLSearchRequest(BaseModel):
     """자연어 기반 검색 요청 (필터/size 자동 추출)"""
     query: str = Field(..., description="자연어 쿼리 (예: '30대 사무직 300명 데이터 보여줘')")
-    index_name: str = Field(default="*", description="검색할 인덱스 이름 (기본값: 전체 인덱스 '*')")
+    index_name: str = Field(
+        default="welcome_all",
+        description="검색할 인덱스 이름 (기본값: alias 'welcome_all'; 와일드카드 사용 가능)"
+    )
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
 
 
@@ -1243,7 +1249,7 @@ async def search_natural_language(
         
         # OpenSearch _source filtering: 필요한 필드만 조회
         source_filter = {
-            "includes": ["user_id", "metadata", "qa_pairs", "timestamp"],
+            "includes": ["user_id", "metadata", "timestamp"],
             "excludes": []  # 필요시 제외할 필드 추가
         }
         
@@ -1282,7 +1288,7 @@ async def search_natural_language(
                 'query': {'match_all': {}},
                 'size': size_value,
                 '_source': {
-                    'includes': ['user_id', 'metadata', 'qa_pairs', 'timestamp']
+                'includes': ['user_id', 'metadata', 'timestamp']
                 }
             }
 
@@ -1664,6 +1670,20 @@ async def search_natural_language(
         
         logger.info(f"  ✅ 인덱스 간 RRF 재결합 완료: {len(rrf_results)}건 (고유 user_id: {len(user_rrf_map)}개)")
         timings['rrf_recombination_ms'] = (perf_counter() - rrf_start) * 1000
+
+        # 후보 문서 수 제한 (후처리 부담 완화)
+        candidate_cap = max(size * 5, 300)
+        if len(rrf_results) > candidate_cap:
+            logger.info(
+                f"  - 후보 문서 제한 적용: {len(rrf_results)} → {candidate_cap} (size={size})"
+            )
+            rrf_results = rrf_results[:candidate_cap]
+        if len(rrf_results) < size:
+            backup_cap = max(size * 6, size + 50)
+            logger.info(
+                f"  - 후보 수가 size보다 작아 증가 시도: {len(rrf_results)} → {min(len(final_rrf_results), backup_cap)}"
+            )
+            rrf_results = final_rrf_results[:backup_cap]
         
         # RRF 점수 디버깅: 상위 10개 출력
         if rrf_results:
