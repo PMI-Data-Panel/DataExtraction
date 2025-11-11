@@ -16,7 +16,9 @@ class Config:
     OPENSEARCH_PORT: int = int(os.getenv("OPENSEARCH_PORT", "9200"))
     OPENSEARCH_USER: str = os.getenv("OPENSEARCH_USER", "admin")
     OPENSEARCH_PASSWORD: str = os.getenv("OPENSEARCH_PASSWORD", "admin")
-    OPENSEARCH_USE_SSL: bool = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
+    OPENSEARCH_USE_SSL: bool = os.getenv("OPENSEARCH_USE_SSL", "true").lower() == "true"
+    OPENSEARCH_VERIFY_CERTS: bool = os.getenv("OPENSEARCH_VERIFY_CERTS", "false").lower() == "true"
+    OPENSEARCH_SSL_ASSERT_HOSTNAME: bool = os.getenv("OPENSEARCH_SSL_ASSERT_HOSTNAME", "false").lower() == "true"
     OPENSEARCH_VERSION: float = float(os.getenv("OPENSEARCH_VERSION", "2.11"))
 
     # --- Elasticsearch (레거시) ---

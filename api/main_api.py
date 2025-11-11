@@ -54,7 +54,8 @@ def create_app() -> FastAPI:
             hosts=[{'host': config.OPENSEARCH_HOST, 'port': config.OPENSEARCH_PORT}],
             http_auth=(config.OPENSEARCH_USER, config.OPENSEARCH_PASSWORD),
             use_ssl=config.OPENSEARCH_USE_SSL,
-            verify_certs=False,
+            verify_certs=config.OPENSEARCH_VERIFY_CERTS,
+            ssl_assert_hostname=config.OPENSEARCH_SSL_ASSERT_HOSTNAME,
             ssl_show_warn=False,
             request_timeout=60  # ⭐ 타임아웃 증가: 배치 조회 대응 (30초 → 60초)
         )
