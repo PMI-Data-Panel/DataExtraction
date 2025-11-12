@@ -2,7 +2,10 @@
 import asyncio
 import logging
 from typing import List, Dict, Any, Optional
-from opensearchpy import OpenSearch, AsyncOpenSearch
+from opensearchpy import OpenSearch
+from opensearchpy._async.client import AsyncOpenSearch
+
+#from opensearchpy import OpenSearch, AsyncOpenSearch
 
 logger = logging.getLogger(__name__)
 

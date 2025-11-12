@@ -4,7 +4,11 @@ import logging
 import torch
 from typing import Optional
 from fastapi import FastAPI
-from opensearchpy import OpenSearch, AsyncOpenSearch
+#from opensearchpy import OpenSearch, AsyncOpenSearch
+# from opensearchpy import OpenSearch, AsyncOpenSearch
+from opensearchpy import OpenSearch
+from opensearchpy._async.client import AsyncOpenSearch
+
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 

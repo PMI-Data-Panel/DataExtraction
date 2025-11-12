@@ -444,9 +444,9 @@ async def search_query(
            
 
             data_fetcher = DataFetcher(
-                opensearch_client=os_client,
+                opensearch_client=os_client, # 동기적 
                 qdrant_client=getattr(router, 'qdrant_client', None),
-                async_opensearch_client=getattr(router, 'async_os_client', None)
+                async_opensearch_client=getattr(router, 'async_os_client', None) # 비동기
             )
             # ⭐ 필터가 있는 경우, 교집합을 위해 더 많은 결과를 가져와야 함
             has_filters = bool(os_query.get('query', {}).get('bool', {}).get('must'))
