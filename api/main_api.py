@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from opensearchpy import OpenSearch, AsyncOpenSearch
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
+import redis
 
 # 설정
 from rag_query_analyzer.config import get_config, Config
@@ -72,6 +73,17 @@ def create_app() -> FastAPI:
         qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=30)
         logger.info(f"[OK] Qdrant 클라이언트 초기화 완료: {qdrant_host}:{qdrant_port}")
 
+        # Redis 클라이언트 (검색 결과 캐시)
+        redis_client = None
+        if config.REDIS_URL:
+            try:
+                redis_client = redis.Redis.from_url(config.REDIS_URL, decode_responses=True)
+                redis_client.ping()
+                logger.info(f"[OK] Redis 연결 성공: {config.REDIS_URL}")
+            except Exception as e:
+                redis_client = None
+                logger.warning(f"⚠️ Redis 연결 실패 ({config.REDIS_URL}): {e}")
+
         # 임베딩 모델 로딩 (KURE-v1)
         logger.info(f"임베딩 모델 로딩 중: {config.EMBEDDING_MODEL}")
         embedding_model = SentenceTransformer(
@@ -90,6 +102,10 @@ def create_app() -> FastAPI:
         search_router.embedding_model = embedding_model
         search_router.embedding_model_factory = lambda: embedding_model
         search_router.config = config
+        search_router.redis_client = redis_client
+        search_router.cache_ttl_seconds = config.SEARCH_CACHE_TTL_SECONDS
+        search_router.cache_max_results = config.SEARCH_CACHE_MAX_RESULTS
+        search_router.cache_prefix = "search:results"
 
         # 시작 이벤트 등록
         @app.on_event("startup")

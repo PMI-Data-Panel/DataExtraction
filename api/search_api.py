@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import hashlib
 from collections import defaultdict, OrderedDict
 from time import perf_counter
 from typing import List, Dict, Any, Optional, Set, Tuple
@@ -86,6 +87,240 @@ def calculate_rrf_score_adaptive(
         k=k,
     )
     return combined, k, reason
+
+
+def _sort_dict_recursive(obj: Any) -> Any:
+    """딕셔너리/리스트를 재귀적으로 정렬"""
+    if isinstance(obj, dict):
+        return {key: _sort_dict_recursive(obj[key]) for key in sorted(obj)}
+    if isinstance(obj, list):
+        normalized_items = [_sort_dict_recursive(item) for item in obj]
+        try:
+            return sorted(
+                normalized_items,
+                key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
+            )
+        except TypeError:
+            return normalized_items
+    return obj
+
+
+def _normalize_filters_for_cache(filters: List[Dict[str, Any]]) -> str:
+    """필터 목록을 안정적인 문자열로 변환"""
+    if not filters:
+        return ""
+
+    normalized_strings = []
+    for filter_item in filters:
+        normalized = _sort_dict_recursive(filter_item)
+        normalized_strings.append(json.dumps(normalized, ensure_ascii=False, sort_keys=True))
+
+    normalized_strings.sort()
+    return "|".join(normalized_strings)
+
+
+def _make_cache_key(
+    *,
+    prefix: str,
+    query: str,
+    index_name: str,
+    page_size: int,
+    use_vector: bool,
+    must_terms: List[str],
+    should_terms: List[str],
+    must_not_terms: List[str],
+    filters_signature: Optional[str] = None,
+) -> str:
+    """생성된 검색 결과를 재사용하기 위한 캐시 키 생성 (안정화)"""
+    stable_must = sorted(must_terms) if must_terms else []
+    stable_should = sorted(should_terms) if should_terms else []
+    stable_must_not = sorted(must_not_terms) if must_not_terms else []
+
+    payload = {
+        "query": query.strip().lower(),
+        "index": index_name,
+        "page_size": page_size,
+        "use_vector": use_vector,
+        "must_terms": stable_must,
+        "should_terms": stable_should,
+        "must_not_terms": stable_must_not,
+        "filters_signature": filters_signature or "",
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    key = f"{prefix}:{digest}"
+
+    logger.debug(f"🔑 Cache key generated: {key}")
+    logger.debug(f"   - must_terms: {stable_must}")
+    logger.debug(f"   - should_terms: {stable_should}")
+    logger.debug(f"   - filters_signature: {(filters_signature or '')[:100]}...")
+
+    return key
+
+
+def _serialize_result(result: "SearchResult") -> Dict[str, Any]:
+    """SearchResult를 JSON 직렬화 가능한 dict로 변환"""
+    return result.model_dump()
+
+
+def _deserialize_result(payload: Dict[str, Any]) -> "SearchResult":
+    """dict를 SearchResult 객체로 역직렬화"""
+    return SearchResult(**payload)
+
+
+def _slice_results(
+    serialized_items: List[Dict[str, Any]],
+    page: int,
+    page_size: int,
+) -> Tuple[List["SearchResult"], bool]:
+    """페이지 정보를 기준으로 결과를 슬라이싱"""
+    if page <= 0:
+        page = 1
+    start = (page - 1) * page_size
+    end = start + page_size
+
+    if start >= len(serialized_items):
+        return [], False
+
+    page_items = serialized_items[start:end]
+    results = [_deserialize_result(item) for item in page_items]
+    has_more = end < len(serialized_items)
+    return results, has_more
+
+
+def _build_cached_response(
+    *,
+    payload: Dict[str, Any],
+    request: "SearchRequest",
+    analysis,
+    filters_for_response: List[Dict[str, Any]],
+    overall_start: float,
+    extracted_entities_dict: Optional[Dict[str, Any]] = None,
+) -> "SearchResponse":
+    """Redis 캐시에서 불러온 결과로 SearchResponse 구성"""
+    total_hits = payload.get("total_hits", 0)
+    max_score = payload.get("max_score", 0.0)
+    serialized_items = payload.get("items", [])
+
+    page_results, has_more_local = _slice_results(serialized_items, request.page, request.size)
+    has_more = has_more_local and ((request.page * request.size) < total_hits)
+    total_duration_ms = (perf_counter() - overall_start) * 1000
+
+    timings = {
+        "cache_hit": 1.0,
+        "total_ms": total_duration_ms,
+    }
+
+    query_analysis = {
+        "intent": analysis.intent,
+        "must_terms": analysis.must_terms,
+        "should_terms": analysis.should_terms,
+        "alpha": analysis.alpha,
+        "confidence": analysis.confidence,
+        "filters": filters_for_response,
+        "size": request.size,
+        "timings_ms": timings,
+    }
+    if extracted_entities_dict is not None:
+        query_analysis["extracted_entities"] = extracted_entities_dict
+
+    return SearchResponse(
+        query=request.query,
+        total_hits=total_hits,
+        max_score=max_score,
+        results=page_results,
+        query_analysis=query_analysis,
+        took_ms=int(total_duration_ms),
+        page=request.page,
+        page_size=request.size,
+        has_more=has_more,
+    )
+
+
+def build_occupation_dsl_filter(occupation_entities: List["DemographicEntity"]) -> Dict[str, Any]:
+    """직업 DemographicEntity 리스트를 OpenSearch DSL 필터로 변환"""
+    if not occupation_entities:
+        return {"match_all": {}}
+
+    occupation_values: Set[str] = set()
+    for demo in occupation_entities:
+        for candidate in (
+            getattr(demo, "raw_value", None),
+            getattr(demo, "value", None),
+        ):
+            if candidate:
+                occupation_values.add(str(candidate))
+        synonyms = getattr(demo, "synonyms", None)
+        if synonyms:
+            for syn in synonyms:
+                if syn:
+                    occupation_values.add(str(syn))
+
+    occupation_values = {value.strip() for value in occupation_values if value and value.strip()}
+    if not occupation_values:
+        return {"match_all": {}}
+
+    values_list = sorted(occupation_values)
+
+    question_should = [
+        {"match_phrase": {"qa_pairs.q_text": "직업"}},
+        {"match_phrase": {"qa_pairs.q_text": "직무"}},
+        {"match_phrase": {"qa_pairs.q_text": "occupation"}},
+    ]
+
+    answer_should = [
+        {"terms": {"qa_pairs.answer.keyword": values_list}},
+        {"terms": {"qa_pairs.answer_text.keyword": values_list}},
+    ]
+    for value in values_list:
+        answer_should.append({"match": {"qa_pairs.answer": value}})
+        answer_should.append({"match": {"qa_pairs.answer_text": value}})
+
+    nested_filter = {
+        "nested": {
+            "path": "qa_pairs",
+            "query": {
+                "bool": {
+                    "must": [
+                        {
+                            "bool": {
+                                "should": question_should,
+                                "minimum_should_match": 1,
+                            }
+                        },
+                        {
+                            "bool": {
+                                "should": answer_should,
+                                "minimum_should_match": 1,
+                            }
+                        },
+                    ]
+                }
+            }
+        }
+    }
+
+    metadata_terms = {
+        "terms": {
+            "metadata.occupation.keyword": values_list,
+        }
+    }
+    metadata_job_terms = {
+        "terms": {
+            "metadata.job.keyword": values_list,
+        }
+    }
+
+    return {
+        "bool": {
+            "should": [
+                metadata_terms,
+                metadata_job_terms,
+                nested_filter,
+            ],
+            "minimum_should_match": 1,
+        }
+    }
 
 
 def get_adaptive_score_threshold(
@@ -310,6 +545,7 @@ class SearchRequest(BaseModel):
     )
     size: int = Field(default=10, ge=1, le=100, description="반환할 결과 개수")
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
+    page: int = Field(default=1, ge=1, description="요청할 페이지 번호 (1부터 시작)")
 
 
 class SearchResult(BaseModel):
@@ -331,6 +567,9 @@ class SearchResponse(BaseModel):
     results: List[SearchResult]
     query_analysis: Optional[Dict[str, Any]] = None
     took_ms: int
+    page: int = Field(default=1, description="현재 페이지 번호")
+    page_size: int = Field(default=10, description="페이지 당 결과 수")
+    has_more: bool = Field(default=False, description="추가 페이지 존재 여부")
 
 
 
@@ -401,6 +640,53 @@ async def search_query(
         timings: Dict[str, float] = {}
         overall_start = perf_counter()
 
+        # 페이지 및 캐시 설정
+        page_size = max(1, request.size)
+        page = max(1, request.page)
+        requested_window = page_size * page
+        cache_client = getattr(router, "redis_client", None)
+        cache_ttl = getattr(router, "cache_ttl_seconds", 0)
+        cache_limit = getattr(router, "cache_max_results", requested_window)
+        cache_prefix = getattr(router, "cache_prefix", "search:results")
+        cache_enabled = bool(cache_client) and cache_ttl > 0
+        window_size = max(page_size, requested_window)
+        if cache_limit > 0:
+            window_size = min(window_size, cache_limit)
+        filters_for_response: List[Dict[str, Any]] = []
+        filters_signature = _normalize_filters_for_cache(filters_for_response)
+        cache_key = None
+        cache_hit = False
+
+        if cache_enabled:
+            try:
+                cache_key = _make_cache_key(
+                    prefix=cache_prefix,
+                    query=request.query,
+                    index_name=request.index_name,
+                    page_size=page_size,
+                    use_vector=request.use_vector_search,
+                    must_terms=analysis.must_terms or [],
+                    should_terms=analysis.should_terms or [],
+                    must_not_terms=getattr(analysis, "must_not_terms", []) or [],
+                    filters_signature=filters_signature,
+                )
+                cached_raw = cache_client.get(cache_key)
+                if cached_raw:
+                    cache_payload = json.loads(cached_raw)
+                    cache_hit = True
+                    logger.info(f"🔁 Redis 검색 캐시 히트: key={cache_key}")
+                    return _build_cached_response(
+                        payload=cache_payload,
+                        request=request,
+                        analysis=analysis,
+                        filters_for_response=filters_for_response,
+                        overall_start=overall_start,
+                    )
+            except Exception as cache_exc:
+                logger.warning(f"⚠️ Redis 검색 캐시 조회 실패: {cache_exc}")
+                cache_key = None
+                cache_enabled = False
+
         # 2단계: 쿼리 빌드
         logger.info("\n[2/3] 검색 쿼리 생성 중...")
         query_builder = OpenSearchHybridQueryBuilder(config)
@@ -415,7 +701,7 @@ async def search_query(
         os_query = query_builder.build_query(
             analysis=query_analysis,
             query_vector=query_vector,
-            size=request.size
+            size=window_size
         )
 
         # 3단계: 검색 실행
@@ -457,13 +743,13 @@ async def search_query(
             # Qdrant top-N 제한: 필터 유무에 따라 분기
             if has_filters:
                 # 필터 있음: 후보 수를 줄여 후처리 부담 완화
-                qdrant_limit = min(300, max(150, request.size * 5))
-                search_size = max(500, min(request.size * 15, 3000))
+                qdrant_limit = min(300, max(150, window_size * 5 // max(page, 1)))
+                search_size = max(500, min(window_size * 15, 3000))
                 logger.info(f"🔍 필터 적용: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (size*5 전략)")
             else:
                 # 필터 없음: 소량만 읽기
-                qdrant_limit = min(150, max(60, request.size * 2))
-                search_size = max(request.size * 2, 200)
+                qdrant_limit = min(150, max(60, window_size * 2 // max(page, 1)))
+                search_size = max(window_size * 2, 200)
                 logger.info(f"🔍 필터 없음: OpenSearch size={search_size}, Qdrant limit={qdrant_limit}")
             
             # OpenSearch _source filtering: 필요한 필드만 조회
@@ -575,7 +861,7 @@ async def search_query(
                         )
 
             # 상위 N개만 선택
-            final_hits = combined_results[:request.size]
+            final_hits = combined_results[:window_size]
             logger.info(f"      → RRF 결합 완료: {len(final_hits)}건")
 
             # 최종 상세 정보 (_mget) 조회
@@ -693,7 +979,7 @@ async def search_query(
             search_response = data_fetcher.search_opensearch(
                 index_name=request.index_name,
                 query=os_query,
-                size=request.size
+                size=window_size
             )
 
             # 결과 포매팅
@@ -737,22 +1023,60 @@ async def search_query(
             max_score = search_response['hits']['max_score']
             took_ms = search_response['took']
 
-        logger.info(f"\n[OK] 검색 완료: {len(results)}건 반환")
+        total_duration_ms = (perf_counter() - overall_start) * 1000
+        timings = {
+            "opensearch_ms": took_ms,
+            "total_ms": total_duration_ms,
+            "cache_hit": 1.0 if cache_hit else 0.0,
+        }
+
+        serialized_results = [_serialize_result(res) for res in results]
+        stored_items = serialized_results
+        if cache_enabled and cache_limit > 0:
+            stored_items = serialized_results[:cache_limit]
+        page_results, has_more_local = _slice_results(stored_items, page, page_size)
+        has_more = has_more_local and ((page * page_size) < total_hits)
+
+        if cache_enabled and cache_key and stored_items:
+            cache_payload = {
+                "total_hits": total_hits,
+                "max_score": max_score,
+                "items": stored_items,
+                "filters": filters_for_response,
+                "extracted_entities": extracted_entities.to_dict(),
+            }
+            try:
+                cache_client.setex(
+                    cache_key,
+                    cache_ttl,
+                    json.dumps(cache_payload, ensure_ascii=False),
+                )
+                logger.info(f"💾 Redis 검색 캐시 저장: key={cache_key}, ttl={cache_ttl}s")
+            except Exception as cache_exc:
+                logger.warning(f"⚠️ Redis 검색 캐시 저장 실패: {cache_exc}")
+
+        logger.info(f"\n[OK] 검색 완료: {len(page_results)}건 반환 (page={page}, size={page_size})")
         logger.info(f"{'='*60}\n")
 
         return SearchResponse(
             query=request.query,
             total_hits=total_hits,
             max_score=max_score,
-            results=results,
+            results=page_results,
             query_analysis={
                 "intent": query_analysis.intent,
                 "must_terms": query_analysis.must_terms,
                 "should_terms": query_analysis.should_terms,
                 "alpha": query_analysis.alpha,
-                "confidence": query_analysis.confidence
+                "confidence": query_analysis.confidence,
+                "filters": filters_for_response,
+                "size": page_size,
+                "timings_ms": timings,
             },
-            took_ms=took_ms
+            took_ms=int(total_duration_ms),
+            page=page,
+            page_size=page_size,
+            has_more=has_more,
         )
 
     except HTTPException:
@@ -773,6 +1097,7 @@ class NLSearchRequest(BaseModel):
         description="검색할 인덱스 이름 (기본값: alias 'welcome_all'; 와일드카드 사용 가능)"
     )
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
+    page: int = Field(default=1, ge=1, description="요청할 페이지 번호 (1부터 시작)")
 
 
 @router.post("/nl", response_model=SearchResponse, summary="자연어 쿼리: 자동 추출+검색")
@@ -832,7 +1157,56 @@ async def search_natural_language(
             if filter_clause and filter_clause != {"match_all": {}}:
                 filters.append(filter_clause)
         filters_for_response = list(filters)
-        size = max(1, min(requested_size, 100))
+        filters_signature = _normalize_filters_for_cache(filters_for_response)
+
+        page_size = max(1, min(requested_size, 100))
+        page = max(1, request.page)
+        requested_window = page_size * page
+        cache_client = getattr(router, "redis_client", None)
+        cache_ttl = getattr(router, "cache_ttl_seconds", 0)
+        cache_limit = getattr(router, "cache_max_results", requested_window)
+        cache_prefix = getattr(router, "cache_prefix", "search:results")
+        cache_enabled = bool(cache_client) and cache_ttl > 0
+        window_size = max(page_size, requested_window)
+        if cache_limit > 0:
+            window_size = min(window_size, cache_limit)
+        size = window_size
+        cache_key = None
+        cache_hit = False
+
+        if cache_enabled:
+            try:
+                cache_key = _make_cache_key(
+                    prefix=cache_prefix,
+                    query=request.query,
+                    index_name=request.index_name,
+                    page_size=page_size,
+                    use_vector=request.use_vector_search,
+                    must_terms=analysis.must_terms or [],
+                    should_terms=analysis.should_terms or [],
+                    must_not_terms=getattr(analysis, "must_not_terms", []) or [],
+                    filters_signature=filters_signature,
+                )
+                cached_raw = cache_client.get(cache_key)
+                if cached_raw:
+                    cache_payload = json.loads(cached_raw)
+                    cache_hit = True
+                    logger.info(f"🔁 Redis 검색 캐시 히트: key={cache_key}")
+                    extracted_entities_dict = cache_payload.get("extracted_entities")
+                    if extracted_entities_dict is None:
+                        extracted_entities_dict = extracted_entities.to_dict()
+                    return _build_cached_response(
+                        payload=cache_payload,
+                        request=request,
+                        analysis=analysis,
+                        filters_for_response=filters_for_response,
+                        overall_start=overall_start,
+                        extracted_entities_dict=extracted_entities_dict,
+                    )
+            except Exception as cache_exc:
+                logger.warning(f"⚠️ Redis 검색 캐시 조회 실패: {cache_exc}")
+                cache_key = None
+                cache_enabled = False
         
         age_gender_filters = [f for f in filters if is_age_or_gender_filter(f)]
         occupation_filters = [f for f in filters if is_occupation_filter(f)]
@@ -841,6 +1215,7 @@ async def search_natural_language(
         filters_os = age_gender_filters + other_filters
         filters = filters_os  # 유지보수: 기존 로직과 호환성을 위해
         has_demographic_filters = bool(filters_for_response)
+        occupation_filter_handled = False
 
         logger.info("🔍 필터 상태 체크:")
         logger.info(f"  - age_gender_filters: {len(age_gender_filters)}개")
@@ -1218,14 +1593,12 @@ async def search_natural_language(
             final_query['size'] = size
 
         if filters_os:
-            import json
             logger.info(f"🔍 적용된 필터 ({len(filters_os)}개):")
             for i, f in enumerate(filters_os, 1):
                 logger.info(f"  필터 {i}: {json.dumps(f, ensure_ascii=False, indent=2)}")
             logger.info(f"🔍 최종 쿼리 구조:")
             logger.info(f"  {json.dumps(final_query, ensure_ascii=False, indent=2)}")
         else:
-            import json
             logger.info(f"🔍 최종 쿼리 구조 (필터 없음):")
             logger.info(f"  {json.dumps(final_query, ensure_ascii=False, indent=2)}")
 
@@ -1300,6 +1673,10 @@ async def search_natural_language(
 
             age_gender_filters_split = [f for f in filters if is_age_or_gender_filter(f)]
             occupation_filters_split = [f for f in filters if is_occupation_filter(f)]
+            occupation_entities = [
+                demo for demo in extracted_entities.demographics
+                if demo.demographic_type == DemographicType.OCCUPATION
+            ]
 
             logger.info(f"  - 연령/성별 필터: {len(age_gender_filters_split)}개")
             logger.info(f"  - 직업 필터: {len(occupation_filters_split)}개")
@@ -1314,19 +1691,27 @@ async def search_natural_language(
             else:
                 logger.info(f"  ⚠️ welcome_1st: 필터 없음, match_all 사용")
 
-            if occupation_filters_split:
+            occupation_dsl_filter = build_occupation_dsl_filter(occupation_entities)
+            if occupation_dsl_filter and occupation_dsl_filter != {"match_all": {}}:
+                welcome_2nd_query['query'] = {
+                    'bool': {
+                        'must': [occupation_dsl_filter]
+                    }
+                }
+                occupation_filter_handled = True
+                logger.info(f"  ✅ welcome_2nd: 직업 필터 DSL 적용 ({len(occupation_entities)}개)")
+            elif occupation_filters_split:
                 welcome_2nd_query['query'] = {
                     'bool': {
                         'must': occupation_filters_split
                     }
                 }
-                logger.info(f"  ✅ welcome_2nd: 직업 필터 {len(occupation_filters_split)}개 적용")
+                logger.info(f"  ⚠️ welcome_2nd: DSL 생성 실패 → 기존 필터 {len(occupation_filters_split)}개 적용")
             else:
                 logger.info(f"  ⚠️ welcome_2nd: 필터 없음, match_all 사용")
         else:
             logger.info(f"  ⚠️ 필터 없음: 모든 인덱스에서 match_all 사용")
 
-        import json
         logger.info(f"📋 최종 쿼리 확인:")
         logger.info(f"  welcome_1st: {json.dumps(welcome_1st_query, ensure_ascii=False)[:200]}...")
         logger.info(f"  welcome_2nd: {json.dumps(welcome_2nd_query, ensure_ascii=False)[:200]}...")
@@ -1363,7 +1748,8 @@ async def search_natural_language(
                             welcome_1st_vector_results.append({
                                 '_id': str(item.id),
                                 '_score': item.score,
-                                '_source': item.payload
+                                '_source': item.payload,
+                                '_index': 's_welcome_1st',
                             })
                         logger.info(f"  ✅ Qdrant: {len(welcome_1st_vector_results)}건")
                     except Exception as e:
@@ -1401,7 +1787,8 @@ async def search_natural_language(
                             welcome_2nd_vector_results.append({
                                 '_id': str(item.id),
                                 '_score': item.score,
-                                '_source': item.payload
+                                '_source': item.payload,
+                                '_index': 's_welcome_2nd',
                             })
                         logger.info(f"  ✅ Qdrant: {len(welcome_2nd_vector_results)}건")
                     except Exception as e:
@@ -1462,7 +1849,8 @@ async def search_natural_language(
                                             other_vector_results.append({
                                                 '_id': str(item.id),
                                                 '_score': item.score,
-                                                '_source': item.payload
+                                                '_source': item.payload,
+                                                '_index': col.name,
                                             })
                                     except Exception:
                                         continue
@@ -1471,47 +1859,6 @@ async def search_natural_language(
                             logger.debug(f"  ⚠️ Qdrant 검색 실패: {e}")
                 except Exception as e:
                     logger.warning(f"  ⚠️ 기타 인덱스 검색 실패: {e}")
-        
-        # ⭐ STEP 2: 각 인덱스별 RRF 결합
-        logger.info(f"\n{'='*60}")
-        logger.info(f"📊 STEP 2: 각 인덱스별 RRF 결합")
-        logger.info(f"{'='*60}")
-        
-        # welcome_1st RRF 결합
-        welcome_1st_rrf = []
-        if welcome_1st_keyword_results or welcome_1st_vector_results:
-            logger.info(f"🔄 [1/3] welcome_1st RRF 결합 중...")
-            logger.info(f"  - 키워드: {len(welcome_1st_keyword_results)}건, 벡터: {len(welcome_1st_vector_results)}건")
-            if welcome_1st_vector_results:
-                welcome_1st_rrf = calculate_rrf_score(welcome_1st_keyword_results, welcome_1st_vector_results, k=60)
-                logger.info(f"  ✅ welcome_1st RRF 완료: {len(welcome_1st_rrf)}건")
-            else:
-                welcome_1st_rrf = welcome_1st_keyword_results
-                logger.info(f"  ✅ welcome_1st 키워드만 사용: {len(welcome_1st_rrf)}건")
-        
-        # welcome_2nd RRF 결합
-        welcome_2nd_rrf = []
-        if welcome_2nd_keyword_results or welcome_2nd_vector_results:
-            logger.info(f"🔄 [2/3] welcome_2nd RRF 결합 중...")
-            logger.info(f"  - 키워드: {len(welcome_2nd_keyword_results)}건, 벡터: {len(welcome_2nd_vector_results)}건")
-            if welcome_2nd_vector_results:
-                welcome_2nd_rrf = calculate_rrf_score(welcome_2nd_keyword_results, welcome_2nd_vector_results, k=60)
-                logger.info(f"  ✅ welcome_2nd RRF 완료: {len(welcome_2nd_rrf)}건")
-            else:
-                welcome_2nd_rrf = welcome_2nd_keyword_results
-                logger.info(f"  ✅ welcome_2nd 키워드만 사용: {len(welcome_2nd_rrf)}건")
-        
-        # 기타 인덱스 RRF 결합
-        other_rrf = []
-        if other_keyword_results or other_vector_results:
-            logger.info(f"🔄 [3/3] 기타 인덱스 RRF 결합 중...")
-            logger.info(f"  - 키워드: {len(other_keyword_results)}건, 벡터: {len(other_vector_results)}건")
-            if other_vector_results:
-                other_rrf = calculate_rrf_score(other_keyword_results, other_vector_results, k=60)
-                logger.info(f"  ✅ 기타 인덱스 RRF 완료: {len(other_rrf)}건")
-            else:
-                other_rrf = other_keyword_results
-                logger.info(f"  ✅ 기타 인덱스 키워드만 사용: {len(other_rrf)}건")
         
         # user_id 및 _id -> 원본 문서 매핑 생성 (모든 인덱스 결과에서)
         user_doc_map = {}
@@ -1571,95 +1918,91 @@ async def search_natural_language(
             if doc_id:
                 id_doc_map[doc_id] = doc_info
 
-        # ⭐ STEP 3: 인덱스 간 RRF 재결합
-        # welcome_1st, welcome_2nd, 기타 인덱스의 RRF 결과를 user_id 기준으로 RRF 재결합
+        # ⭐ 통합 RRF 결합: 한 번만 실행
         logger.info(f"\n{'='*60}")
-        logger.info(f"📊 STEP 3: 인덱스 간 RRF 재결합")
+        logger.info("📊 RRF 결합: 단일 패스 실행")
         logger.info(f"{'='*60}")
-        logger.info(f"  - welcome_1st RRF: {len(welcome_1st_rrf)}건")
-        logger.info(f"  - welcome_2nd RRF: {len(welcome_2nd_rrf)}건")
-        logger.info(f"  - 기타 인덱스 RRF: {len(other_rrf)}건")
+
+        # 벡터 결과에 인덱스 메타데이터 보강
+        for doc in welcome_1st_vector_results:
+            doc.setdefault('_index', 's_welcome_1st')
+        for doc in welcome_2nd_vector_results:
+            doc.setdefault('_index', 's_welcome_2nd')
+        for doc in other_vector_results:
+            if '_index' not in doc:
+                doc['_index'] = doc.get('collection', doc.get('_source', {}).get('index', 'unknown'))
+
+        all_keyword_results: List[Dict[str, Any]] = []
+        all_vector_results: List[Dict[str, Any]] = []
+
+        if welcome_1st_keyword_results:
+            all_keyword_results.extend(welcome_1st_keyword_results)
+        if welcome_2nd_keyword_results:
+            all_keyword_results.extend(welcome_2nd_keyword_results)
+        if other_keyword_results:
+            all_keyword_results.extend(other_keyword_results)
+
+        if welcome_1st_vector_results:
+            all_vector_results.extend(welcome_1st_vector_results)
+        if welcome_2nd_vector_results:
+            all_vector_results.extend(welcome_2nd_vector_results)
+        if other_vector_results:
+            all_vector_results.extend(other_vector_results)
+
+        logger.info(f"  - 총 키워드 결과: {len(all_keyword_results)}건")
+        logger.info(f"  - 총 벡터   결과: {len(all_vector_results)}건")
 
         rrf_start = perf_counter()
 
-        # user_id 기준으로 그룹화하여 RRF 재결합
-        user_rrf_map = {}  # user_id -> [doc1, doc2, ...]
-        
-        # welcome_1st RRF 결과 그룹화
-        for doc in welcome_1st_rrf:
-            source = doc.get('_source', {})
-            if not source and 'doc' in doc:
-                source = doc.get('doc', {}).get('_source', {})
-            user_id = source.get('user_id') if isinstance(source, dict) else None
-            if not user_id:
-                user_id = doc.get('_id', '')
-            
-            if user_id:
-                if user_id not in user_rrf_map:
-                    user_rrf_map[user_id] = []
-                # 인덱스 정보 추가
-                doc['_index'] = 's_welcome_1st'
-                user_rrf_map[user_id].append(doc)
-        
-        # welcome_2nd RRF 결과 그룹화
-        for doc in welcome_2nd_rrf:
-            source = doc.get('_source', {})
-            if not source and 'doc' in doc:
-                source = doc.get('doc', {}).get('_source', {})
-            user_id = source.get('user_id') if isinstance(source, dict) else None
-            if not user_id:
-                user_id = doc.get('_id', '')
-            
-            if user_id:
-                if user_id not in user_rrf_map:
-                    user_rrf_map[user_id] = []
-                # 인덱스 정보 추가
-                doc['_index'] = 's_welcome_2nd'
-                user_rrf_map[user_id].append(doc)
-        
-        # 기타 인덱스 RRF 결과 그룹화
-        for doc in other_rrf:
-            source = doc.get('_source', {})
-            if not source and 'doc' in doc:
-                source = doc.get('doc', {}).get('_source', {})
-            user_id = source.get('user_id') if isinstance(source, dict) else None
-            if not user_id:
-                user_id = doc.get('_id', '')
-            
-            if user_id:
-                if user_id not in user_rrf_map:
-                    user_rrf_map[user_id] = []
-                # 인덱스 정보 유지 또는 추가
-                if '_index' not in doc:
-                    doc['_index'] = source.get('index', 'unknown') if isinstance(source, dict) else 'unknown'
-                user_rrf_map[user_id].append(doc)
-        
-        # user_id별로 RRF 재결합
-        # 같은 user_id의 여러 문서가 있으면, 각각을 독립적인 결과로 간주하고 RRF 점수를 합산
-        final_rrf_results = []
-        for user_id, user_docs in user_rrf_map.items():
-            if len(user_docs) == 1:
-                # 단일 문서: 그대로 사용
-                final_rrf_results.append(user_docs[0])
+        if request.use_vector_search and all_vector_results:
+            combined_rrf, rrf_k_used, rrf_reason = calculate_rrf_score_adaptive(
+                keyword_results=all_keyword_results,
+                vector_results=all_vector_results,
+                query_intent=getattr(analysis, "intent", None),
+                has_filters=has_filters,
+                use_vector_search=request.use_vector_search,
+            )
+        else:
+            combined_rrf = all_keyword_results
+            if request.use_vector_search:
+                rrf_reason = "벡터 결과 없음 → 키워드 결과 사용"
             else:
-                # 여러 문서: RRF 점수를 합산하여 대표 문서 선택
-                # 각 문서의 RRF 점수를 합산
-                total_rrf_score = sum(
-                    doc.get('_score', 0.0) or doc.get('rrf_score', 0.0)
-                    for doc in user_docs
-                )
-                # 가장 높은 점수의 문서를 대표로 선택
-                best_doc = max(user_docs, key=lambda d: d.get('_score', 0.0) or d.get('rrf_score', 0.0))
-                # 합산된 RRF 점수로 업데이트
-                best_doc['_score'] = total_rrf_score
-                best_doc['_rrf_details'] = {
-                    'combined_score': total_rrf_score,
-                    'source_count': len(user_docs),
-                    'sources': [d.get('_index', 'unknown') for d in user_docs]
-                }
-                final_rrf_results.append(best_doc)
+                rrf_reason = "벡터 검색 비활성화 → 키워드 결과 사용"
+            rrf_k_used = 0
+
+        user_rrf_variants: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for doc in combined_rrf:
+            user_id = get_user_id_from_doc(doc)
+            if not user_id:
+                continue
+            user_rrf_variants[user_id].append(doc)
         
-        # RRF 점수 기준으로 정렬
+        user_rrf_map: Dict[str, List[Dict[str, Any]]] = {}
+        final_rrf_results: List[Dict[str, Any]] = []
+        for user_id, docs in user_rrf_variants.items():
+            def _score(doc: Dict[str, Any]) -> float:
+                score = doc.get('_score')
+                if score is None:
+                    score = doc.get('rrf_score', 0.0)
+                return float(score or 0.0)
+
+            best_doc_original = max(docs, key=_score)
+            total_rrf_score = sum(_score(doc) for doc in docs)
+            sources = [doc.get('_index', 'unknown') for doc in docs]
+
+            best_doc = dict(best_doc_original)
+            best_doc['_score'] = total_rrf_score
+            best_doc['_rrf_details'] = {
+                'combined_score': total_rrf_score,
+                'source_count': len(docs),
+                'sources': sources,
+            }
+
+            final_rrf_results.append(best_doc)
+            # best_doc를 첫 번째로 유지하고, 나머지는 참고용으로 보관
+            others = [doc for doc in docs if doc is not best_doc_original]
+            user_rrf_map[user_id] = [best_doc] + others
+        
         final_rrf_results.sort(
             key=lambda d: d.get('_score', 0.0) or d.get('rrf_score', 0.0),
             reverse=True
@@ -1668,18 +2011,19 @@ async def search_natural_language(
         rrf_results = final_rrf_results
         took_ms = 0  # 여러 검색의 합이므로 정확한 시간 측정은 어려움
         
-        logger.info(f"  ✅ 인덱스 간 RRF 재결합 완료: {len(rrf_results)}건 (고유 user_id: {len(user_rrf_map)}개)")
+        logger.info(f"  ✅ 단일 RRF 결합 완료: {len(rrf_results)}건 (고유 user_id: {len(user_rrf_map)}개)")
         timings['rrf_recombination_ms'] = (perf_counter() - rrf_start) * 1000
 
         # 후보 문서 수 제한 (후처리 부담 완화)
-        candidate_cap = max(size * 5, 300)
+        fetch_size = window_size
+        candidate_cap = max(fetch_size * 5, 300)
         if len(rrf_results) > candidate_cap:
             logger.info(
-                f"  - 후보 문서 제한 적용: {len(rrf_results)} → {candidate_cap} (size={size})"
+                f"  - 후보 문서 제한 적용: {len(rrf_results)} → {candidate_cap} (size={fetch_size})"
             )
             rrf_results = rrf_results[:candidate_cap]
-        if len(rrf_results) < size:
-            backup_cap = max(size * 6, size + 50)
+        if len(rrf_results) < fetch_size:
+            backup_cap = max(fetch_size * 6, fetch_size + 50)
             logger.info(
                 f"  - 후보 수가 size보다 작아 증가 시도: {len(rrf_results)} → {min(len(final_rrf_results), backup_cap)}"
             )
@@ -1702,11 +2046,126 @@ async def search_natural_language(
         filtered_rrf_results: List[Dict[str, Any]] = rrf_results
 
         occupation_display_map: Dict[str, str] = {}
+        doc_user_map: Dict[int, str] = {}
+        welcome_1st_batch: Dict[str, Dict[str, Any]] = {}
+        welcome_2nd_batch: Dict[str, Dict[str, Any]] = {}
+        synonym_cache: Dict[str, List[str]] = {}
+
+        PLACEHOLDER_TOKENS: Set[str] = {
+            "",
+            "미정",
+            "없음",
+            "무응답",
+            "해당없음",
+            "n/a",
+            "na",
+            "null",
+            "none",
+            "unknown",
+            "미선택",
+            "미기재",
+        }
+        PLACEHOLDER_TOKENS = {token.strip().lower() for token in PLACEHOLDER_TOKENS}
+
+        def normalize_value(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, bool):
+                value_str = str(value)
+            elif isinstance(value, (int, float)):
+                try:
+                    if value.is_integer():  # type: ignore[attr-defined]
+                        value = int(value)
+                except AttributeError:
+                    pass
+                value_str = str(value)
+            else:
+                value_str = str(value)
+
+            cleaned = value_str.strip()
+            lower = cleaned.lower()
+            if lower in PLACEHOLDER_TOKENS:
+                return ""
+            return lower
+
+        def build_expected_values(demo: "DemographicEntity") -> Set[str]:
+            key = f"{demo.demographic_type.value}:{demo.raw_value}"
+            expected: Set[str] = set()
+            expected.add(demo.raw_value)
+            expected.add(demo.value)
+            expected.update(demo.synonyms or set())
+            expected.update(synonym_cache.get(key, []))
+            normalized_expected = {normalize_value(v) for v in expected if v}
+
+            if demo.demographic_type == DemographicType.GENDER:
+                male_aliases = {
+                    normalize_value(v)
+                    for v in {"m", "male", "man", "남", "남성", "남자", "남성형"}
+                }
+                female_aliases = {
+                    normalize_value(v)
+                    for v in {"f", "female", "woman", "여", "여성", "여자", "여성형"}
+                }
+                if normalized_expected & male_aliases:
+                    normalized_expected.update(male_aliases)
+                if normalized_expected & female_aliases:
+                    normalized_expected.update(female_aliases)
+
+            return normalized_expected
+
+        def values_match(values: Set[str], expected: Set[str]) -> bool:
+            if not values or not expected:
+                return False
+            for val in values:
+                if not val:
+                    continue
+                for exp in expected:
+                    if not exp:
+                        continue
+                    if val == exp or val in exp or exp in val:
+                        return True
+            return False
+
+        def expand_gender_aliases(values: Set[str]) -> None:
+            male_aliases = {"m", "남", "남성", "male", "man", "남자"}
+            female_aliases = {"f", "여", "여성", "female", "woman", "여자"}
+            if values & male_aliases:
+                values.update(male_aliases)
+            if values & female_aliases:
+                values.update(female_aliases)
+
+        def add_age_decade(values: Set[str], age_value: Any) -> None:
+            if age_value in (None, ""):
+                return
+            try:
+                age_int = int(age_value)
+                decade = (age_int // 10) * 10
+                for candidate in (f"{decade}대", f"{decade}s", str(age_int)):
+                    normalized_candidate = normalize_value(candidate)
+                    if normalized_candidate:
+                        values.add(normalized_candidate)
+            except (ValueError, TypeError):
+                pass
 
         if has_demographic_filters:
             filter_start = perf_counter()
 
-            synonym_cache: Dict[str, List[str]] = {}
+            gender_dsl_handled = bool(demographic_filters.get(DemographicType.GENDER)) and search_welcome_1st
+            age_dsl_handled = bool(demographic_filters.get(DemographicType.AGE)) and search_welcome_1st
+            occupation_dsl_handled = bool(demographic_filters.get(DemographicType.OCCUPATION)) and occupation_filter_handled
+
+            filters_to_validate: List[DemographicType] = []
+            if demographic_filters.get(DemographicType.GENDER) and not gender_dsl_handled:
+                filters_to_validate.append(DemographicType.GENDER)
+            if demographic_filters.get(DemographicType.AGE) and not age_dsl_handled:
+                filters_to_validate.append(DemographicType.AGE)
+            if demographic_filters.get(DemographicType.OCCUPATION) and not occupation_dsl_handled:
+                filters_to_validate.append(DemographicType.OCCUPATION)
+
+            if not filters_to_validate and demographic_filters:
+                filters_to_validate = list(demographic_filters.keys())
+                logger.info("  ⚠️ DSL에서 필터를 적용했지만 안전성 확인을 위해 후처리 검증을 수행합니다.")
+
             for demo in extracted_entities.demographics:
                 cache_key = f"{demo.demographic_type.value}:{demo.raw_value}"
                 if demo.demographic_type in {DemographicType.GENDER, DemographicType.OCCUPATION}:
@@ -1721,22 +2180,17 @@ async def search_natural_language(
                 else:
                     synonym_cache[cache_key] = [demo.raw_value]
             
-            # 성능 최적화: 배치 조회를 위해 먼저 모든 user_id 수집
-            user_ids_to_fetch = set()
-            doc_user_map = {}  # doc -> user_id 매핑
-            welcome_1st_batch: Dict[str, Dict[str, Any]] = {}
-            welcome_2nd_batch: Dict[str, Dict[str, Any]] = {}
+            user_ids_to_fetch: Set[str] = set()
+            doc_user_map.clear()
+            welcome_1st_batch.clear()
+            welcome_2nd_batch.clear()
             
             logger.info(f"🔍 user_id 수집 중: RRF 결과 {len(rrf_results)}건...")
             for doc in rrf_results:
-                # source 추출 (여러 경로 시도)
                 source = doc.get('_source', {})
                 if not source and 'doc' in doc:
                     source = doc.get('doc', {}).get('_source', {})
-                
-                # Qdrant 결과인 경우 payload에서 추출
                 if not source or not isinstance(source, dict):
-                    # Qdrant 결과는 payload에 있을 수 있음
                     if 'payload' in doc:
                         payload = doc.get('payload', {})
                         if isinstance(payload, dict) and payload:
@@ -1745,38 +2199,26 @@ async def search_natural_language(
                         payload = source.get('payload', {})
                         if isinstance(payload, dict) and payload:
                             source = payload
-                
-                # user_id 추출 (여러 경로 시도)
                 user_id = None
                 if isinstance(source, dict):
                     user_id = source.get('user_id')
-                
                 if not user_id:
                     user_id = doc.get('_id', '')
-                
                 if not user_id and 'payload' in doc:
                     payload = doc.get('payload', {})
                     if isinstance(payload, dict):
                         user_id = payload.get('user_id')
-                
                 if user_id:
                     user_ids_to_fetch.add(user_id)
                     doc_user_map[id(doc)] = user_id
             
             logger.info(f"  ✅ 수집된 user_id: {len(user_ids_to_fetch)}건")
             
-            # ⭐ 디버깅: user_id 샘플 로깅 (처음 10개)
-            if user_ids_to_fetch:
-                sample_user_ids = list(user_ids_to_fetch)[:10]
-                logger.info(f"  📋 user_id 샘플 (처음 10개): {sample_user_ids}")
-            
-            # ⭐ 배치 조회: welcome_1st와 welcome_2nd를 작은 단위로 분할하여 조회 (타임아웃 방지)
             if user_ids_to_fetch:
                 user_ids_list = list(user_ids_to_fetch)
                 total_batches = (len(user_ids_list) + 199) // 200
                 logger.info(f"🔍 배치 조회: welcome_1st/welcome_2nd {len(user_ids_list)}건 조회 중...")
 
-                # 캐시된 문서 선반영
                 for uid in list(user_ids_list):
                     cached_1 = _cache_get_welcome_doc("s_welcome_1st", uid)
                     if cached_1:
@@ -1790,7 +2232,6 @@ async def search_natural_language(
 
                 try:
                     if data_fetcher.os_async_client:
-                        # 비동기 배치 조회
                         if uncached_1st:
                             raw_welcome_1st_docs = await data_fetcher.multi_get_documents_async(
                                 index_name="s_welcome_1st",
@@ -1799,8 +2240,8 @@ async def search_natural_language(
                             ) or []
                             fetched_map = data_fetcher.docs_to_user_map(raw_welcome_1st_docs)
                             welcome_1st_batch.update(fetched_map)
-                            for uid, doc in fetched_map.items():
-                                _cache_put_welcome_doc("s_welcome_1st", uid, doc)
+                            for uid, doc_item in fetched_map.items():
+                                _cache_put_welcome_doc("s_welcome_1st", uid, doc_item)
 
                         if uncached_2nd:
                             raw_welcome_2nd_docs = await data_fetcher.multi_get_documents_async(
@@ -1810,12 +2251,10 @@ async def search_natural_language(
                             ) or []
                             fetched_map = data_fetcher.docs_to_user_map(raw_welcome_2nd_docs)
                             welcome_2nd_batch.update(fetched_map)
-                            for uid, doc in fetched_map.items():
-                                _cache_put_welcome_doc("s_welcome_2nd", uid, doc)
+                            for uid, doc_item in fetched_map.items():
+                                _cache_put_welcome_doc("s_welcome_2nd", uid, doc_item)
                     else:
-                        # 기존 동기 방식 유지
                         if uncached_1st:
-                            found_count = 0
                             for batch_idx in range(0, len(uncached_1st), 200):
                                 batch_ids = uncached_1st[batch_idx:batch_idx + 200]
                                 batch_num = (batch_idx // 200) + 1
@@ -1825,16 +2264,13 @@ async def search_natural_language(
                                     for item in mget_response.get('docs', []):
                                         if item.get('found'):
                                             welcome_1st_batch[item['_id']] = item['_source']
-                                            found_count += 1
                                             _cache_put_welcome_doc("s_welcome_1st", item['_id'], item['_source'])
                                     logger.debug(f"  📦 welcome_1st 배치 {batch_num}/{total_batches}: {len([d for d in mget_response.get('docs', []) if d.get('found')])}/{len(batch_ids)}건")
                                 except Exception as e:
                                     logger.warning(f"  ⚠️ welcome_1st 배치 {batch_num}/{total_batches} 실패: {e}")
                                     continue
-                            logger.info(f"  ✅ welcome_1st 배치 조회: {found_count}/{len(uncached_1st)}건 성공")
 
                         if uncached_2nd:
-                            found_count = 0
                             for batch_idx in range(0, len(uncached_2nd), 200):
                                 batch_ids = uncached_2nd[batch_idx:batch_idx + 200]
                                 batch_num = (batch_idx // 200) + 1
@@ -1844,17 +2280,12 @@ async def search_natural_language(
                                     for item in mget_response.get('docs', []):
                                         if item.get('found'):
                                             welcome_2nd_batch[item['_id']] = item['_source']
-                                            found_count += 1
                                             _cache_put_welcome_doc("s_welcome_2nd", item['_id'], item['_source'])
                                     logger.debug(f"  📦 welcome_2nd 배치 {batch_num}/{total_batches}: {len([d for d in mget_response.get('docs', []) if d.get('found')])}/{len(batch_ids)}건")
                                 except Exception as e:
                                     logger.warning(f"  ⚠️ welcome_2nd 배치 {batch_num}/{total_batches} 실패: {e}")
                                     continue
-                            logger.info(f"  ✅ welcome_2nd 배치 조회: {found_count}/{len(uncached_2nd)}건 성공")
 
-                    logger.info(f"  ✅ 배치 조회 완료: welcome_1st={len(welcome_1st_batch)}건, welcome_2nd={len(welcome_2nd_batch)}건")
-
-                    # ⭐ 배치 조회에서 찾지 못한 user_id에 대해 개별 조회 시도 (fallback)
                     missing_1st = user_ids_to_fetch - set(welcome_1st_batch.keys())
                     missing_2nd = user_ids_to_fetch - set(welcome_2nd_batch.keys())
 
@@ -1876,10 +2307,10 @@ async def search_natural_language(
                                 request_timeout=60,
                                 ignore=[404]
                             )
-                            for doc in response.get('docs', []):
-                                if doc.get('found'):
-                                    welcome_1st_batch[doc['_id']] = doc['_source']
-                                    _cache_put_welcome_doc("s_welcome_1st", doc['_id'], doc['_source'])
+                            for doc_item in response.get('docs', []):
+                                if doc_item.get('found'):
+                                    welcome_1st_batch[doc_item['_id']] = doc_item['_source']
+                                    _cache_put_welcome_doc("s_welcome_1st", doc_item['_id'], doc_item['_source'])
                         logger.info(f"  ✅ welcome_1st 추가 조회 후 총 {len(welcome_1st_batch)}건")
 
                     if missing_2nd and len(missing_2nd) <= 1000:
@@ -1900,109 +2331,263 @@ async def search_natural_language(
                                 request_timeout=60,
                                 ignore=[404]
                             )
-                            for doc in response.get('docs', []):
-                                if doc.get('found'):
-                                    welcome_2nd_batch[doc['_id']] = doc['_source']
-                                    _cache_put_welcome_doc("s_welcome_2nd", doc['_id'], doc['_source'])
+                            for doc_item in response.get('docs', []):
+                                if doc_item.get('found'):
+                                    welcome_2nd_batch[doc_item['_id']] = doc_item['_source']
+                                    _cache_put_welcome_doc("s_welcome_2nd", doc_item['_id'], doc_item['_source'])
                         logger.info(f"  ✅ welcome_2nd 추가 조회 후 총 {len(welcome_2nd_batch)}건")
 
                 except Exception as e:
                     logger.warning(f"  ⚠️ 배치 조회 실패: {e}, 개별 조회로 fallback")
             
-            # ⭐ 디버깅: 필터링 전 RRF 결과 분석
-            logger.info(f"📊 필터링 전 RRF 결과 분석:")
-            logger.info(f"  - 총 RRF 결과: {len(rrf_results)}건")
-            logger.info(f"  - welcome_1st 배치 조회: {len(welcome_1st_batch)}건")
-            logger.info(f"  - welcome_2nd 배치 조회: {len(welcome_2nd_batch)}건")
-            
-            # 샘플 10개 분석
-            for i, doc in enumerate(rrf_results[:10]):
-                source = doc.get('_source', {})
-                if not source and 'doc' in doc:
-                    source = doc.get('doc', {}).get('_source', {})
-                user_id = source.get('user_id') if isinstance(source, dict) else doc.get('_id', '')
-                logger.info(f"  샘플 {i+1}. user_id={user_id}, metadata={source.get('metadata', {}) if isinstance(source, dict) else 'N/A'}")
-            
-            # 필터 재적용
-            PLACEHOLDER_TOKENS = {
-                "",
-                "미정",
-                "없음",
-                "무응답",
-                "해당없음",
-                "n/a",
-                "na",
-                "null",
-                "none",
-                "unknown",
-                "미선택",
-                "미기재",
-            }
-            PLACEHOLDER_TOKENS = {token.strip().lower() for token in PLACEHOLDER_TOKENS}
+            if not filters_to_validate:
+                timings["post_filter_ms"] = (perf_counter() - filter_start) * 1000
+                filtered_rrf_results = rrf_results
+                logger.info("  ✅ Demographic 필터 없음: Python 후처리 생략")
+            else:
+                def collect_doc_values(
+                    user_id: str,
+                    source: Dict[str, Any],
+                    metadata_1st: Dict[str, Any],
+                    metadata_2nd: Dict[str, Any],
+                ) -> Tuple[Dict[DemographicType, Set[str]], Dict[DemographicType, bool]]:
+                    doc_values: Dict[DemographicType, Set[str]] = {
+                        DemographicType.GENDER: set(),
+                        DemographicType.AGE: set(),
+                        DemographicType.OCCUPATION: set(),
+                    }
+                    metadata_presence: Dict[DemographicType, bool] = {
+                        DemographicType.GENDER: False,
+                        DemographicType.AGE: False,
+                        DemographicType.OCCUPATION: False,
+                    }
 
-            def normalize_value(value: Any) -> str:
-                if value is None:
-                    return ""
-                if isinstance(value, bool):
-                    value_str = str(value)
-                if isinstance(value, (int, float)):
-                    try:
-                        if value.is_integer():  # type: ignore[attr-defined]
-                            value = int(value)
-                    except AttributeError:
-                        pass
-                    value_str = str(value)
-                else:
-                    value_str = str(value)
+                    metadata_candidates = [
+                        metadata_1st,
+                        metadata_2nd,
+                        source.get("metadata", {}) if isinstance(source, dict) else {},
+                    ]
 
-                cleaned = value_str.strip()
-                lower = cleaned.lower()
-                if lower in PLACEHOLDER_TOKENS:
-                    return ""
-                return lower
+                    payload = {}
+                    if isinstance(source, dict):
+                        payload_candidate = source.get("payload")
+                        if isinstance(payload_candidate, dict):
+                            payload = payload_candidate
+                    if not payload and isinstance(source, dict) and "doc" in source:
+                        doc_payload = source.get("doc", {}).get("payload")
+                        if isinstance(doc_payload, dict):
+                            payload = doc_payload
+                    if not payload and isinstance(source, dict):
+                        payload = source
 
-            def build_expected_values(demo: "DemographicEntity") -> Set[str]:
-                key = f"{demo.demographic_type.value}:{demo.raw_value}"
-                expected: Set[str] = set()
-                expected.add(demo.raw_value)
-                expected.add(demo.value)
-                expected.update(demo.synonyms or set())
-                expected.update(synonym_cache.get(key, []))
-                return {normalize_value(v) for v in expected if v}
+                    if isinstance(payload, dict):
+                        metadata_candidates.append(payload.get("metadata", {}))
 
-            def values_match(values: Set[str], expected: Set[str]) -> bool:
-                if not values or not expected:
-                    return False
-                for val in values:
-                    if not val:
-                        continue
-                    for exp in expected:
-                        if not exp:
+                    for candidate in metadata_candidates:
+                        if not isinstance(candidate, dict):
                             continue
-                        if val == exp or val in exp or exp in val:
-                            return True
-                return False
 
-            def expand_gender_aliases(values: Set[str]) -> None:
-                male_aliases = {"m", "남", "남성", "male", "man", "남자"}
-                female_aliases = {"f", "여", "여성", "female", "woman", "여자"}
-                if values & male_aliases:
-                    values.update(male_aliases)
-                if values & female_aliases:
-                    values.update(female_aliases)
+                        candidate_sources: List[Dict[str, Any]] = [candidate]
+                        nested_meta = candidate.get("metadata")
+                        if isinstance(nested_meta, dict):
+                            candidate_sources.append(nested_meta)
 
-            def add_age_decade(values: Set[str], age_value: Any) -> None:
-                if age_value in (None, ""):
-                    return
-                try:
-                    age_int = int(age_value)
-                    decade = (age_int // 10) * 10
-                    for candidate in (f"{decade}대", f"{decade}s", str(age_int)):
-                        normalized_candidate = normalize_value(candidate)
-                        if normalized_candidate:
-                            values.add(normalized_candidate)
-                except (ValueError, TypeError):
-                    pass
+                        for meta_source in candidate_sources:
+                            gender_val = meta_source.get("gender") or meta_source.get("gender_code")
+                            if gender_val:
+                                normalized_gender = normalize_value(gender_val)
+                                if normalized_gender:
+                                    doc_values[DemographicType.GENDER].add(normalized_gender)
+                                    metadata_presence[DemographicType.GENDER] = True
+
+                            age_group_val = meta_source.get("age_group")
+                            if age_group_val:
+                                normalized_age_group = normalize_value(age_group_val)
+                                if normalized_age_group:
+                                    doc_values[DemographicType.AGE].add(normalized_age_group)
+                                    metadata_presence[DemographicType.AGE] = True
+
+                            age_val = meta_source.get("age")
+                            if age_val:
+                                pre_count = len(doc_values[DemographicType.AGE])
+                                add_age_decade(doc_values[DemographicType.AGE], age_val)
+                                if len(doc_values[DemographicType.AGE]) > pre_count:
+                                    metadata_presence[DemographicType.AGE] = True
+
+                            birth_year_val = meta_source.get("birth_year")
+                            if birth_year_val:
+                                normalized_birth_year = normalize_value(birth_year_val)
+                                if normalized_birth_year:
+                                    doc_values[DemographicType.AGE].add(normalized_birth_year)
+                                    metadata_presence[DemographicType.AGE] = True
+
+                            occupation_val = meta_source.get("occupation") or meta_source.get("job")
+                            if occupation_val:
+                                normalized_occupation = normalize_value(occupation_val)
+                                if normalized_occupation:
+                                    doc_values[DemographicType.OCCUPATION].add(normalized_occupation)
+                                    metadata_presence[DemographicType.OCCUPATION] = True
+
+                    if user_id:
+                        qa_sources: List[List[Dict[str, Any]]] = []
+                        if isinstance(source, dict):
+                            qa_sources.append(source.get("qa_pairs", []) or [])
+                        if isinstance(welcome_2nd_batch.get(user_id), dict):
+                            qa_sources.append(welcome_2nd_batch[user_id].get("qa_pairs", []) or [])
+                        if isinstance(welcome_1st_batch.get(user_id), dict):
+                            qa_sources.append(welcome_1st_batch[user_id].get("qa_pairs", []) or [])
+
+                        for qa_pairs in qa_sources:
+                            for qa in qa_pairs:
+                                if not isinstance(qa, dict):
+                                    continue
+                                q_text = normalize_value(qa.get("q_text"))
+                                answer_candidates = [
+                                    qa.get("answer"),
+                                    qa.get("answer_text"),
+                                    qa.get("value"),
+                                ]
+                                answers: List[str] = []
+                                for candidate in answer_candidates:
+                                    if candidate is None:
+                                        continue
+                                    if isinstance(candidate, list):
+                                        answers.extend(str(item) for item in candidate if item)
+                                    else:
+                                        answers.append(str(candidate))
+                                normalized_answers = {normalize_value(ans) for ans in answers if ans}
+
+                                if q_text and normalized_answers:
+                                    if q_text in {"직업", "직무", "occupation"}:
+                                        doc_values[DemographicType.OCCUPATION].update(normalized_answers)
+
+                    return doc_values, metadata_presence
+
+                filtered_list = []
+                source_not_found_count = 0
+                gender_filter_failed = 0
+                age_filter_failed = 0
+                occupation_filter_failed = 0
+                gender_metadata_missing = 0
+                age_metadata_missing = 0
+                occupation_metadata_missing = 0
+
+                for doc in rrf_results:
+                    user_id = doc_user_map.get(id(doc))
+                    if not user_id:
+                        continue
+
+                    source = user_rrf_map.get(user_id, [{}])[0].get('_source', {})
+                    if not isinstance(source, dict):
+                        source = {}
+
+                    metadata_1st = welcome_1st_batch.get(user_id, {}) if isinstance(welcome_1st_batch.get(user_id), dict) else {}
+                    metadata_2nd = welcome_2nd_batch.get(user_id, {}) if isinstance(welcome_2nd_batch.get(user_id), dict) else {}
+                    metadata_2nd_full = welcome_2nd_batch.get(user_id, {})
+
+                    doc_values, metadata_presence = collect_doc_values(user_id, source, metadata_1st, metadata_2nd)
+
+                    gender_pass = True
+                    age_pass = True
+                    occupation_pass = True
+
+                    if DemographicType.GENDER in filters_to_validate:
+                        expected = set()
+                        for demo in demographic_filters[DemographicType.GENDER]:
+                            expected.update(build_expected_values(demo))
+                        expand_gender_aliases(doc_values[DemographicType.GENDER])
+                        gender_pass = values_match(doc_values[DemographicType.GENDER], expected)
+                        if not gender_pass:
+                            gender_filter_failed += 1
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    "🚫 성별 불일치 | user_id=%s | doc_values=%s | expected=%s | metadata=%s",
+                                    user_id,
+                                    doc_values[DemographicType.GENDER],
+                                    expected,
+                                    {
+                                        "metadata_1st": metadata_1st,
+                                        "metadata_2nd": metadata_2nd,
+                                    },
+                                )
+
+                    if gender_pass and DemographicType.AGE in filters_to_validate:
+                        expected = set()
+                        for demo in demographic_filters[DemographicType.AGE]:
+                            expected.update(build_expected_values(demo))
+                        age_pass = values_match(doc_values[DemographicType.AGE], expected)
+                        if not age_pass:
+                            age_filter_failed += 1
+
+                    if gender_pass and age_pass and DemographicType.OCCUPATION in filters_to_validate:
+                        expected = set()
+                        for demo in demographic_filters[DemographicType.OCCUPATION]:
+                            expected.update(build_expected_values(demo))
+                        if not metadata_presence[DemographicType.OCCUPATION]:
+                            occupation_metadata_missing += 1
+                        occupation_pass = values_match(doc_values[DemographicType.OCCUPATION], expected)
+                        if not occupation_pass:
+                            occupation_filter_failed += 1
+                        else:
+                            display_occupation = None
+                            occupation_candidates = [
+                                metadata_2nd.get("occupation"),
+                                metadata_2nd.get("job"),
+                                metadata_2nd.get("occupation_group"),
+                            ]
+                            for candidate in occupation_candidates:
+                                normalized_candidate = normalize_value(candidate)
+                                if normalized_candidate and values_match({normalized_candidate}, expected):
+                                    display_occupation = str(candidate)
+                                    break
+                            if not display_occupation:
+                                qa_sources: List[List[Dict[str, Any]]] = []
+                                if isinstance(source, dict):
+                                    qa_sources.append(source.get("qa_pairs", []) or [])
+                                if isinstance(metadata_2nd_full, dict):
+                                    qa_sources.append(metadata_2nd_full.get("qa_pairs", []) or [])
+                                for qa_pairs in qa_sources:
+                                    for qa in qa_pairs:
+                                        if not isinstance(qa, dict):
+                                            continue
+                                        q_text = str(qa.get("q_text", "")).lower()
+                                        if not any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
+                                            continue
+                                        answer = qa.get("answer")
+                                        if answer is None:
+                                            answer = qa.get("answer_text")
+                                        if answer is None:
+                                            continue
+                                        candidate_value = str(answer)
+                                        normalized_candidate = normalize_value(candidate_value)
+                                        if normalized_candidate and values_match({normalized_candidate}, expected):
+                                            display_occupation = candidate_value
+                                            break
+                                    if display_occupation:
+                                        break
+                            if display_occupation:
+                                occupation_display_map[user_id] = display_occupation
+
+                    if gender_pass and age_pass and occupation_pass:
+                        filtered_list.append(doc)
+
+                filter_duration_ms = (perf_counter() - filter_start) * 1000
+                timings["post_filter_ms"] = filter_duration_ms
+                filtered_rrf_results = filtered_list
+
+                logger.info(f"  - 소스 누락 문서: {source_not_found_count}건")
+                if DemographicType.GENDER in filters_to_validate:
+                    logger.info(f"  - 성별 metadata 없음: {gender_metadata_missing}건")
+                    logger.info(f"  - 성별 필터 미충족: {gender_filter_failed}건")
+                if DemographicType.AGE in filters_to_validate:
+                    logger.info(f"  - 연령 metadata 없음: {age_metadata_missing}건")
+                    logger.info(f"  - 연령 필터 미충족: {age_filter_failed}건")
+                if DemographicType.OCCUPATION in filters_to_validate:
+                    logger.info(f"  - 직업 metadata 없음: {occupation_metadata_missing}건")
+                    logger.info(f"  - 직업 필터 미충족: {occupation_filter_failed}건")
+                logger.info(f"  - 필터 조건 충족 문서: {len(filtered_rrf_results)}건")
+        else:
+            timings.setdefault('post_filter_ms', timings.get('post_filter_ms', 0.0))
 
             def collect_doc_values(
                 user_id: str,
@@ -2247,7 +2832,7 @@ async def search_natural_language(
             logger.info(f"  - 필터 조건 충족 문서: {len(filtered_rrf_results)}건")
 
         lazy_join_start = perf_counter()
-        final_hits = filtered_rrf_results[:size]
+        final_hits = filtered_rrf_results[:window_size]
         results: List[SearchResult] = []
         inner_hits_map: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -2392,21 +2977,31 @@ async def search_natural_language(
         timings.setdefault('post_filter_ms', timings.get('post_filter_ms', 0.0))
         timings.setdefault('rrf_recombination_ms', 0.0)
         timings.setdefault('qdrant_parallel_ms', 0.0)
-        timings.setdefault('opensearch_parallel_ms', timings.get('two_phase_stage1_ms', 0.0) + timings.get('two_phase_stage2_ms', 0.0))
+        timings.setdefault(
+            'opensearch_parallel_ms',
+            timings.get('two_phase_stage1_ms', 0.0) + timings.get('two_phase_stage2_ms', 0.0)
+        )
 
         total_duration_ms = (perf_counter() - overall_start) * 1000
         timings['total_ms'] = total_duration_ms
+        timings['cache_hit'] = 1.0 if cache_hit else 0.0
+
+        serialized_results = [_serialize_result(res) for res in results]
+        stored_items = serialized_results
+        if cache_enabled and cache_limit > 0:
+            stored_items = serialized_results[:cache_limit]
+        page_results, has_more_local = _slice_results(stored_items, page, page_size)
+        has_more = has_more_local and ((page * page_size) < total_hits)
+        total_hits = len(filtered_rrf_results)
+        max_score = results[0].score if results else 0.0
+        response_took_ms = int(total_duration_ms)
 
         logger.info("📈 성능 측정 요약 (ms):")
         for key in sorted(timings.keys()):
             logger.info(f"  - {key}: {timings[key]:.2f}")
 
-        response_took_ms = int(total_duration_ms)
-        total_hits = len(filtered_rrf_results)
-        max_score = final_hits[0].get('_score', 0.0) if final_hits else 0.0
-
         summary_parts = [
-            f"returned={len(results)}/{total_hits}",
+            f"returned={len(page_results)}/{total_hits}",
             f"total_ms={response_took_ms}",
         ]
         if rrf_k_used is not None:
@@ -2419,23 +3014,44 @@ async def search_natural_language(
         if threshold_reason:
             logger.info(f"   • Qdrant: {threshold_reason}")
 
+        if cache_enabled and cache_key and stored_items:
+            cache_payload = {
+                "total_hits": total_hits,
+                "max_score": max_score,
+                "items": stored_items,
+                "filters": filters_for_response,
+                "extracted_entities": extracted_entities.to_dict(),
+            }
+            try:
+                cache_client.setex(
+                    cache_key,
+                    cache_ttl,
+                    json.dumps(cache_payload, ensure_ascii=False),
+                )
+                logger.info(f"💾 Redis 검색 캐시 저장: key={cache_key}, ttl={cache_ttl}s")
+            except Exception as cache_exc:
+                logger.warning(f"⚠️ Redis 검색 캐시 저장 실패: {cache_exc}")
+
         return SearchResponse(
             query=request.query,
             total_hits=total_hits,
             max_score=max_score,
-            results=results,
+            results=page_results,
             query_analysis={
                 "intent": analysis.intent,
                 "must_terms": analysis.must_terms,
                 "should_terms": analysis.should_terms,
                 "alpha": analysis.alpha,
                 "confidence": analysis.confidence,
-                "extracted_entities": extracted_entities.to_dict(),
                 "filters": filters_for_response,
-                "size": size,
+                "size": page_size,
                 "timings_ms": timings,
+                "extracted_entities": extracted_entities.to_dict(),
             },
             took_ms=response_took_ms,
+            page=page,
+            page_size=page_size,
+            has_more=has_more,
         )
 
     except HTTPException:
