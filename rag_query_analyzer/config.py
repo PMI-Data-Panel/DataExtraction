@@ -42,6 +42,8 @@ class Config:
     CLAUDE_MODEL_FAST: str = os.getenv("CLAUDE_MODEL_FAST", "claude-3-7-sonnet-latest")
     CLAUDE_MAX_TOKENS: int = int(os.getenv("CLAUDE_MAX_TOKENS", 1500))
     CLAUDE_TEMPERATURE: float = float(os.getenv("CLAUDE_TEMPERATURE", 0.1))
+    ENABLE_CLAUDE_ANALYZER: bool = os.getenv("ENABLE_CLAUDE_ANALYZER", "false").lower() == "true"
+    CLAUDE_ANALYZER_TIMEOUT: int = int(os.getenv("CLAUDE_ANALYZER_TIMEOUT", "3"))
 
     # --- 시스템 동작 ---
     ENABLE_CACHE: bool = os.getenv("ENABLE_CACHE", "true").lower() == "true"
@@ -51,14 +53,23 @@ class Config:
     MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", 4))
     MAX_REWRITTEN_QUERIES: int = int(os.getenv("MAX_REWRITTEN_QUERIES", 2))
     QUERY_LOG_FILE: str = os.getenv("QUERY_LOG_FILE", "query_performance.json")
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    SEARCH_CACHE_TTL_SECONDS: int = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "300"))
+    SEARCH_CACHE_MAX_RESULTS: int = int(os.getenv("SEARCH_CACHE_MAX_RESULTS", "500"))
     
     # --- 검색 파라미터 ---
     INITIAL_SEARCH_SIZE: int = int(os.getenv("INITIAL_SEARCH_SIZE", 50))
     FINAL_RESULT_SIZE: int = int(os.getenv("FINAL_RESULT_SIZE", 10))
 
     def validate(self):
-        if not self.CLAUDE_API_KEY:
-            raise ValueError("CLAUDE_API_KEY가 설정되지 않았습니다.")
+        if self.ENABLE_CLAUDE_ANALYZER and not self.CLAUDE_API_KEY:
+            raise ValueError("ENABLE_CLAUDE_ANALYZER=True인 경우 CLAUDE_API_KEY가 필요합니다.")
+        if self.CLAUDE_ANALYZER_TIMEOUT <= 0:
+            raise ValueError("CLAUDE_ANALYZER_TIMEOUT 값은 1 이상이어야 합니다.")
+        if self.SEARCH_CACHE_TTL_SECONDS < 0:
+            raise ValueError("SEARCH_CACHE_TTL_SECONDS 값은 0 이상이어야 합니다.")
+        if self.SEARCH_CACHE_MAX_RESULTS <= 0:
+            raise ValueError("SEARCH_CACHE_MAX_RESULTS 값은 1 이상이어야 합니다.")
 
 # 싱글턴 인스턴스
 _config_instance: Config = None

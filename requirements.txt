@@ -13,7 +13,7 @@ opensearch-py==2.4.2
 qdrant-client>=1.7.1,<1.16
 
 # AWS OpenSearch Service 
-=======
+
 qdrant-client==1.7.0
 
 # AWS OpenSearch Service (선택사항)
@@ -25,7 +25,6 @@ requests-aws4auth>=1.2.0
 sentence-transformers==3.2.1
 
 torch==2.9.0
-=======
 torch==2.4.1
 
 transformers==4.44.2
@@ -34,10 +33,11 @@ transformers==4.44.2
 python-dotenv==1.0.1
 tqdm==4.66.5
 pydantic>=2.0.0
+redis>=4.5.0
 
 
 
-=======
+
 # Optional: GPU 가속 (CUDA 사용 시)
 # nvidia-cuda-runtime-cu12==12.4.0  # Windows/Linux
 # nvidia-cuda-nvrtc-cu12==12.4.0
