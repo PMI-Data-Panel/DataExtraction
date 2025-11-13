@@ -89,30 +89,45 @@ class OpenSearchHybridQueryBuilder:
         return self.build_query(analysis, query_vector=query_vector, size=size)
 
     def _extract_demographic_filters(self, analysis) -> List[str]:
-        """must_terms에서 인구통계 키워드 추출 (qa_pairs.answer에서 검색용)"""
-        demographic_terms = []
+        """분석 결과에서 인구통계 필터 후보 추출"""
+        demographic_terms: List[str] = []
 
-        for term in analysis.must_terms:
-            matched = False
+        entities = getattr(analysis, "demographic_entities", None)
+        if entities:
+            for entity in entities:
+                demographic_terms.append(str(entity.raw_value))
+                demographic_terms.append(str(entity.value))
+                for syn in getattr(entity, "synonyms", []) or []:
+                    demographic_terms.append(str(syn))
+        else:
+            for term in analysis.must_terms:
+                matched = False
+                for field, config in self.demographic_patterns.items():
+                    if term in config["values"]:
+                        demographic_terms.append(term)
+                        matched = True
+                        break
+                    if term in config["synonyms"]:
+                        normalized = config["synonyms"][term]
+                        demographic_terms.append(normalized)
+                        matched = True
+                        break
+                if not matched:
+                    logger.debug(f"'{term}'은(는) 인구통계 키워드가 아님")
 
-            for field, config in self.demographic_patterns.items():
-                # 직접 매칭
-                if term in config["values"]:
-                    demographic_terms.append(term)
-                    matched = True
-                    break
+        # 중복 제거 및 정리
+        seen = set()
+        unique_terms: List[str] = []
+        for term in demographic_terms:
+            if not term:
+                continue
+            lowered = term.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            unique_terms.append(term)
 
-                # 동의어 매칭
-                if term in config["synonyms"]:
-                    normalized = config["synonyms"][term]
-                    demographic_terms.append(normalized)
-                    matched = True
-                    break
-
-            if not matched:
-                logger.debug(f"'{term}'은(는) 인구통계 키워드가 아님")
-
-        return demographic_terms
+        return unique_terms
 
     def _extract_semantic_terms(self, analysis) -> Dict[str, List[str]]:
         """인구통계가 아닌 의미적 키워드 추출"""
@@ -218,27 +233,38 @@ class OpenSearchHybridQueryBuilder:
         #    - 여기서는 키워드 검색에서 제외하므로 추가하지 않음
 
         # ⭐ 2. 의미적 must 키워드 (Demographics가 아닌 것만)
-        inner_hit_counter = 0
+        # ✨ 개선: 모든 must_terms를 하나의 nested 쿼리로 통합 (성능 향상)
+        must_terms_filtered = [
+            term for term in semantic_terms["must"]
+            if term not in demographic_set
+        ]
 
-        if semantic_terms["must"]:
-            for term in semantic_terms["must"]:
-                # Demographics가 아닌지 재확인
-                if term not in demographic_set:
-                    must_queries.append({
-                        "nested": {
-                            "path": "qa_pairs",
-                            "query": {"match": {"qa_pairs.answer_text": term}},
-                            "score_mode": "max",
-                            "inner_hits": {
-                                "name": f"must_{inner_hit_counter}",
-                                "size": 3,
-                                "_source": {
-                                    "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
+        if must_terms_filtered:
+            # ⭐ 개선: answer와 answer_text 둘 다 검색 (s_welcome_*는 answer만, qpoll_*는 answer_text도)
+            # 모든 must_terms를 하나의 nested 쿼리 내부의 bool.must로 처리
+            must_queries.append({
+                "nested": {
+                    "path": "qa_pairs",
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "bool": {
+                                        "should": [
+                                            {"match": {"qa_pairs.answer": term}},           # s_welcome_* (필수)
+                                            {"match": {"qa_pairs.answer_text": term}}      # qpoll_* (옵션)
+                                        ],
+                                        "minimum_should_match": 1
+                                    }
                                 }
-                            }
+                                for term in must_terms_filtered
+                            ]
                         }
-                    })
-                    inner_hit_counter += 1
+                    },
+                    "score_mode": "max",
+                    # inner_hits는 제거 (성능 향상, 필요시 후처리에서 추출)
+                }
+            })
 
         # ⭐ 3. should 조건 (Demographics 제외, 있을 때만)
         should_query = None
@@ -248,7 +274,7 @@ class OpenSearchHybridQueryBuilder:
                 term for term in semantic_terms["should"]
                 if term not in demographic_set
             ]
-            
+
             if should_terms_filtered:
                 should_query = {
                     "nested": {
@@ -256,23 +282,24 @@ class OpenSearchHybridQueryBuilder:
                         "query": {
                             "bool": {
                                 "should": [
-                                    {"match": {"qa_pairs.answer_text": term}}
+                                    {
+                                        "bool": {
+                                            "should": [
+                                                {"match": {"qa_pairs.answer": term}},           # s_welcome_*
+                                                {"match": {"qa_pairs.answer_text": term}}      # qpoll_*
+                                            ],
+                                            "minimum_should_match": 1
+                                        }
+                                    }
                                     for term in should_terms_filtered
                                 ],
                                 "minimum_should_match": 1
                             }
                         },
                         "score_mode": "max",
-                        "inner_hits": {
-                            "name": f"should_{inner_hit_counter}",
-                            "size": 3,
-                            "_source": {
-                                "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
-                            }
-                        }
+                        # inner_hits 제거 (성능 향상)
                     }
                 }
-                inner_hit_counter += 1
 
         # ⭐ 4. 최종 쿼리 구성
         if must_queries or should_query:
@@ -290,7 +317,15 @@ class OpenSearchHybridQueryBuilder:
                     {
                         "nested": {
                             "path": "qa_pairs",
-                            "query": {"match": {"qa_pairs.answer_text": term}}
+                            "query": {
+                                "bool": {
+                                    "should": [
+                                        {"match": {"qa_pairs.answer": term}},           # s_welcome_*
+                                        {"match": {"qa_pairs.answer_text": term}}      # qpoll_*
+                                    ],
+                                    "minimum_should_match": 1
+                                }
+                            }
                         }
                     }
                     for term in semantic_terms["must_not"]

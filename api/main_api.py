@@ -8,6 +8,7 @@ from opensearchpy import OpenSearch, AsyncOpenSearch
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 import redis
+import anthropic
 
 # 설정
 from rag_query_analyzer.config import get_config, Config
@@ -73,7 +74,7 @@ def create_app() -> FastAPI:
         qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=30)
         logger.info(f"[OK] Qdrant 클라이언트 초기화 완료: {qdrant_host}:{qdrant_port}")
 
-        # Redis 클라이언트 (검색 결과 캐시)
+        # Redis 클라이언트 (검색 결과 캐시 및 로그)
         redis_client = None
         if config.REDIS_URL:
             try:
@@ -83,6 +84,16 @@ def create_app() -> FastAPI:
             except Exception as e:
                 redis_client = None
                 logger.warning(f"⚠️ Redis 연결 실패 ({config.REDIS_URL}): {e}")
+
+        # Claude/Anthropic 클라이언트 (재사용)
+        anthropic_client = None
+        if config.CLAUDE_API_KEY:
+            try:
+                anthropic_client = anthropic.Anthropic(api_key=config.CLAUDE_API_KEY)
+                logger.info("[OK] Anthropic 클라이언트 초기화 완료")
+            except Exception as e:
+                anthropic_client = None
+                logger.warning(f"⚠️ Anthropic 클라이언트 초기화 실패: {e}")
 
         # 임베딩 모델 로딩 (KURE-v1)
         logger.info(f"임베딩 모델 로딩 중: {config.EMBEDDING_MODEL}")
@@ -106,6 +117,19 @@ def create_app() -> FastAPI:
         search_router.cache_ttl_seconds = config.SEARCH_CACHE_TTL_SECONDS
         search_router.cache_max_results = config.SEARCH_CACHE_MAX_RESULTS
         search_router.cache_prefix = "search:results"
+        search_router.conversation_history_prefix = config.CONVERSATION_HISTORY_PREFIX
+        search_router.conversation_history_ttl_seconds = config.CONVERSATION_HISTORY_TTL_SECONDS
+        search_router.conversation_history_max_messages = config.CONVERSATION_HISTORY_MAX_MESSAGES
+        search_router.search_history_prefix = config.SEARCH_HISTORY_PREFIX
+        search_router.search_history_ttl_seconds = config.SEARCH_HISTORY_TTL_SECONDS
+        search_router.search_history_max_entries = config.SEARCH_HISTORY_MAX_ENTRIES
+        search_router.enable_search_summary = config.ENABLE_SEARCH_SUMMARY
+        search_router.search_summary_max_results = config.SEARCH_SUMMARY_MAX_RESULTS
+        search_router.search_summary_max_chars = config.SEARCH_SUMMARY_MAX_CHARS
+        search_router.search_summary_model = (
+            config.SEARCH_SUMMARY_MODEL or config.CLAUDE_MODEL
+        )
+        search_router.anthropic_client = anthropic_client
 
         # 시작 이벤트 등록
         @app.on_event("startup")

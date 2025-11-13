@@ -1,32 +1,39 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from datetime import datetime
 
 
 @dataclass
 class QueryAnalysis:
     """쿼리 분석 결과를 담는 데이터 클래스"""
-    
+
     # 기본 분석 결과
     intent: str                              # 검색 의도: exact_match, semantic_search, hybrid
-    must_terms: List[str]                    # AND 조건 키워드  고민중!!
+    must_terms: List[str]                    # AND 조건 키워드 (의미적 키워드만)
     should_terms: List[str]                  # OR 조건 키워드
     must_not_terms: List[str]                # 제외 키워드
-    
+
     # 검색 파라미터
     alpha: float                              # 하이브리드 검색 가중치 (0: 키워드, 1: 벡터)
-    
+
     # 확장 정보
     expanded_keywords: Dict[str, List[str]]  # 키워드별 확장어
     confidence: float                         # 분석 신뢰도 (0-1)
     explanation: str                          # 분석 설명
-    
+
     # 추가 메타데이터
     reasoning_steps: List[str] = field(default_factory=list)    # CoT 추론 과정
     rewritten_queries: List[str] = field(default_factory=list)  # 재작성된 쿼리들
     semantic_intent: str = "unknown"         # 의미론적 의도
     execution_time: float = 0.0              # 실행 시간 (초)
-    
+
+    # 행동/상태 조건
+    behavioral_conditions: Dict[str, bool] = field(default_factory=dict)
+
+    # Demographics 정보 (필터로만 사용)
+    demographic_entities: List[Any] = field(default_factory=list)  # DemographicEntity 리스트
+    removed_demographic_terms: List[str] = field(default_factory=list)  # 제거된 Demographics 키워드
+
     # 분석 메타데이터
     analyzer_used: str = ""                  # 사용된 분석기
     fallback_used: bool = False              # 폴백 사용 여부
@@ -44,7 +51,8 @@ class QueryAnalysis:
             "confidence": self.confidence,
             "explanation": self.explanation,
             "semantic_intent": self.semantic_intent,
-            "execution_time": self.execution_time
+            "execution_time": self.execution_time,
+            "behavioral_conditions": self.behavioral_conditions,
         }
     
     def merge_with(self, other: 'QueryAnalysis'):
@@ -61,6 +69,9 @@ class QueryAnalysis:
             else:
                 self.expanded_keywords[key] = values
         
+        # 행동 조건 병합 (other가 우선)
+        self.behavioral_conditions.update(other.behavioral_conditions)
+
         # 신뢰도는 평균
         self.confidence = (self.confidence + other.confidence) / 2
         

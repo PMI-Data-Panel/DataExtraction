@@ -135,7 +135,8 @@ JSON 형식:
                 expanded_keywords=data.get("expanded_keywords", {}),
                 confidence=float(data.get("confidence", 0.5)),
                 explanation=data.get("explanation", ""),
-                reasoning_steps=data.get("reasoning_steps", [])
+                reasoning_steps=data.get("reasoning_steps", []),
+                behavioral_conditions=data.get("behavioral_conditions", {}),
             )
             
         except Exception as e:
@@ -154,7 +155,8 @@ JSON 형식:
             confidence=0.1,
             explanation=f"Claude API 오류로 기본값 사용: {error}",
             analyzer_used=self.get_name(),
-            fallback_used=True
+            fallback_used=True,
+            behavioral_conditions={},
         )
     
     def _create_empty_analysis(self) -> QueryAnalysis:
@@ -168,5 +170,6 @@ JSON 형식:
             expanded_keywords={},
             confidence=0.0,
             explanation="유효하지 않은 쿼리",
-            analyzer_used=self.get_name()
+            analyzer_used=self.get_name(),
+            behavioral_conditions={},
         )

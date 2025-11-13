@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import List, Dict
+from typing import List, Dict, Tuple, Set
 from .base import BaseAnalyzer
 from ..models.query import QueryAnalysis
 
@@ -20,6 +20,7 @@ class RuleBasedAnalyzer(BaseAnalyzer):
         self.keyword_expansions = self._init_keyword_expansions()
         self.meta_keywords = self._init_meta_keywords()
         self.demographic_keywords = self._init_demographic_keywords()
+        self.behavior_keywords = self._init_behavior_keywords()
         logger.info("RuleBasedAnalyzer 초기화 완료 (강화됨)")
     
     def get_name(self) -> str:
@@ -111,11 +112,53 @@ class RuleBasedAnalyzer(BaseAnalyzer):
             '직장인', '생산직', '무직', '프리랜서', '사무원', '화이트칼라',
             '대학생', '고등학생', '소상공인', '의사', '변호사', '회계사',
             '서비스업', '판매직', '영업', '블루칼라',
+            '공무원', '공직자', '공무', '공직', '가정주부', '실직', '미취업', '자유직',
+            '중/고등학생', '대학생/대학원생', '간호사', '엔지니어', '프로그래머',
+            '생산/노무직', '경영/관리직', '경영관리직', '교직', '교사', '교수', '강사',
             # 지역
             '서울', '부산', '대구', '인천', '광주', '대전', '울산',
             '경기', '강원', '충북', '충남', '전북', '전남', '경북', '경남', '제주', '세종',
-            # 기타
-            '미혼', '기혼', '싱글', '결혼'
+            # 결혼여부
+            '미혼', '기혼', '싱글', '결혼', '이혼', '사별', '별거',
+            # 학력
+            '고졸', '대졸', '대학원', '석사', '박사', '대학 재학', '대학교 재학',
+            # 소득
+            '100만원', '200만원', '300만원', '400만원', '500만원',
+            '소득', '급여', '연봉',
+            # 가족수, 자녀수
+            '1명', '2명', '3명', '4명', '5명', '가족수', '자녀수', '혼자', '독거',
+            # 직무
+            'IT', '아이티', '개발', '프로그래밍', '코딩',
+            '경영', '인사', '총무', '사무',
+            '생산', '정비', '기능', '노무',
+            '서비스', '여행', '숙박', '음식', '미용', '보안',
+            '의료', '간호', '보건', '복지',
+            '건설', '건축', '토목', '환경',
+            '교육', '교사', '강사', '교직원',
+            '유통', '물류', '운송', '운전',
+            '무역', '영업', '판매', '매장관리',
+            '전자', '기계', '기술', '화학', '연구개발', 'R&D',
+            '재무', '회계', '경리',
+            '마케팅', '광고', '홍보', '조사',
+            '금융', '보험', '증권',
+            '고객상담', 'TM', '텔레마케팅',
+            '법률', '인문사회',
+            '디자인',
+            '문화', '스포츠',
+            '인터넷', '통신',
+            '방송', '언론',
+            '게임'
+        }
+
+    def _init_behavior_keywords(self) -> set:
+        """행동/습관 관련 키워드"""
+        return {
+            '흡연', '흡연자', '흡연하는', '흡연량', '흡연률', '흡연율',
+            '비흡연', '금연', '금연자', '담배', '담배피는', '담배피움', '담배피우는',
+            '담배피고', '담배피며', '담배피면서', '담배피거나',  # ✅ 추가: 담배 피고 등 연결형
+            '차량', '자동차', '차량여부', '보유차량', '차', '차량보유', '차량 보유',
+            '소유', '소유하는', '소유한', '가진', '보유', '보유한', '보유하는',
+            '맥주', '와인', '소주', '술', '음주', '비음주', '금주', '음용', '음용경험'
         }
     
     def analyze(self, query: str, context: str = "") -> QueryAnalysis:
@@ -157,10 +200,67 @@ class RuleBasedAnalyzer(BaseAnalyzer):
         # Demographics 키워드 분리 (must_terms에서 제거, 필터로만 처리)
         demographic_terms = [t for t in must_terms if t in self.demographic_keywords]
         must_terms = [t for t in must_terms if t not in self.demographic_keywords]
-        
+
+        if demographic_terms:
+            logger.info(f"🔍 [RuleAnalyzer] Demographics 키워드 분리: {demographic_terms}")
+
         # 추가 키워드 추출 (패턴 외, Demographics 제외)
         additional_terms = self._extract_additional_keywords(query, must_terms + demographic_terms)
+
+        # 행동 조건 추출 (예: 흡연자, 비흡연자 등)
+        behavioral_conditions, behavior_tokens = self._extract_behavioral_conditions(query)
+        if behavior_tokens:
+            behavior_keywords_lower = {kw.lower() for kw in self.behavior_keywords}
+            behavior_tokens_lower = {token.lower() for token in behavior_tokens}
+
+            def is_behavior_term(term: str) -> bool:
+                term_lower = term.lower()
+                if term_lower in behavior_keywords_lower:
+                    return True
+                for token_lower in behavior_tokens_lower:
+                    if token_lower and token_lower in term_lower:
+                        return True
+                for kw_lower in behavior_keywords_lower:
+                    if kw_lower and kw_lower in term_lower:
+                        return True
+                return False
+
+            removed_behavior = [t for t in must_terms + should_terms + demographic_terms + additional_terms if is_behavior_term(t)]
+            must_terms = [t for t in must_terms if not is_behavior_term(t)]
+            should_terms = [t for t in should_terms if not is_behavior_term(t)]
+            demographic_terms = [t for t in demographic_terms if not is_behavior_term(t)]
+            additional_terms = [t for t in additional_terms if not is_behavior_term(t)]
+
+            if removed_behavior:
+                logger.info(f"🔍 [RuleAnalyzer] 행동 키워드 제거: {list(set(removed_behavior))}")
+            if behavioral_conditions:
+                logger.info(f"   ✅ 행동 조건 추출: {behavioral_conditions}")
+
         must_terms.extend(additional_terms)
+
+        # 최종 용어 정리: 행동/메타 키워드 제거
+        def _is_behavior_term(term: str) -> bool:
+            term_lower = term.lower()
+            if term_lower in {kw.lower() for kw in self.behavior_keywords}:
+                return True
+            for keyword in self.behavior_keywords:
+                if keyword.lower() in term_lower:
+                    return True
+            return False
+
+        def _is_meta_term(term: str) -> bool:
+            return term in self.meta_keywords or term.lower() in {kw.lower() for kw in self.meta_keywords}
+
+        original_must_count = len(must_terms)
+        original_should_count = len(should_terms)
+        removed_meta_must = [t for t in must_terms if _is_meta_term(t)]
+        removed_meta_should = [t for t in should_terms if _is_meta_term(t)]
+
+        must_terms = [t for t in must_terms if t and not _is_behavior_term(t) and not _is_meta_term(t)]
+        should_terms = [t for t in should_terms if t and not _is_behavior_term(t) and not _is_meta_term(t)]
+
+        if removed_meta_must or removed_meta_should:
+            logger.info(f"🔍 [RuleAnalyzer] 메타 키워드 제거: must={removed_meta_must}, should={removed_meta_should}")
 
         # 의도 결정
         intent = self._determine_intent(intent_hints)
@@ -185,7 +285,8 @@ class RuleBasedAnalyzer(BaseAnalyzer):
                 f"추출된 키워드: {', '.join(must_terms[:5])}",
                 f"의도: {intent}"
             ],
-            analyzer_used=self.get_name()
+            analyzer_used=self.get_name(),
+            behavioral_conditions=behavioral_conditions,
         )
 
     def _extract_additional_keywords(self, query: str, existing_terms: List[str]) -> List[str]:
@@ -203,6 +304,7 @@ class RuleBasedAnalyzer(BaseAnalyzer):
             if (token in existing_terms or 
                 token in self.meta_keywords or 
                 token in self.demographic_keywords or
+                token in self.behavior_keywords or
                 len(token) <= 1):
                 continue
             
@@ -253,5 +355,133 @@ class RuleBasedAnalyzer(BaseAnalyzer):
             expanded_keywords={},
             confidence=0.0,
             explanation="유효하지 않은 쿼리",
-            analyzer_used=self.get_name()
+            analyzer_used=self.get_name(),
+            behavioral_conditions={},
         )
+
+    # ---------------------------------------------------------
+    # 행동 조건 추출
+    # ---------------------------------------------------------
+    def _extract_behavioral_conditions(self, query: str) -> Tuple[Dict[str, bool], Set[str]]:
+        """쿼리에서 행동 조건(예: 흡연 여부, 차량 보유)을 추출"""
+        lowered = query.lower()
+        conditions: Dict[str, bool] = {}
+        tokens_to_remove: Set[str] = set()
+        tokens = re.findall(r'\w+', query)
+
+        def mark_tokens(keyword_list: Tuple[str, ...]) -> None:
+            for token in tokens:
+                token_lower = token.lower()
+                for keyword in keyword_list:
+                    if keyword in token_lower:
+                        tokens_to_remove.add(token)
+                        break
+
+        specs = {
+            "smoker": {
+                "negative": [
+                    r'비\s*흡연자?',
+                    r'흡연\s*(안|않|하지|안함|않음)',
+                    r'담배\s*(안|않)\s*피',
+                    r'담배를\s*피워본\s*적\s*이\s*없',
+                    r'금연자?',
+                    r'non[-\s]?smoker',
+                    r'담배\s*안\s*피',
+                ],
+                "positive": [
+                    r'흡연\s*자',
+                    r'흡연\s*중',
+                    r'흡연\s*하는',
+                    r'흡연\s*하고',      # "smoking and" - conjunction form
+                    r'흡연\s*하며',      # "while smoking"
+                    r'흡연\s*하면서',    # "while smoking"
+                    r'흡연\s*하거나',    # "smoking or"
+                    r'담배\s*(피우|피는|피운|피움|피고|피며|피면서|피거나)',  # ✅ 추가: 피고, 피며, 피면서, 피거나
+                    r'smoker',
+                ],
+                "token_keywords": ("흡연", "담배"),
+            },
+            "has_vehicle": {
+                "negative": [
+                    r'차량\s*(없|미보유|미소유)',
+                    r'자동차\s*(없|미보유|미소유)',
+                    r'차\s*없',
+                    r'차가\s*없',
+                    r'무\s*차량',
+                    r'차량\s*보유\s*(안|않)',
+                ],
+                "positive": [
+                    r'차량\s*(있|보유|소유)',
+                    r'자동차\s*(있|보유|소유)',
+                    r'차\s*있',
+                    r'차가\s*있',
+                    r'차량\s*보유',
+                    r'차량\s*소유',
+                    r'차를\s*소유하는',   # "owning a car" - descriptive form
+                    r'차를\s*소유하고',   # "owning a car and"
+                    r'차를\s*가진',       # "having a car"
+                    r'차를\s*보유한',     # "possessing a car"
+                    r'차량을\s*소유하는',
+                    r'차량을\s*소유하고',
+                    r'차량을\s*가진',
+                    r'차량을\s*보유한',
+                ],
+                "token_keywords": ("차량", "자동차", "차", "보유차량", "차량여부"),
+            },
+            "drinks_beer": {
+                "positive": [
+                    r'맥주\s*(마시|음용|선호|좋아|즐기)',
+                    r'맥주',
+                    r'beer',
+                ],
+                "token_keywords": ("맥주", "beer"),
+            },
+            "drinks_wine": {
+                "positive": [
+                    r'와인\s*(마시|음용|선호|좋아|즐기)',
+                    r'와인',
+                    r'wine',
+                ],
+                "token_keywords": ("와인", "wine"),
+            },
+            "drinks_soju": {
+                "positive": [
+                    r'소주\s*(마시|음용|선호|좋아|즐기)',
+                    r'소주',
+                    r'soju',
+                ],
+                "token_keywords": ("소주", "soju"),
+            },
+            "non_drinker": {
+                "positive": [
+                    r'술\s*(안|않)\s*마',
+                    r'술\s*못\s*마',
+                    r'비음주',
+                    r'금주',
+                    r'논\s*드링커',
+                    r'non[-\s]?drinker',
+                    r'술을\s*마시지\s*않',
+                ],
+                "token_keywords": ("술", "음주", "비음주", "금주"),
+            },
+        }
+
+        for key, spec in specs.items():
+            found = False
+            # negative 패턴 체크 (있는 경우만)
+            for pattern in spec.get("negative", []):
+                if re.search(pattern, lowered):
+                    conditions[key] = False
+                    mark_tokens(spec["token_keywords"])
+                    found = True
+                    break
+            if found:
+                continue
+            # positive 패턴 체크
+            for pattern in spec.get("positive", []):
+                if re.search(pattern, lowered):
+                    conditions[key] = True
+                    mark_tokens(spec["token_keywords"])
+                    break
+
+        return conditions, tokens_to_remove

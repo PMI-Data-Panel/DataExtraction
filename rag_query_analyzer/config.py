@@ -1,9 +1,12 @@
 import os
+import logging
 from dataclasses import dataclass, field
 from typing import List
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Config:
@@ -42,7 +45,7 @@ class Config:
     CLAUDE_MODEL_FAST: str = os.getenv("CLAUDE_MODEL_FAST", "claude-3-7-sonnet-latest")
     CLAUDE_MAX_TOKENS: int = int(os.getenv("CLAUDE_MAX_TOKENS", 1500))
     CLAUDE_TEMPERATURE: float = float(os.getenv("CLAUDE_TEMPERATURE", 0.1))
-    ENABLE_CLAUDE_ANALYZER: bool = os.getenv("ENABLE_CLAUDE_ANALYZER", "false").lower() == "true"
+    ENABLE_CLAUDE_ANALYZER: bool = os.getenv("ENABLE_CLAUDE_ANALYZER", "true").lower() == "true"
     CLAUDE_ANALYZER_TIMEOUT: int = int(os.getenv("CLAUDE_ANALYZER_TIMEOUT", "3"))
 
     # --- 시스템 동작 ---
@@ -55,21 +58,56 @@ class Config:
     QUERY_LOG_FILE: str = os.getenv("QUERY_LOG_FILE", "query_performance.json")
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     SEARCH_CACHE_TTL_SECONDS: int = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "300"))
-    SEARCH_CACHE_MAX_RESULTS: int = int(os.getenv("SEARCH_CACHE_MAX_RESULTS", "500"))
+    SEARCH_CACHE_MAX_RESULTS: int = int(os.getenv("SEARCH_CACHE_MAX_RESULTS", "12000"))
+    CONVERSATION_HISTORY_PREFIX: str = os.getenv("CONVERSATION_HISTORY_PREFIX", "chat:session")
+    CONVERSATION_HISTORY_TTL_SECONDS: int = int(os.getenv("CONVERSATION_HISTORY_TTL_SECONDS", "604800"))
+    CONVERSATION_HISTORY_MAX_MESSAGES: int = int(os.getenv("CONVERSATION_HISTORY_MAX_MESSAGES", "200"))
+    SEARCH_HISTORY_PREFIX: str = os.getenv("SEARCH_HISTORY_PREFIX", "search:history")
+    SEARCH_HISTORY_TTL_SECONDS: int = int(os.getenv("SEARCH_HISTORY_TTL_SECONDS", "2592000"))
+    SEARCH_HISTORY_MAX_ENTRIES: int = int(os.getenv("SEARCH_HISTORY_MAX_ENTRIES", "500"))
+    ENABLE_SEARCH_SUMMARY: bool = os.getenv("ENABLE_SEARCH_SUMMARY", "true").lower() == "true"
+    SEARCH_SUMMARY_MODEL: str = os.getenv("SEARCH_SUMMARY_MODEL", "")
+    SEARCH_SUMMARY_MAX_RESULTS: int = int(os.getenv("SEARCH_SUMMARY_MAX_RESULTS", "10"))
+    SEARCH_SUMMARY_MAX_CHARS: int = int(os.getenv("SEARCH_SUMMARY_MAX_CHARS", "16000"))
     
     # --- 검색 파라미터 ---
-    INITIAL_SEARCH_SIZE: int = int(os.getenv("INITIAL_SEARCH_SIZE", 50))
-    FINAL_RESULT_SIZE: int = int(os.getenv("FINAL_RESULT_SIZE", 10))
+    INITIAL_SEARCH_SIZE: int = int(os.getenv("INITIAL_SEARCH_SIZE", 2000))
+    FINAL_RESULT_SIZE: int = int(os.getenv("FINAL_RESULT_SIZE", 6000))
+
+    # --- 인덱스 이름 ---
+    WELCOME_INDEX: str = os.getenv("WELCOME_INDEX", "welcome_all")  # 기본값: welcome_all (통합 인덱스)
 
     def validate(self):
         if self.ENABLE_CLAUDE_ANALYZER and not self.CLAUDE_API_KEY:
-            raise ValueError("ENABLE_CLAUDE_ANALYZER=True인 경우 CLAUDE_API_KEY가 필요합니다.")
+            logger.warning("ENABLE_CLAUDE_ANALYZER가 활성화되었지만 CLAUDE_API_KEY가 설정되지 않아 자동으로 비활성화합니다.")
+            self.ENABLE_CLAUDE_ANALYZER = False
         if self.CLAUDE_ANALYZER_TIMEOUT <= 0:
             raise ValueError("CLAUDE_ANALYZER_TIMEOUT 값은 1 이상이어야 합니다.")
         if self.SEARCH_CACHE_TTL_SECONDS < 0:
             raise ValueError("SEARCH_CACHE_TTL_SECONDS 값은 0 이상이어야 합니다.")
         if self.SEARCH_CACHE_MAX_RESULTS <= 0:
             raise ValueError("SEARCH_CACHE_MAX_RESULTS 값은 1 이상이어야 합니다.")
+        if self.FINAL_RESULT_SIZE <= 0:
+            raise ValueError("FINAL_RESULT_SIZE 값은 1 이상이어야 합니다.")
+        if self.SEARCH_CACHE_MAX_RESULTS < self.FINAL_RESULT_SIZE:
+            logger.warning(
+                "SEARCH_CACHE_MAX_RESULTS(%s)이 FINAL_RESULT_SIZE(%s)보다 작아 FINAL_RESULT_SIZE를 조정합니다.",
+                self.SEARCH_CACHE_MAX_RESULTS,
+                self.FINAL_RESULT_SIZE,
+            )
+            self.FINAL_RESULT_SIZE = self.SEARCH_CACHE_MAX_RESULTS
+        if self.CONVERSATION_HISTORY_TTL_SECONDS < 0:
+            raise ValueError("CONVERSATION_HISTORY_TTL_SECONDS 값은 0 이상이어야 합니다.")
+        if self.CONVERSATION_HISTORY_MAX_MESSAGES < 0:
+            raise ValueError("CONVERSATION_HISTORY_MAX_MESSAGES 값은 0 이상이어야 합니다.")
+        if self.SEARCH_HISTORY_TTL_SECONDS < 0:
+            raise ValueError("SEARCH_HISTORY_TTL_SECONDS 값은 0 이상이어야 합니다.")
+        if self.SEARCH_HISTORY_MAX_ENTRIES < 0:
+            raise ValueError("SEARCH_HISTORY_MAX_ENTRIES 값은 0 이상이어야 합니다.")
+        if self.SEARCH_SUMMARY_MAX_RESULTS <= 0:
+            raise ValueError("SEARCH_SUMMARY_MAX_RESULTS 값은 1 이상이어야 합니다.")
+        if self.SEARCH_SUMMARY_MAX_CHARS <= 0:
+            raise ValueError("SEARCH_SUMMARY_MAX_CHARS 값은 1 이상이어야 합니다.")
 
 # 싱글턴 인스턴스
 _config_instance: Config = None

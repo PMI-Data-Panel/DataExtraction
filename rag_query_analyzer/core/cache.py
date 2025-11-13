@@ -37,7 +37,7 @@ class LRUCachedAnalyzer:
         
         logger.info(f"LRUCachedAnalyzer 초기화 (크기: {self.cache_size})")
     
-    def _get_cache_key(self, query: str) -> str:
+    def _get_cache_key(self, query: str, use_claude: Optional[bool]) -> str:
         """쿼리의 캐시 키 생성
         
         Args:
@@ -48,9 +48,11 @@ class LRUCachedAnalyzer:
         """
         # 정규화: 공백 정리, 소문자 변환
         normalized = re.sub(r'\s+', ' ', query.lower().strip())
-        return hashlib.md5(normalized.encode()).hexdigest()
+        prefix = "1" if use_claude else "0"
+        digest = hashlib.md5(normalized.encode()).hexdigest()
+        return f"{prefix}:{digest}"
     
-    def get_cached(self, query: str) -> Optional[QueryAnalysis]:
+    def get_cached(self, query: str, use_claude: Optional[bool] = None) -> Optional[QueryAnalysis]:
         """캐시에서 분석 결과 가져오기
         
         Args:
@@ -59,7 +61,7 @@ class LRUCachedAnalyzer:
         Returns:
             캐시된 분석 결과 또는 None
         """
-        key = self._get_cache_key(query)
+        key = self._get_cache_key(query, use_claude)
         
         # 정확한 매칭
         if key in self.cache:
@@ -74,7 +76,7 @@ class LRUCachedAnalyzer:
             return result
         
         # 유사 쿼리 검색
-        similar_result = self._find_similar_cached(query)
+        similar_result = self._find_similar_cached(query, use_claude)
         if similar_result:
             self.hit_count += 1
             similar_result.cache_hit = True
@@ -84,7 +86,7 @@ class LRUCachedAnalyzer:
         self.miss_count += 1
         return None
     
-    def _find_similar_cached(self, query: str) -> Optional[QueryAnalysis]:
+    def _find_similar_cached(self, query: str, use_claude: Optional[bool]) -> Optional[QueryAnalysis]:
         """유사한 캐시된 쿼리 찾기
         
         Args:
@@ -111,6 +113,12 @@ class LRUCachedAnalyzer:
         for cache_key in candidate_keys:
             if cache_key not in self.cache:
                 continue
+            if use_claude is not None:
+                desired_flag = bool(use_claude)
+                candidate_flag = cache_key.startswith("1:")
+                if candidate_flag != desired_flag:
+                    continue
+                continue
             
             cached_analysis = self.cache[cache_key]
             
@@ -132,14 +140,14 @@ class LRUCachedAnalyzer:
         
         return best_match
     
-    def set_cached(self, query: str, analysis: QueryAnalysis):
+    def set_cached(self, query: str, analysis: QueryAnalysis, use_claude: Optional[bool] = None):
         """분석 결과 캐싱
         
         Args:
             query: 원본 쿼리
             analysis: 분석 결과
         """
-        key = self._get_cache_key(query)
+        key = self._get_cache_key(query, use_claude)
         
         # 이미 캐시에 있으면 끝으로 이동
         if key in self.cache:

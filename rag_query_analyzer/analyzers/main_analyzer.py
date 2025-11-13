@@ -1,11 +1,12 @@
 import time
 import logging
 import asyncio
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 from concurrent.futures import ThreadPoolExecutor
 
 from .base import BaseAnalyzer
 from .claude_analyzer import ClaudeAnalyzer
+from .demographic_extractor import DemographicExtractor
 from .semantic_analyzer import SemanticAnalyzer
 from .rule_analyzer import RuleBasedAnalyzer
 
@@ -74,16 +75,22 @@ class AdvancedRAGQueryAnalyzer:
     
     def _init_analyzers(self):
         """분석기 체인 초기화"""
+        self.rule_analyzer = RuleBasedAnalyzer()
+        self.semantic_analyzer = SemanticAnalyzer(self.config)
+        self.claude_analyzer = None
         self.analyzers = [
-            ("Claude", ClaudeAnalyzer(self.config)),
-            ("Semantic", SemanticAnalyzer(self.config)),
-            ("Rule", RuleBasedAnalyzer())
+            ("Semantic", self.semantic_analyzer),
+            ("Rule", self.rule_analyzer),
         ]
+        if self.config.ENABLE_CLAUDE_ANALYZER:
+            self.claude_analyzer = ClaudeAnalyzer(self.config)
+            self.analyzers.insert(0, ("Claude", self.claude_analyzer))
     
     def analyze_query(self, 
                      query: str, 
                      context: str = "",
-                     metadata: Dict = None) -> QueryAnalysis:
+                     metadata: Dict = None,
+                     use_claude: Optional[bool] = None) -> QueryAnalysis:
         """쿼리 분석 (메인 엔트리 포인트)
         
         Args:
@@ -97,14 +104,18 @@ class AdvancedRAGQueryAnalyzer:
         start_time = time.time()
         
         # 캐시 확인
+        if use_claude is None:
+            use_claude = self.config.ENABLE_CLAUDE_ANALYZER
+
         if self.cache:
-            cached = self.cache.get_cached(query)
+            cached = self.cache.get_cached(query, use_claude=use_claude)
             if cached:
                 cached.execution_time = time.time() - start_time
                 return cached
         
         # 폴백 체인으로 분석
-        analysis = self._analyze_with_fallback(query, context)
+        analysis = self._analyze_with_fallback(query, context, use_claude=use_claude)
+        analysis = self._normalize_analysis(analysis, query, context)
         
         # 과거 성능 데이터 활용
         optimal_params = self.query_optimizer.find_optimal_params(query)
@@ -117,11 +128,11 @@ class AdvancedRAGQueryAnalyzer:
         
         # 캐시 저장
         if self.cache:
-            self.cache.set_cached(query, analysis)
+            self.cache.set_cached(query, analysis, use_claude=use_claude)
         
         return analysis
     
-    def _analyze_with_fallback(self, query: str, context: str) -> QueryAnalysis:
+    def _analyze_with_fallback(self, query: str, context: str, use_claude: Optional[bool]) -> QueryAnalysis:
         """폴백 체인을 통한 분석
         
         Args:
@@ -131,7 +142,25 @@ class AdvancedRAGQueryAnalyzer:
         Returns:
             분석 결과
         """
-        for name, analyzer in self.analyzers:
+        pipeline: List[Tuple[str, BaseAnalyzer]] = []
+        if use_claude:
+            if self.claude_analyzer is None:
+                if not self.config.CLAUDE_API_KEY:
+                    logger.warning("Claude 분석기가 요청되었지만 CLAUDE_API_KEY가 설정되지 않았습니다. Claude 단계를 건너뜁니다.")
+                else:
+                    try:
+                        self.claude_analyzer = ClaudeAnalyzer(self.config)
+                    except Exception as exc:
+                        logger.warning(f"Claude 분석기 초기화 실패: {exc}")
+            if self.claude_analyzer is not None:
+                pipeline.append(("Claude", self.claude_analyzer))
+
+        pipeline.extend([
+            ("Semantic", self.semantic_analyzer),
+            ("Rule", self.rule_analyzer),
+        ])
+
+        for name, analyzer in pipeline:
             try:
                 logger.info(f"🔍 {name} 분석기 시도 중...")
                 analysis = analyzer.analyze(query, context)
@@ -353,6 +382,128 @@ class AdvancedRAGQueryAnalyzer:
         
         return stats
     
+    def _normalize_analysis(self, analysis: QueryAnalysis, query: str, context: str) -> QueryAnalysis:
+        """분석 결과 정규화 (행동 조건/불용어 보강)"""
+        if not analysis:
+            return analysis
+
+        # Rule 기반 불용어/행동 키워드
+        rule_analyzer = getattr(self, "rule_analyzer", None) or RuleBasedAnalyzer()
+        meta_lower = {kw.lower() for kw in rule_analyzer.meta_keywords}
+        behavior_lower = {kw.lower() for kw in rule_analyzer.behavior_keywords}
+        demographic_extractor = DemographicExtractor()
+
+        def _is_meta(term: str) -> bool:
+            lowered = term.lower()
+            if lowered in meta_lower:
+                return True
+            return any(kw in lowered for kw in meta_lower)
+
+        def _is_behavior(term: str) -> bool:
+            lowered = term.lower()
+            if lowered in behavior_lower:
+                return True
+            return any(kw in lowered for kw in behavior_lower)
+
+        # must_terms 정리
+        sanitized_must: List[str] = []
+        removed_behavior_terms: List[str] = []
+        removed_demographic_terms: List[str] = []
+        for term in analysis.must_terms:
+            if not term:
+                continue
+            if _is_meta(term):
+                continue
+            if _is_behavior(term):
+                removed_behavior_terms.append(term)
+                continue
+            sanitized_must.append(term)
+
+        # should_terms 정리
+        sanitized_should: List[str] = []
+        for term in analysis.should_terms:
+            if not term or _is_meta(term):
+                continue
+            if _is_behavior(term):
+                removed_behavior_terms.append(term)
+                continue
+            sanitized_should.append(term)
+
+        # Demographics 추출 및 제거
+        demographics = demographic_extractor.extract(query)
+        demographic_tokens: Set[str] = set()
+        for entity in demographics.demographics:
+            demographic_tokens.add(entity.raw_value.lower())
+            demographic_tokens.add(entity.value.lower())
+            for syn in entity.synonyms:
+                demographic_tokens.add(str(syn).lower())
+
+        if demographic_tokens:
+            sanitized_must = [
+                term for term in sanitized_must
+                if term.lower() not in demographic_tokens
+            ]
+            sanitized_should = [
+                term for term in sanitized_should
+                if term.lower() not in demographic_tokens
+            ]
+            removed_demographic_terms = [
+                term for term in analysis.must_terms + analysis.should_terms
+                if term and term.lower() in demographic_tokens
+            ]
+
+        # 행동 조건 보강 (Rule 분석 결과와 병합) - must/should 할당 전에 먼저 수행
+        if not analysis.behavioral_conditions:
+            try:
+                rule_analysis = rule_analyzer.analyze(query, context)
+                if rule_analysis.behavioral_conditions:
+                    analysis.behavioral_conditions = dict(rule_analysis.behavioral_conditions)
+            except Exception as exc:
+                logger.debug(f"Rule 분석 보강 실패: {exc}")
+
+        # 행동 키워드 처리:
+        # - behavioral_conditions가 있으면: 완전 제거 (OpenSearch 필터로 처리됨)
+        # - behavioral_conditions가 없으면: should_terms로 완화 (의미 검색)
+        if removed_behavior_terms:
+            if not analysis.behavioral_conditions:
+                # behavioral_conditions가 없으면 should_terms로 완화
+                existing_should_lower = {term.lower() for term in sanitized_should}
+                for term in removed_behavior_terms:
+                    lowered = term.lower()
+                    if lowered in existing_should_lower:
+                        continue
+                    sanitized_should.append(term)
+                    existing_should_lower.add(lowered)
+                logger.info(f"⚠️ Behavioral conditions 없음 → 행동 키워드를 should_terms로 완화: {removed_behavior_terms}")
+            else:
+                # behavioral_conditions가 있으면 완전 제거 (필터로 처리됨)
+                logger.info(f"✅ Behavioral conditions 있음 → 행동 키워드 제거: {removed_behavior_terms}")
+
+        # 정리된 리스트 반영 (입력 순서 유지)
+        def _dedupe(items: List[str]) -> List[str]:
+            seen = set()
+            ordered: List[str] = []
+            for item in items:
+                lowered = item.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                ordered.append(item)
+            return ordered
+
+        analysis.must_terms = _dedupe(sanitized_must)
+        analysis.should_terms = _dedupe(sanitized_should)
+
+        # Demographics 정보 저장 (이제 정식 필드이므로 type: ignore 불필요)
+        analysis.demographic_entities = demographics.demographics
+        analysis.removed_demographic_terms = removed_demographic_terms
+
+        logger.info(f"🔍 Demographics 추출 완료: {len(demographics.demographics)}개")
+        if removed_demographic_terms:
+            logger.info(f"   ❌ 제거된 Demographics 키워드: {removed_demographic_terms}")
+
+        return analysis
+
     def _create_default_analysis(self, query: str) -> QueryAnalysis:
         """기본 분석 결과 생성
         
@@ -372,6 +523,7 @@ class AdvancedRAGQueryAnalyzer:
             confidence=0.1,
             explanation="기본 분석 (폴백)",
             analyzer_used="default",
-            fallback_used=True
+            fallback_used=True,
+            behavioral_conditions={},
         )
 
