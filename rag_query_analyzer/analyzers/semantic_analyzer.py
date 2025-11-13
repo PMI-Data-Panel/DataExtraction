@@ -89,7 +89,8 @@ class SemanticAnalyzer(BaseAnalyzer):  # 전부다 벡터값을 넣는게 아니
             explanation=f"의미론적 분석 완료 (의도: {semantic_intent})",
             reasoning_steps=reasoning_steps,
             semantic_intent=semantic_intent,
-            analyzer_used=self.get_name()
+            analyzer_used=self.get_name(),
+            behavioral_conditions={},
         )
     
     def _calculate_alpha(self, intent: str, confidence: float) -> float:
@@ -125,6 +126,7 @@ class SemanticAnalyzer(BaseAnalyzer):  # 전부다 벡터값을 넣는게 아니
             expanded_keywords={},
             confidence=0.0,
             explanation="유효하지 않은 쿼리",
-            analyzer_used=self.get_name()
+            analyzer_used=self.get_name(),
+            behavioral_conditions={},
         )
 

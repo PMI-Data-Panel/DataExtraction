@@ -109,9 +109,12 @@ class DemographicType(str, Enum):
     GENDER = "gender"
     REGION = "region"
     OCCUPATION = "occupation"
+    JOB_FUNCTION = "job_function"
     EDUCATION = "education"
     INCOME = "income"
     MARITAL_STATUS = "marital_status"
+    FAMILY_SIZE = "family_size"
+    CHILDREN_COUNT = "children_count"
 
 
 class BaseEntity(BaseModel):
@@ -188,24 +191,32 @@ class DemographicEntity(BaseEntity):
         # answer_text와 answer를 하나의 multi_match로 통합 (중복 제거)
         answer_should = []
         
-        # 각 값에 대해 multi_match 사용 (answer_text와 answer 동시 검색)
+        # 각 값에 대해 multi_match 사용 (answer와 answer_text 동시 검색)
         for value in unique_values:
             if value:
-                # multi_match: answer_text와 answer를 동시에 검색 (중복 제거)
+                # ⚠️ Demographics는 정확한 매칭 필요 → match_phrase 우선!
+                # match_phrase: 정확한 구문 매칭 (answer와 answer_text 모두)
                 answer_should.append({
-                    "multi_match": {
-                        "query": value,
-                        "fields": ["qa_pairs.answer_text^1.0", "qa_pairs.answer^0.8"],  # answer_text에 약간 더 가중치
-                        "type": "best_fields",  # 가장 높은 점수 사용
-                        "operator": "or"  # 단어 단위 매칭
+                    "match_phrase": {
+                        "qa_pairs.answer": value
                     }
                 })
-                # match_phrase: 정확한 구문 매칭 (answer_text만, answer는 생략하여 중복 제거)
                 answer_should.append({
                     "match_phrase": {
                         "qa_pairs.answer_text": value
                     }
                 })
+                # multi_match는 fallback으로만 사용 (긴 값의 경우 부분 매칭 허용)
+                # 하지만 operator는 "and"로 엄격하게
+                if len(value) > 5:  # 긴 값만 multi_match 사용
+                    answer_should.append({
+                        "multi_match": {
+                            "query": value,
+                            "fields": ["qa_pairs.answer^1.0", "qa_pairs.answer_text^0.8"],
+                            "type": "best_fields",
+                            "operator": "and"  # ✅ 모든 단어 포함되어야 함
+                        }
+                    })
         
         # 연령대의 경우: 출생년도 범위도 추가 (예: "30대" → 1985-1994)
         # 최적화: 출생년도를 하나의 terms 쿼리로 통합
@@ -271,29 +282,41 @@ class DemographicEntity(BaseEntity):
             DemographicType.AGE: {
                 "field": "metadata.age_group.keyword",
                 "qa_questions": [
-                    "출생년도",  # welcome_1st: "귀하의 출생년도는 어떻게 되십니까?"
+                    "출생년도",
+                    "귀하의 출생년도는 어떻게 되십니까?",
+                    "연령",
+                    "나이",
                     "출생", "연령", "나이", "연령대", "age", "생년월일"
                 ]
             },
             DemographicType.GENDER: {
                 "field": "metadata.gender.keyword",
                 "qa_questions": [
-                    "성별",  # welcome_1st: "귀하의 성별은"
-                    "gender"
+                    "성별",
+                    "gender",
+                    "귀하의 성별은",
+                    "귀하의 성별은 무엇입니까?",
+                    "귀하의 성별은 무엇인가요?"
                 ]
             },
             DemographicType.OCCUPATION: {
                 "field": "metadata.occupation.keyword",
                 "qa_questions": [
                     "직업",  # welcome_2nd: "직업"
-                    "직무",  # welcome_2nd: "직무"
                     "occupation", "직종"
+                ]
+            },
+            DemographicType.JOB_FUNCTION: {
+                "field": "metadata.job_function.keyword",
+                "qa_questions": [
+                    "직무",  # welcome_2nd: "직무"
+                    "job_function", "담당 업무", "업무"
                 ]
             },
             DemographicType.REGION: {
                 "field": "metadata.region.keyword",
                 "qa_questions": [
-                    "지역",  # welcome_1st: "회원님께서 현재 살고 계신 지역은 어디인가요?"
+                    "지역",
                     "거주지", "주소", "region"
                 ]
             },
@@ -302,6 +325,35 @@ class DemographicEntity(BaseEntity):
                 "qa_questions": [
                     "최종학력",  # welcome_2nd: "최종학력"
                     "학력", "education", "학위"
+                ]
+            },
+            DemographicType.MARITAL_STATUS: {
+                "field": "metadata.marital_status.keyword",
+                "qa_questions": [
+                    "결혼여부",  # welcome_2nd: "결혼여부"
+                    "결혼 여부", "혼인", "marital"
+                ]
+            },
+            DemographicType.INCOME: {
+                "field": "metadata.income.keyword",
+                "qa_questions": [
+                    "월평균 개인소득",  # welcome_2nd: "월평균 개인소득"
+                    "월평균 가구소득",  # welcome_2nd: "월평균 가구소득"
+                    "소득", "income", "급여", "연봉"
+                ]
+            },
+            DemographicType.FAMILY_SIZE: {
+                "field": "metadata.family_size.keyword",
+                "qa_questions": [
+                    "가족수",  # welcome_2nd: "가족수"
+                    "가족 수", "family_size", "가구원수"
+                ]
+            },
+            DemographicType.CHILDREN_COUNT: {
+                "field": "metadata.children_count.keyword",
+                "qa_questions": [
+                    "자녀수",  # welcome_2nd: "자녀수"
+                    "자녀 수", "children", "아이 수"
                 ]
             },
         }

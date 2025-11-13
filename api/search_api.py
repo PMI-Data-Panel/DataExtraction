@@ -3,10 +3,13 @@ import asyncio
 import json
 import logging
 import hashlib
+import re
 from collections import defaultdict, OrderedDict
 from time import perf_counter
-from typing import List, Dict, Any, Optional, Set, Tuple
-from fastapi import APIRouter, HTTPException, Depends
+from datetime import datetime, timezone
+from uuid import uuid4
+from typing import List, Dict, Any, Optional, Set, Tuple, Literal
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 from opensearchpy import OpenSearch
 
@@ -40,6 +43,437 @@ _welcome_cache: Dict[str, OrderedDict] = {
     "s_welcome_1st": OrderedDict(),
     "s_welcome_2nd": OrderedDict(),
 }
+
+_SUMMARY_RESPONSE_TEMPLATE = (
+    "{\n"
+    '  "highlights": ["요약1", "요약2", "요약3"],\n'
+    '  "demographic_summary": "주요 인구통계 인사이트",\n'
+    '  "behavioral_summary": "주요 행동/습관 인사이트",\n'
+    '  "data_signals": ["주요 수치나 패턴"],\n'
+    '  "follow_up_questions": ["후속으로 탐색하면 좋을 질문"]\n'
+    "}"
+)
+
+_DEFAULT_SUMMARY_INSTRUCTIONS = (
+    "검색 결과를 분석하여 사용자에게 도움이 되는 핵심 인사이트를 한국어로 제공하세요. "
+    "정량적 지표(응답자 수, 비율 등)가 있을 경우 명시하고, 데이터의 편향이나 한계도 언급하세요."
+)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=timezone.utc).isoformat()
+
+
+def _truncate_text(value: Any, max_length: int = 4000) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 3] + "..."
+
+
+def _redis_list_append(
+    client,
+    key: str,
+    payload: Dict[str, Any],
+    max_length: Optional[int],
+    ttl_seconds: Optional[int],
+) -> None:
+    if not client or not key:
+        return
+    try:
+        serialized = json.dumps(payload, ensure_ascii=False, default=str)
+        pipeline = client.pipeline()
+        pipeline.rpush(key, serialized)
+        if max_length and max_length > 0:
+            pipeline.ltrim(key, -max_length, -1)
+        if ttl_seconds and ttl_seconds > 0:
+            pipeline.expire(key, ttl_seconds)
+        pipeline.execute()
+    except Exception as exc:
+        logger.warning(f"⚠️ Redis 리스트 업데이트 실패: key={key}, error={exc}")
+
+
+def _make_conversation_key(prefix: Optional[str], session_id: Optional[str]) -> Optional[str]:
+    if not prefix or not session_id:
+        return None
+    return f"{prefix}:{session_id}"
+
+
+def _make_history_key(prefix: Optional[str], owner_id: Optional[str]) -> Optional[str]:
+    if not prefix or not owner_id:
+        return None
+    return f"{prefix}:{owner_id}"
+
+
+def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    try:
+        fenced = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+        if fenced:
+            return json.loads(fenced.group(1))
+        fallback = re.search(r"\{.*\}", text, re.DOTALL)
+        if fallback:
+            return json.loads(fallback.group(0))
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _ensure_request_defaults(request: Any) -> None:
+    """요청에 필수 기본값을 채워 사용자가 query만 보내도 동작하도록 보정."""
+    session_id = getattr(request, "session_id", None)
+    if not session_id:
+        session_id = str(uuid4())
+        request.session_id = session_id
+
+    user_id = getattr(request, "user_id", None)
+    if not user_id:
+        request.user_id = session_id
+
+    # 모든 보조 기능 기본 활성화
+    request.log_conversation = True
+    request.log_search_history = True
+    request.request_llm_summary = True
+
+def _prepare_summary_results(
+    results: List["SearchResult"],
+    max_results: int,
+    max_chars: int,
+) -> List[Dict[str, Any]]:
+    trimmed: List[Dict[str, Any]] = []
+    total_chars = 0
+    for idx, result in enumerate(results[:max_results], start=1):
+        if hasattr(result, "model_dump"):
+            item = result.model_dump()
+        elif isinstance(result, dict):
+            item = result
+        else:
+            continue
+
+        item_copy = {
+            "rank": idx,
+            "user_id": item.get("user_id"),
+            "score": item.get("score"),
+            "timestamp": item.get("timestamp"),
+            "demographic_info": item.get("demographic_info"),
+            "behavioral_info": item.get("behavioral_info"),
+            "qa_pairs": (item.get("qa_pairs") or [])[:3],
+            "matched_qa_pairs": (item.get("matched_qa_pairs") or [])[:3],
+            "highlights": item.get("highlights"),
+        }
+
+        serialized = json.dumps(item_copy, ensure_ascii=False)
+        prospective_total = total_chars + len(serialized)
+        if prospective_total > max_chars and trimmed:
+            break
+        trimmed.append(item_copy)
+        total_chars = prospective_total
+    return trimmed
+
+
+def _maybe_generate_llm_summary(
+    *,
+    request,
+    response: "SearchResponse",
+    analysis,
+) -> Optional[Dict[str, Any]]:
+    if not getattr(request, "request_llm_summary", False):
+        return None
+
+    if not getattr(router, "enable_search_summary", False):
+        logger.info("LLM 요약 비활성화 설정으로 인해 요약을 건너뜁니다.")
+        return None
+
+    client = getattr(router, "anthropic_client", None)
+    if client is None:
+        logger.warning("Anthropic 클라이언트가 설정되지 않아 LLM 요약을 건너뜁니다.")
+        return None
+
+    config = getattr(router, "config", None)
+    if config is None:
+        logger.warning("Config 설정이 없어 LLM 요약을 건너뜁니다.")
+        return None
+
+    model_name = getattr(router, "search_summary_model", None) or config.CLAUDE_MODEL
+    if not model_name:
+        logger.warning("요약에 사용할 모델명이 설정되지 않아 LLM 요약을 건너뜁니다.")
+        return None
+
+    max_results = getattr(router, "search_summary_max_results", 10)
+    max_chars = getattr(router, "search_summary_max_chars", 16000)
+    prepared_results = _prepare_summary_results(response.results, max_results, max_chars)
+    if not prepared_results:
+        logger.info("LLM 요약을 위한 결과가 없어 요약을 건너뜁니다.")
+        return None
+
+    instructions = getattr(request, "llm_summary_instructions", None) or _DEFAULT_SUMMARY_INSTRUCTIONS
+
+    prompt = (
+        "당신은 설문조사 데이터 분석 전문가입니다. "
+        "주어진 검색 결과를 바탕으로 사용자의 질문에 대한 인사이트를 제공하세요.\n\n"
+        f"사용자 질의: {request.query}\n"
+        f"예상 검색 의도: {getattr(analysis, 'intent', 'N/A')}\n"
+        f"추출된 must_terms: {getattr(analysis, 'must_terms', [])}\n"
+        f"추출된 should_terms: {getattr(analysis, 'should_terms', [])}\n"
+        f"총 검색 결과 수: {response.total_hits}\n"
+        f"현재 반환된 결과 수: {len(response.results)}\n\n"
+        f"요약 지침: {instructions}\n\n"
+        "검색 결과(최대 일부) JSON:\n"
+        f"{json.dumps(prepared_results, ensure_ascii=False, indent=2)}\n\n"
+        "응답은 반드시 JSON 형식으로 작성하세요. 형식 예시는 다음과 같습니다:\n"
+        f"{_SUMMARY_RESPONSE_TEMPLATE}\n"
+    )
+
+    max_tokens = min(1200, getattr(config, "CLAUDE_MAX_TOKENS", 1500))
+    temperature = getattr(config, "CLAUDE_TEMPERATURE", 0.1)
+
+    try:
+        message = client.messages.create(
+            model=model_name,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = ""
+        if message and getattr(message, "content", None):
+            parts = getattr(message, "content", [])
+            if parts:
+                # Anthropics SDK returns list of blocks with .text
+                first = parts[0]
+                content = getattr(first, "text", "") or ""
+        summary_json = _extract_json_from_text(content)
+        if summary_json is None:
+            logger.warning("LLM 요약 응답에서 JSON을 추출하지 못했습니다.")
+            return {
+                "model": model_name,
+                "generated_at": _utc_now_iso(),
+                "raw_text": content,
+            }
+        return {
+            "model": model_name,
+            "generated_at": _utc_now_iso(),
+            "summary": summary_json,
+        }
+    except Exception as exc:
+        logger.warning(f"⚠️ LLM 요약 생성 실패: {exc}")
+        return None
+
+
+def _extract_response_timings(response: "SearchResponse", fallback: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if response.query_analysis and isinstance(response.query_analysis, dict):
+        timings = response.query_analysis.get("timings_ms")
+        if isinstance(timings, dict):
+            return timings
+    return fallback or {}
+
+
+def _persist_search_logs(
+    *,
+    request,
+    response: "SearchResponse",
+    analysis,
+    cache_hit: bool,
+    timings: Dict[str, Any],
+) -> None:
+    client = getattr(router, "redis_client", None)
+    if client is None:
+        return
+
+    timestamp = _utc_now_iso()
+    session_id = getattr(request, "session_id", None)
+    user_id = getattr(request, "user_id", None)
+    request_id = getattr(request, "request_id", None)
+    request_metadata = getattr(request, "metadata", None)
+    conversation_prefix = getattr(router, "conversation_history_prefix", None)
+    conversation_ttl = getattr(router, "conversation_history_ttl_seconds", None)
+    conversation_max = getattr(router, "conversation_history_max_messages", None)
+    search_history_prefix = getattr(router, "search_history_prefix", None)
+    search_history_ttl = getattr(router, "search_history_ttl_seconds", None)
+    search_history_max = getattr(router, "search_history_max_entries", None)
+
+    top_user_ids = [
+        getattr(result, "user_id", None) for result in (response.results or [])[:5]
+        if getattr(result, "user_id", None)
+    ]
+
+    if getattr(request, "log_conversation", True):
+        conversation_key = _make_conversation_key(conversation_prefix, session_id)
+        if conversation_key:
+            user_entry = {
+                "role": "user",
+                "timestamp": timestamp,
+                "content": _truncate_text(request.query, 4000),
+                "session_id": session_id,
+                "user_id": user_id,
+                "request_id": request_id,
+                "metadata": request_metadata,
+            }
+            _redis_list_append(client, conversation_key, user_entry, conversation_max, conversation_ttl)
+
+            assistant_payload: Dict[str, Any] = {
+                "total_hits": response.total_hits,
+                "returned_count": len(response.results or []),
+                "cache_hit": cache_hit,
+                "top_user_ids": top_user_ids,
+            }
+            if response.llm_summary:
+                assistant_payload["llm_summary"] = response.llm_summary
+
+            assistant_entry = {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": _truncate_text(assistant_payload, 4000),
+                "session_id": session_id,
+                "user_id": user_id,
+                "request_id": request_id,
+            }
+            _redis_list_append(client, conversation_key, assistant_entry, conversation_max, conversation_ttl)
+
+    if getattr(request, "log_search_history", True):
+        owner_id = user_id or session_id or "default"
+        history_key = _make_history_key(search_history_prefix, owner_id)
+        if history_key:
+            history_entry = {
+                "timestamp": timestamp,
+                "user_id": user_id,
+                "session_id": session_id,
+                "request_id": request_id,
+                "query": request.query,
+                "intent": getattr(analysis, "intent", None),
+                "must_terms": getattr(analysis, "must_terms", []),
+                "should_terms": getattr(analysis, "should_terms", []),
+                "page": response.page,
+                "page_size": response.page_size,
+                "total_hits": response.total_hits,
+                "returned_count": len(response.results or []),
+                "cache_hit": cache_hit,
+                "timings": timings,
+                "top_user_ids": top_user_ids,
+                "llm_summary": response.llm_summary,
+                "metadata": request_metadata,
+            }
+            _redis_list_append(client, history_key, history_entry, search_history_max, search_history_ttl)
+
+
+class ConversationMessage(BaseModel):
+    role: str
+    timestamp: str
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
+    request_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    content: Any
+
+
+class SearchHistoryEntry(BaseModel):
+    timestamp: str
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    request_id: Optional[str] = None
+    query: str
+    intent: Optional[str] = None
+    must_terms: List[str] = Field(default_factory=list)
+    should_terms: List[str] = Field(default_factory=list)
+    page: int
+    page_size: int
+    total_hits: int
+    returned_count: int
+    cache_hit: bool
+    timings: Dict[str, Any] = Field(default_factory=dict)
+    top_user_ids: List[str] = Field(default_factory=list)
+    llm_summary: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+def _parse_conversation_record(item: str) -> Optional[ConversationMessage]:
+    if not item:
+        return None
+    try:
+        payload = json.loads(item)
+    except Exception as exc:
+        logger.warning(f"⚠️ 대화 로그 JSON 파싱 실패: {exc}")
+        return None
+
+    content = payload.get("content")
+    if payload.get("role") == "assistant" and isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except Exception:
+            pass
+    return ConversationMessage(
+        role=payload.get("role"),
+        timestamp=payload.get("timestamp"),
+        session_id=payload.get("session_id"),
+        user_id=payload.get("user_id"),
+        request_id=payload.get("request_id"),
+        metadata=payload.get("metadata"),
+        content=content,
+    )
+
+
+def _parse_search_history_record(item: str) -> Optional[SearchHistoryEntry]:
+    if not item:
+        return None
+    try:
+        payload = json.loads(item)
+    except Exception as exc:
+        logger.warning(f"⚠️ 검색 이력 JSON 파싱 실패: {exc}")
+        return None
+
+    llm_summary = payload.get("llm_summary")
+    if isinstance(llm_summary, str):
+        try:
+            llm_summary = json.loads(llm_summary)
+        except Exception:
+            pass
+
+    return SearchHistoryEntry(
+        timestamp=payload.get("timestamp"),
+        user_id=payload.get("user_id"),
+        session_id=payload.get("session_id"),
+        request_id=payload.get("request_id"),
+        query=payload.get("query", ""),
+        intent=payload.get("intent"),
+        must_terms=payload.get("must_terms") or [],
+        should_terms=payload.get("should_terms") or [],
+        page=payload.get("page", 1),
+        page_size=payload.get("page_size", 10),
+        total_hits=payload.get("total_hits", 0),
+        returned_count=payload.get("returned_count", 0),
+        cache_hit=bool(payload.get("cache_hit")),
+        timings=payload.get("timings") or {},
+        top_user_ids=payload.get("top_user_ids") or [],
+        llm_summary=llm_summary,
+        metadata=payload.get("metadata"),
+    )
+
+
+def _finalize_search_response(
+    *,
+    request,
+    response: "SearchResponse",
+    analysis,
+    cache_hit: bool,
+    timings: Optional[Dict[str, Any]] = None,
+) -> "SearchResponse":
+    summary_payload = _maybe_generate_llm_summary(
+        request=request,
+        response=response,
+        analysis=analysis,
+    )
+    if summary_payload:
+        response = response.model_copy(update={"llm_summary": summary_payload})
+
+    effective_timings = _extract_response_timings(response, timings)
+    _persist_search_logs(
+        request=request,
+        response=response,
+        analysis=analysis,
+        cache_hit=cache_hit,
+        timings=effective_timings,
+    )
+    return response
 
 
 def _cache_get_welcome_doc(index_name: str, user_id: str) -> Optional[Dict[str, Any]]:
@@ -126,10 +560,12 @@ def _make_cache_key(
     index_name: str,
     page_size: int,
     use_vector: bool,
+    use_claude: bool,
     must_terms: List[str],
     should_terms: List[str],
     must_not_terms: List[str],
     filters_signature: Optional[str] = None,
+    behavior_signature: Optional[str] = None,
 ) -> str:
     """생성된 검색 결과를 재사용하기 위한 캐시 키 생성 (안정화)"""
     stable_must = sorted(must_terms) if must_terms else []
@@ -141,10 +577,12 @@ def _make_cache_key(
         "index": index_name,
         "page_size": page_size,
         "use_vector": use_vector,
+        "use_claude": bool(use_claude),
         "must_terms": stable_must,
         "should_terms": stable_should,
         "must_not_terms": stable_must_not,
         "filters_signature": filters_signature or "",
+        "behavior_signature": behavior_signature or "",
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -154,6 +592,8 @@ def _make_cache_key(
     logger.debug(f"   - must_terms: {stable_must}")
     logger.debug(f"   - should_terms: {stable_should}")
     logger.debug(f"   - filters_signature: {(filters_signature or '')[:100]}...")
+    logger.debug(f"   - behavior_signature: {(behavior_signature or '')[:100]}...")
+    logger.debug(f"   - use_claude: {bool(use_claude)}")
 
     return key
 
@@ -202,8 +642,14 @@ def _build_cached_response(
     max_score = payload.get("max_score", 0.0)
     serialized_items = payload.get("items", [])
 
-    page_results, has_more_local = _slice_results(serialized_items, request.page, request.size)
-    has_more = has_more_local and ((request.page * request.size) < total_hits)
+    cached_page_size = payload.get("page_size")
+    request_page_size = getattr(request, "size", None)
+    if request_page_size is None:
+        request_page_size = getattr(request, "page_size", None)
+    page_size = cached_page_size or request_page_size or max(len(serialized_items), 1)
+
+    page_results, has_more_local = _slice_results(serialized_items, request.page, page_size)
+    has_more = has_more_local and ((request.page * page_size) < total_hits)
     total_duration_ms = (perf_counter() - overall_start) * 1000
 
     timings = {
@@ -218,8 +664,10 @@ def _build_cached_response(
         "alpha": analysis.alpha,
         "confidence": analysis.confidence,
         "filters": filters_for_response,
-        "size": request.size,
+        "size": page_size,
         "timings_ms": timings,
+        "behavioral_conditions": payload.get("behavioral_conditions", {}),
+        "use_claude_analyzer": bool(payload.get("use_claude", False)),
     }
     if extracted_entities_dict is not None:
         query_analysis["extracted_entities"] = extracted_entities_dict
@@ -232,9 +680,55 @@ def _build_cached_response(
         query_analysis=query_analysis,
         took_ms=int(total_duration_ms),
         page=request.page,
-        page_size=request.size,
+        page_size=page_size,
         has_more=has_more,
     )
+
+
+def _log_final_summary(
+    *,
+    stage: str,
+    query: str,
+    analysis,
+    total_hits: int,
+    returned_count: int,
+    page: int,
+    page_size: int,
+    cache_hit: bool,
+    timings: Dict[str, Any],
+    took_ms: Optional[float],
+    filters: Optional[List[Dict[str, Any]]],
+    behavioral_conditions: Optional[Dict[str, Any]],
+    use_claude: Optional[bool] = None,
+) -> None:
+    """검색 종료 시 핵심 정보를 한 번 더 요약 출력."""
+    intent = getattr(analysis, "intent", None)
+    must_terms = getattr(analysis, "must_terms", [])
+    should_terms = getattr(analysis, "should_terms", [])
+    filter_count = len(filters or [])
+    behavior_info = behavioral_conditions or {}
+    important_timings = {k: round(v, 2) if isinstance(v, (int, float)) else v for k, v in (timings or {}).items()}
+
+    lines = [
+        "",
+        "🔚 최종 요약 (핵심)",
+        f" • stage: {stage}",
+        f" • query: {query}",
+        f" • intent: {intent}",
+        f" • must_terms: {must_terms}",
+        f" • should_terms: {should_terms}",
+        f" • behavioral_conditions: {behavior_info}",
+        f" • filters: {filter_count}개",
+        f" • returned/total: {returned_count}/{total_hits}",
+        f" • page: {page} / page_size: {page_size}",
+        f" • cache_hit: {cache_hit}",
+        f" • timings: {important_timings}",
+        f" • total_ms: {round(took_ms, 2) if took_ms is not None else 'N/A'}",
+    ]
+    if use_claude is not None:
+        lines.append(f" • use_claude_analyzer: {use_claude}")
+
+    logger.info("\n".join(lines))
 
 
 def build_occupation_dsl_filter(occupation_entities: List["DemographicEntity"]) -> Dict[str, Any]:
@@ -401,6 +895,12 @@ def _collect_text_from_doc(doc: Dict[str, Any]) -> str:
 
 
 def contains_must_terms(doc: Dict[str, Any], must_terms: List[str]) -> bool:
+    """
+    ⚠️ Deprecated: OpenSearch 쿼리에서 must 조건 처리로 대체됨
+    성능 향상을 위해 Python 레벨 검증은 제거됨 (하이브리드 검색 최적화)
+
+    레거시 코드 호환성을 위해 유지, 사용 권장하지 않음
+    """
     if not must_terms:
         return True
 
@@ -505,6 +1005,100 @@ def extract_inner_hit_matches(hit: Dict[str, Any]) -> List[Dict[str, Any]]:
     return collected
 
 
+def extract_behavioral_qa_pairs(
+    source: Dict[str, Any],
+    behavioral_conditions: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Behavioral 조건에 매칭된 qa_pairs 추출
+
+    Args:
+        source: OpenSearch 문서 _source (또는 qa_pairs만 포함된 dict)
+        behavioral_conditions: {"smoker": True, "has_vehicle": True, ...}
+
+    Returns:
+        매칭된 qa_pairs 리스트
+        [
+            {
+                "condition_type": "smoker",
+                "condition_value": True,
+                "q_text": "귀하는 흡연을 하십니까?",
+                "answer": "흡연함",
+                "confidence": 1.0
+            },
+            ...
+        ]
+    """
+    qa_pairs = source.get('qa_pairs', [])
+    if not qa_pairs or not behavioral_conditions:
+        return []
+
+    matched = []
+
+    # 조건별 키워드 매핑
+    CONDITION_KEYWORDS = {
+        'smoker': ['흡연', '담배', '피우', '피움'],
+        'has_vehicle': ['차량', '차', '자동차', '보유차량'],
+        'alcohol_preference': ['주류', '음주', '술', '맥주', '소주', '와인', '막걸리'],
+        'exercise_frequency': ['운동', '헬스', '체육'],
+        'pet_ownership': ['반려동물', '펫', '애완동물', '강아지', '고양이'],
+    }
+
+    for condition_type, condition_value in behavioral_conditions.items():
+        # 이 조건에 해당하는 키워드들
+        keywords = CONDITION_KEYWORDS.get(condition_type, [])
+        if not keywords:
+            continue
+
+        # qa_pairs에서 이 조건에 해당하는 질문 찾기
+        for qa in qa_pairs:
+            q_text = qa.get('q_text', '').lower()
+            answer = qa.get('answer', '')
+
+            # 키워드 매칭
+            if any(kw in q_text for kw in keywords):
+                # Boolean 조건 (smoker, has_vehicle)
+                if isinstance(condition_value, bool):
+                    answer_lower = answer.lower()
+                    is_positive = any(pos in answer_lower for pos in BEHAVIOR_YES_TOKENS)
+                    is_negative = any(neg in answer_lower for neg in BEHAVIOR_NO_TOKENS)
+
+                    # 조건값과 답변이 일치하는지 확인
+                    if condition_value and is_positive:
+                        matched.append({
+                            'condition_type': condition_type,
+                            'condition_value': condition_value,
+                            'q_text': qa.get('q_text', ''),
+                            'answer': answer,
+                            'confidence': 1.0
+                        })
+                        break  # 이 조건에 대해 하나만
+                    elif not condition_value and is_negative:
+                        matched.append({
+                            'condition_type': condition_type,
+                            'condition_value': condition_value,
+                            'q_text': qa.get('q_text', ''),
+                            'answer': answer,
+                            'confidence': 1.0
+                        })
+                        break
+
+                # String 조건 (alcohol_preference)
+                else:
+                    # 답변에 조건값이 포함되어 있으면 매칭
+                    if str(condition_value).lower() in answer.lower():
+                        matched.append({
+                            'condition_type': condition_type,
+                            'condition_value': condition_value,
+                            'q_text': qa.get('q_text', ''),
+                            'answer': answer,
+                            'confidence': 0.8
+                        })
+                        break
+
+    return matched
+
+
 def reorder_with_matches(full_list: List[Dict[str, Any]], matched: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     if not isinstance(full_list, list):
         return []
@@ -546,6 +1140,42 @@ class SearchRequest(BaseModel):
     size: int = Field(default=10, ge=1, le=100, description="반환할 결과 개수")
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
     page: int = Field(default=1, ge=1, description="요청할 페이지 번호 (1부터 시작)")
+    use_claude_analyzer: Optional[bool] = Field(
+        default=None,
+        description="Claude 분석기 사용 여부 (None이면 서버 설정값을 따름)"
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="대화/세션 식별자 (Redis 대화 로그 키)"
+    )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="요청 사용자 식별자 (검색 이력 키)"
+    )
+    request_id: Optional[str] = Field(
+        default=None,
+        description="요청 추적을 위한 ID"
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="추가 요청 메타데이터"
+    )
+    log_conversation: bool = Field(
+        default=True,
+        description="Redis 대화 로그 저장 여부"
+    )
+    log_search_history: bool = Field(
+        default=True,
+        description="Redis 검색 이력 저장 여부"
+    )
+    request_llm_summary: bool = Field(
+        default=False,
+        description="LLM 요약/분석 생성 요청 여부"
+    )
+    llm_summary_instructions: Optional[str] = Field(
+        default=None,
+        description="LLM 요약 시 사용할 추가 지침"
+    )
 
 
 class SearchResult(BaseModel):
@@ -554,6 +1184,7 @@ class SearchResult(BaseModel):
     score: float
     timestamp: Optional[str] = None
     demographic_info: Optional[Dict[str, Any]] = Field(default=None, description="인구통계 정보 (welcome_1st, welcome_2nd에서 조회)")
+    behavioral_info: Optional[Dict[str, Any]] = Field(default=None, description="행동/습관 정보 (예: 흡연 여부, 차량 보유 여부)")
     qa_pairs: Optional[List[Dict[str, Any]]] = None
     matched_qa_pairs: Optional[List[Dict[str, Any]]] = None
     highlights: Optional[Dict[str, Any]] = None
@@ -570,7 +1201,332 @@ class SearchResponse(BaseModel):
     page: int = Field(default=1, description="현재 페이지 번호")
     page_size: int = Field(default=10, description="페이지 당 결과 수")
     has_more: bool = Field(default=False, description="추가 페이지 존재 여부")
+    llm_summary: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="LLM 기반 데이터 요약/분석 결과"
+    )
 
+
+# ===== 간소화된 응답 모델 (프론트엔드 친화적) =====
+
+class MatchedCondition(BaseModel):
+    """Behavioral 조건 매칭 정보"""
+    condition_type: str = Field(..., description="조건 타입 (smoker, has_vehicle, alcohol_preference 등)")
+    condition_value: Any = Field(..., description="조건 값 (True, False, '맥주' 등)")
+    question: str = Field(..., description="실제 질문 텍스트")
+    answer: str = Field(..., description="실제 답변 텍스트")
+    confidence: float = Field(default=1.0, description="매칭 신뢰도 (0.0~1.0)")
+
+
+class SimpleResult(BaseModel):
+    """간소화된 검색 결과 (프론트엔드용)"""
+    user_id: str = Field(..., description="사용자 ID")
+    score: float = Field(..., description="검색 점수")
+    demographics: Dict[str, str] = Field(..., description="인구통계 정보 (gender, age_group, birth_year)")
+    matched_conditions: List[MatchedCondition] = Field(
+        default_factory=list,
+        description="매칭된 behavioral 조건들"
+    )
+
+
+class SimpleResponse(BaseModel):
+    """프론트엔드 친화적 간소화 응답"""
+    state: Literal["SUCCESS", "ERROR"] = Field(..., description="응답 상태")
+    message: str = Field(..., description="응답 메시지")
+    query: str = Field(..., description="검색 쿼리")
+    total_hits: int = Field(..., description="총 결과 수")
+    results: List[SimpleResult] = Field(..., description="검색 결과 목록")
+    query_info: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="쿼리 분석 정보 (keywords, filters_applied, behavioral_conditions)"
+    )
+    took_ms: int = Field(..., description="검색 소요 시간 (밀리초)")
+
+
+BEHAVIOR_YES_TOKENS = {
+    "있다", "있음", "있어요", "yes", "y", "보유", "보유함", "보유중", "한다", "합니다", "해요"
+}
+BEHAVIOR_NO_TOKENS = {
+    "없다", "없음", "없어요", "no", "n", "미보유", "안함", "안해요", "하지않는다", "하지 않는다", "않음", "안합니다"
+}
+SMOKER_NEGATIVE_KEYWORDS = {
+    "피워본 적이 없다", "피워본적이 없다", "피워본적 없다", "피우지 않는다",
+    "흡연하지 않는다", "비흡연", "금연", "담배를 피우지 않는다", "담배를 피워본적이 없다",
+    "담배 안 피", "담배안피", "흡연 안 함", "흡연 안함", "담배를 피우지 않음", "피우지 않음"
+}
+SMOKER_POSITIVE_KEYWORDS = {
+    "흡연", "담배 피", "담배피", "담배를 피", "흡연중", "흡연함", "smoker",
+    "피운다", "피웁니다", "피움", "일반 담배", "일반담배", "전자 담배",
+    "전자담배", "궐련형 전자담배", "궐련형전자담배", "권련형 전자담배",
+    "권련형전자담배", "연초", "시가형 전자담배", "담배", "담배를 피움",
+    "흡연 경험 있음", "흡연경험 있음"
+}
+SMOKER_QUESTION_KEYWORDS = {
+    "흡연", "담배", "흡연경험", "흡연 경험", "흡연경험 담배브랜드",
+    "궐련형 전자담배", "궐련형 전자담배/가열식 전자담배 이용경험",
+    "가열식 전자담배", "전자담배"
+}
+VEHICLE_QUESTION_KEYWORDS = {
+    "보유차량여부", "보유차량", "차량여부", "차량 여부", "자동차", "차량", "차 보유", "차량보유"  # ✅ "보유차량여부" 추가
+}
+
+# 음주 관련 키워드
+ALCOHOL_QUESTION_KEYWORDS = {
+    "음용경험 술", "음용경험", "술", "음주", "음주경험", "알콜", "알코올"
+}
+BEER_KEYWORDS = {
+    "맥주", "beer"
+}
+WINE_KEYWORDS = {
+    "와인", "wine"
+}
+SOJU_KEYWORDS = {
+    "소주", "soju"
+}
+NON_DRINKER_KEYWORDS = {
+    "술을 마시지 않음", "술 마시지 않음", "술 안 마심", "술 안마심", "술 못마심", "술 못 마심",
+    "비음주", "금주", "최근 1년 이내 술을 마시지 않음", "음주 경험 없음", "음주경험 없음"
+}
+
+
+def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dict[str, Any]]:
+    """behavioral_conditions를 OpenSearch nested 필터로 변환
+
+    Args:
+        behavioral_conditions: {"smoker": True, "has_vehicle": False, ...}
+
+    Returns:
+        OpenSearch nested 쿼리 리스트
+
+    Example:
+        {"smoker": True} →
+        {
+            "nested": {
+                "path": "qa_pairs",
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"bool": {"should": [질문 매칭]}},
+                            {"bool": {"should": [긍정 답변], "must_not": [부정 답변]}}
+                        ]
+                    }
+                }
+            }
+        }
+    """
+    filters = []
+
+    for key, value in behavioral_conditions.items():
+        if value is None:
+            continue
+
+        if key == "smoker":
+            # 흡연 필터
+            question_should = [
+                {"match": {"qa_pairs.q_text": q}}
+                for q in SMOKER_QUESTION_KEYWORDS
+            ]
+
+            if value:  # 흡연자
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in SMOKER_POSITIVE_KEYWORDS
+                ]
+                answer_must_not = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in SMOKER_NEGATIVE_KEYWORDS
+                ]
+            else:  # 비흡연자
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in SMOKER_NEGATIVE_KEYWORDS
+                ]
+                answer_must_not = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in SMOKER_POSITIVE_KEYWORDS
+                ]
+
+            filters.append({
+                "nested": {
+                    "path": "qa_pairs",
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "bool": {
+                                        "should": question_should,
+                                        "minimum_should_match": 1
+                                    }
+                                },
+                                {
+                                    "bool": {
+                                        "should": answer_should,
+                                        "must_not": answer_must_not,
+                                        "minimum_should_match": 1
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            })
+
+        elif key == "has_vehicle":
+            # 차량 보유 필터
+            question_should = [
+                {"match": {"qa_pairs.q_text": q}}
+                for q in VEHICLE_QUESTION_KEYWORDS
+            ]
+
+            if value:  # 차량 있음
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in BEHAVIOR_YES_TOKENS
+                ]
+                answer_must_not = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in BEHAVIOR_NO_TOKENS
+                ]
+            else:  # 차량 없음
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in BEHAVIOR_NO_TOKENS
+                ]
+                answer_must_not = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in BEHAVIOR_YES_TOKENS
+                ]
+
+            filters.append({
+                "nested": {
+                    "path": "qa_pairs",
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "bool": {
+                                        "should": question_should,
+                                        "minimum_should_match": 1
+                                    }
+                                },
+                                {
+                                    "bool": {
+                                        "should": answer_should,
+                                        "must_not": answer_must_not,
+                                        "minimum_should_match": 1
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            })
+
+        elif key == "drinks_beer":
+            # 맥주 음용 필터
+            if value:
+                question_should = [
+                    {"match": {"qa_pairs.q_text": q}}
+                    for q in ALCOHOL_QUESTION_KEYWORDS
+                ]
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in BEER_KEYWORDS
+                ]
+
+                filters.append({
+                    "nested": {
+                        "path": "qa_pairs",
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"bool": {"should": question_should, "minimum_should_match": 1}},
+                                    {"bool": {"should": answer_should, "minimum_should_match": 1}}
+                                ]
+                            }
+                        }
+                    }
+                })
+
+        elif key == "drinks_wine":
+            # 와인 음용 필터
+            if value:
+                question_should = [
+                    {"match": {"qa_pairs.q_text": q}}
+                    for q in ALCOHOL_QUESTION_KEYWORDS
+                ]
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in WINE_KEYWORDS
+                ]
+
+                filters.append({
+                    "nested": {
+                        "path": "qa_pairs",
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"bool": {"should": question_should, "minimum_should_match": 1}},
+                                    {"bool": {"should": answer_should, "minimum_should_match": 1}}
+                                ]
+                            }
+                        }
+                    }
+                })
+
+        elif key == "drinks_soju":
+            # 소주 음용 필터
+            if value:
+                question_should = [
+                    {"match": {"qa_pairs.q_text": q}}
+                    for q in ALCOHOL_QUESTION_KEYWORDS
+                ]
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in SOJU_KEYWORDS
+                ]
+
+                filters.append({
+                    "nested": {
+                        "path": "qa_pairs",
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"bool": {"should": question_should, "minimum_should_match": 1}},
+                                    {"bool": {"should": answer_should, "minimum_should_match": 1}}
+                                ]
+                            }
+                        }
+                    }
+                })
+
+        elif key == "non_drinker":
+            # 비음주자 필터
+            if value:
+                question_should = [
+                    {"match": {"qa_pairs.q_text": q}}
+                    for q in ALCOHOL_QUESTION_KEYWORDS
+                ]
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
+                    for kw in NON_DRINKER_KEYWORDS
+                ]
+
+                filters.append({
+                    "nested": {
+                        "path": "qa_pairs",
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"bool": {"should": question_should, "minimum_should_match": 1}},
+                                    {"bool": {"should": answer_should, "minimum_should_match": 1}}
+                                ]
+                            }
+                        }
+                    }
+                })
+
+    return filters
 
 
 @router.get("/", summary="Search API 상태")
@@ -584,7 +1540,6 @@ def search_root():
             "/search/similar"
         ]
     }
-
 
 
 @router.post("/query", response_model=SearchResponse, summary="검색 쿼리 실행")
@@ -608,6 +1563,8 @@ async def search_query(
                 detail="OpenSearch 서버에 연결할 수 없습니다."
             )
 
+        _ensure_request_defaults(request)
+
         # 임베딩 모델 및 설정 확인
         embedding_model = getattr(router, 'embedding_model', None)
         config = getattr(router, 'config', None)
@@ -629,7 +1586,9 @@ async def search_query(
         if analyzer is None:
             analyzer = AdvancedRAGQueryAnalyzer(config)
             router.analyzer = analyzer
-        query_analysis = analyzer.analyze_query(request.query)
+
+        use_claude = request.use_claude_analyzer if request.use_claude_analyzer is not None else config.ENABLE_CLAUDE_ANALYZER
+        query_analysis = analyzer.analyze_query(request.query, use_claude=use_claude)
         analysis = query_analysis
 
         logger.info(f"   - 의도: {query_analysis.intent}")
@@ -649,38 +1608,60 @@ async def search_query(
         cache_limit = getattr(router, "cache_max_results", requested_window)
         cache_prefix = getattr(router, "cache_prefix", "search:results")
         cache_enabled = bool(cache_client) and cache_ttl > 0
-        window_size = max(page_size, requested_window)
-        if cache_limit > 0:
+        min_window_size = 2000
+        window_size = max(requested_window, min_window_size)
+        if cache_limit and cache_limit > 0:
             window_size = min(window_size, cache_limit)
         filters_for_response: List[Dict[str, Any]] = []
         filters_signature = _normalize_filters_for_cache(filters_for_response)
+        behavioral_conditions = getattr(analysis, "behavioral_conditions", {}) or {}
+        has_behavioral_conditions = bool(behavioral_conditions)
+        has_demographic_filters = bool(filters_for_response)
+        has_filter_constraints = has_demographic_filters or has_behavioral_conditions
         cache_key = None
         cache_hit = False
 
         if cache_enabled:
             try:
+                behavior_signature = ""
+                if getattr(query_analysis, "behavioral_conditions", None):
+                    try:
+                        behavior_signature = json.dumps(query_analysis.behavioral_conditions, ensure_ascii=False, sort_keys=True)
+                    except Exception:
+                        behavior_signature = str(query_analysis.behavioral_conditions)
+
                 cache_key = _make_cache_key(
                     prefix=cache_prefix,
                     query=request.query,
                     index_name=request.index_name,
                     page_size=page_size,
                     use_vector=request.use_vector_search,
+                    use_claude=use_claude,
                     must_terms=analysis.must_terms or [],
                     should_terms=analysis.should_terms or [],
                     must_not_terms=getattr(analysis, "must_not_terms", []) or [],
                     filters_signature=filters_signature,
+                    behavior_signature=behavior_signature,
                 )
                 cached_raw = cache_client.get(cache_key)
                 if cached_raw:
                     cache_payload = json.loads(cached_raw)
                     cache_hit = True
                     logger.info(f"🔁 Redis 검색 캐시 히트: key={cache_key}")
-                    return _build_cached_response(
+                    cached_response = _build_cached_response(
                         payload=cache_payload,
                         request=request,
                         analysis=analysis,
                         filters_for_response=filters_for_response,
                         overall_start=overall_start,
+                        extracted_entities_dict=cache_payload.get("extracted_entities"),
+                    )
+                    return _finalize_search_response(
+                        request=request,
+                        response=cached_response,
+                        analysis=analysis,
+                        cache_hit=True,
+                        timings=cached_response.query_analysis.get("timings_ms") if cached_response.query_analysis else None,
                     )
             except Exception as cache_exc:
                 logger.warning(f"⚠️ Redis 검색 캐시 조회 실패: {cache_exc}")
@@ -704,14 +1685,52 @@ async def search_query(
             size=window_size
         )
 
+        # ⭐ 개선: behavioral_conditions를 OpenSearch 필터로 추가
+        if getattr(query_analysis, "behavioral_conditions", None):
+            behavioral_filters = build_behavioral_filters(query_analysis.behavioral_conditions)
+            if behavioral_filters:
+                logger.info(f"✅ Behavioral 필터 추가: {query_analysis.behavioral_conditions} → {len(behavioral_filters)}개")
+                logger.info(f"   Behavioral 필터 상세:\n{json.dumps(behavioral_filters[0], ensure_ascii=False, indent=2)}")
+
+                # os_query에 필터 추가
+                if not os_query.get("query"):
+                    os_query["query"] = {"match_all": {}}
+
+                current_query = os_query["query"]
+
+                # 기존 쿼리를 must 절에 포함
+                if current_query != {"match_all": {}}:
+                    os_query["query"] = {
+                        "bool": {
+                            "must": [current_query] + behavioral_filters
+                        }
+                    }
+                else:
+                    # match_all이면 behavioral 필터만 사용
+                    if len(behavioral_filters) == 1:
+                        os_query["query"] = behavioral_filters[0]
+                    else:
+                        os_query["query"] = {
+                            "bool": {
+                                "must": behavioral_filters
+                            }
+                        }
+
         # 3단계: 검색 실행
         logger.info("\n[3/3] 검색 실행 중...")
 
         # OpenSearch는 body에 반드시 객체 형태의 query가 있어야 합니다.
         # 하이브리드 빌더가 키워드가 없을 때 {'query': None}을 돌려주는 경우가 있어,
         # 그대로 전달하면 parsing_exception이 발생하므로 match_all로 치환합니다.
-        if os_query.get("query") in (None, {}):
+        query_clause = os_query.get("query")
+        if query_clause in (None, {}):
             logger.warning("⚠️ 검색 쿼리가 비어 있어 match_all 로 대체합니다")
+            os_query["query"] = {"match_all": {}}
+        elif not isinstance(query_clause, dict):
+            logger.warning(
+                "⚠️ 검색 쿼리 타입이 dict가 아닙니다. fallback으로 match_all을 사용합니다. "
+                f"type={type(query_clause)} value={str(query_clause)[:200]}"
+            )
             os_query["query"] = {"match_all": {}}
 
         # 하이브리드 검색 (OpenSearch + Qdrant + RRF)
@@ -740,17 +1759,18 @@ async def search_query(
             # ⭐ 필터가 있는 경우, 교집합을 위해 더 많은 결과를 가져와야 함
             has_filters = bool(os_query.get('query', {}).get('bool', {}).get('must'))
             
+            # ⭐ 개선: 검색 크기 최적화 (과도한 조회 방지)
             # Qdrant top-N 제한: 필터 유무에 따라 분기
             if has_filters:
-                # 필터 있음: 후보 수를 줄여 후처리 부담 완화
-                qdrant_limit = min(300, max(150, window_size * 5 // max(page, 1)))
-                search_size = max(500, min(window_size * 15, 3000))
-                logger.info(f"🔍 필터 적용: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (size*5 전략)")
+                # 필터 있음: 적절한 후보 확보 (기존 4000-12000 → 200-300)
+                search_size = min(max(window_size * 3, 150), 300)
+                qdrant_limit = min(max(window_size * 2, 100), 200)
+                logger.info(f"🔍 필터 적용: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (최적화)")
             else:
-                # 필터 없음: 소량만 읽기
-                qdrant_limit = min(150, max(60, window_size * 2 // max(page, 1)))
-                search_size = max(window_size * 2, 200)
-                logger.info(f"🔍 필터 없음: OpenSearch size={search_size}, Qdrant limit={qdrant_limit}")
+                # 필터 없음: 기본 검색 (기존 2000-10000 → 100-200)
+                search_size = min(max(window_size * 2, 80), 200)
+                qdrant_limit = min(max(window_size, 60), 150)
+                logger.info(f"🔍 필터 없음: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (최적화)")
             
             # OpenSearch _source filtering: 필요한 필드만 조회
             source_filter = {
@@ -842,23 +1862,15 @@ async def search_query(
                 use_vector_search=request.use_vector_search,
             )
 
+            # ⭐ 개선: must_terms 검증 제거 (OpenSearch 쿼리에서 이미 처리)
+            # OpenSearch의 nested bool.must로 이미 필터링되었으므로
+            # Python 레벨의 추가 검증은 불필요하며 성능만 저하
             must_terms: List[str] = []
             if getattr(analysis, "must_terms", None):
                 must_terms = [term for term in analysis.must_terms if term]
                 if must_terms:
-                    logger.info(f"   - Must-term 검증 시작: {must_terms}")
-                    before_count = len(combined_results)
-                    combined_results = [
-                        doc for doc in combined_results if contains_must_terms(doc, must_terms)
-                    ]
-                    removed = before_count - len(combined_results)
-                    logger.info(
-                        f"   - Must-term 검증 완료: {len(combined_results)}/{before_count}건 유지"
-                    )
-                    if removed > 0:
-                        logger.warning(
-                            f"     ⚠️ Must-term 미일치 문서 {removed}건 제거 (Qdrant 랭크 제외)"
-                        )
+                    logger.info(f"   ℹ️ Must-terms (이미 OpenSearch 쿼리에 적용됨): {must_terms}")
+                    # Python 검증 제거 - OpenSearch가 이미 처리함
 
             # 상위 N개만 선택
             final_hits = combined_results[:window_size]
@@ -943,20 +1955,85 @@ async def search_query(
                     limit=10
                 ) if isinstance(source, dict) else qa_pairs_display
 
-                demographic_info = None
-                if isinstance(source, dict):
-                    demographic_info = source.get('demographic_info') or source.get('metadata')
+                behavioral_values = behavior_values_map.get(user_id, {}) if user_id else {}
+                behavioral_info: Dict[str, Any] = {}
+                if behavioral_values.get("smoker") is not None:
+                    behavioral_info["smoker"] = behavioral_values.get("smoker")
+                if behavioral_values.get("has_vehicle") is not None:
+                    behavioral_info["has_vehicle"] = behavioral_values.get("has_vehicle")
 
-                result = SearchResult(
+                demographic_info: Dict[str, Any] = {}
+                if metadata_1st:
+                    demographic_info["age_group"] = metadata_1st.get("age_group")
+                    demographic_info["gender"] = metadata_1st.get("gender")
+                    demographic_info["birth_year"] = metadata_1st.get("birth_year")
+
+                occupation_candidate = metadata_2nd.get("occupation") if isinstance(metadata_2nd, dict) else None
+                if not occupation_candidate and isinstance(metadata_2nd_cached, dict):
+                    occupation_candidate = metadata_2nd_cached.get("occupation")
+                if not occupation_candidate and isinstance(payload, dict):
+                    occupation_candidate = payload.get("occupation")
+                if occupation_candidate:
+                    demographic_info["occupation"] = occupation_candidate
+
+                occupation_expected = set()
+                for demo in demographic_filters.get(DemographicType.OCCUPATION, []):
+                    occupation_expected.update(build_expected_values(demo))
+
+                if ("occupation" not in demographic_info or not demographic_info["occupation"]) and user_id:
+                    mapped_occupation = occupation_display_map.get(user_id) if has_demographic_filters else None
+                    if mapped_occupation:
+                        demographic_info["occupation"] = mapped_occupation
+
+                def occupation_matches(candidate: str) -> bool:
+                    normalized_candidate = normalize_value(candidate)
+                    if not normalized_candidate:
+                        return False
+                    for expected in occupation_expected:
+                        if not expected:
+                            continue
+                        if normalized_candidate == expected or normalized_candidate in expected or expected in normalized_candidate:
+                            return True
+                    return False
+
+                if ("occupation" not in demographic_info or not demographic_info["occupation"]) and isinstance(source, dict):
+                    qa_pairs_for_occ = source.get("qa_pairs", [])
+                    for qa in qa_pairs_for_occ:
+                        if not isinstance(qa, dict):
+                            continue
+                        q_text = str(qa.get("q_text", "")).lower()
+                        answer = qa.get("answer")
+                        if answer is None:
+                            answer = qa.get("answer_text")
+                        if answer is None:
+                            continue
+                        answer_str = str(answer)
+                        if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")) and occupation_matches(answer_str):
+                            demographic_info["occupation"] = answer_str
+                            break
+
+                matched_qa_pairs: List[Dict[str, Any]] = extract_inner_hit_matches(inner_hit_wrapper)
+                if not matched_qa_pairs and analysis.must_terms:
+                    matched_qa_pairs = extract_matched_qa_pairs(source, analysis.must_terms)
+
+                qa_pairs_display = reorder_with_matches(
+                    source.get("qa_pairs", []) if isinstance(source, dict) else [],
+                    matched_qa_pairs,
+                    limit=10
+                )
+
+                results.append(
+                    SearchResult(
                     user_id=user_id,
-                    score=doc.get('_score', 0.0),
-                    timestamp=source.get('timestamp') if isinstance(source, dict) else None,
-                    demographic_info=demographic_info,
+                        score=doc.get("_score", 0.0),
+                        timestamp=source.get("timestamp") if isinstance(source, dict) else None,
+                        demographic_info=demographic_info if demographic_info else None,
+                        behavioral_info=behavioral_info if behavioral_info else None,
                     qa_pairs=qa_pairs_display[:5],
                     matched_qa_pairs=matched_qa_pairs,
-                    highlights=None
+                        highlights=doc.get("highlight"),
                 )
-                results.append(result)
+                )
                 logger.debug(
                     "[match_check] user_id=%s inner_hits=%d matched=%d", 
                     user_id,
@@ -1004,15 +2081,30 @@ async def search_query(
                     limit=10
                 )
 
-                demographic_info = None
-                if isinstance(hit['_source'], dict):
-                    demographic_info = hit['_source'].get('demographic_info') or hit['_source'].get('metadata')
+                behavioral_values = behavior_values_map.get(hit['_source'].get('user_id', ''), {}) if hit['_source'].get('user_id') else {}
+                behavioral_info: Dict[str, Any] = {}
+                if behavioral_values.get("smoker") is not None:
+                    behavioral_info["smoker"] = behavioral_values.get("smoker")
+                if behavioral_values.get("has_vehicle") is not None:
+                    behavioral_info["has_vehicle"] = behavioral_values.get("has_vehicle")
+
+                demographic_info: Dict[str, Any] = {}
+                if hit['_source'].get('metadata'):
+                    metadata = hit['_source'].get('metadata')
+                    if isinstance(metadata, dict):
+                        if 'age_group' in metadata:
+                            demographic_info["age_group"] = metadata['age_group']
+                        if 'gender' in metadata:
+                            demographic_info["gender"] = metadata['gender']
+                        if 'birth_year' in metadata:
+                            demographic_info["birth_year"] = metadata['birth_year']
 
                 result = SearchResult(
                     user_id=hit['_source'].get('user_id', ''),
                     score=hit['_score'],
                     timestamp=hit['_source'].get('timestamp'),
-                    demographic_info=demographic_info,
+                    demographic_info=demographic_info if demographic_info else None,
+                    behavioral_info=behavioral_info if behavioral_info else None,
                     qa_pairs=qa_pairs_display[:5],
                     matched_qa_pairs=matched_qa,
                     highlights=hit.get('highlight')
@@ -1030,6 +2122,17 @@ async def search_query(
             "cache_hit": 1.0 if cache_hit else 0.0,
         }
 
+        extracted_entities_payload: Dict[str, Any] = {}
+        extracted_entities_attr = getattr(query_analysis, "extracted_entities", None)
+        if extracted_entities_attr is not None:
+            if hasattr(extracted_entities_attr, "to_dict"):
+                try:
+                    extracted_entities_payload = extracted_entities_attr.to_dict()
+                except Exception:
+                    extracted_entities_payload = {}
+            elif isinstance(extracted_entities_attr, dict):
+                extracted_entities_payload = extracted_entities_attr
+
         serialized_results = [_serialize_result(res) for res in results]
         stored_items = serialized_results
         if cache_enabled and cache_limit > 0:
@@ -1042,8 +2145,11 @@ async def search_query(
                 "total_hits": total_hits,
                 "max_score": max_score,
                 "items": stored_items,
+                "page_size": page_size,
                 "filters": filters_for_response,
-                "extracted_entities": extracted_entities.to_dict(),
+                "extracted_entities": extracted_entities_payload,
+                "behavioral_conditions": getattr(query_analysis, "behavioral_conditions", {}),
+                "use_claude": bool(use_claude),
             }
             try:
                 cache_client.setex(
@@ -1058,7 +2164,23 @@ async def search_query(
         logger.info(f"\n[OK] 검색 완료: {len(page_results)}건 반환 (page={page}, size={page_size})")
         logger.info(f"{'='*60}\n")
 
-        return SearchResponse(
+        _log_final_summary(
+            stage="search_query",
+            query=request.query,
+            analysis=query_analysis,
+            total_hits=total_hits,
+            returned_count=len(page_results),
+            page=page,
+            page_size=page_size,
+            cache_hit=cache_hit,
+            timings=timings,
+            took_ms=total_duration_ms,
+            filters=filters_for_response,
+            behavioral_conditions=getattr(query_analysis, "behavioral_conditions", {}),
+            use_claude=use_claude,
+        )
+
+        response = SearchResponse(
             query=request.query,
             total_hits=total_hits,
             max_score=max_score,
@@ -1072,11 +2194,21 @@ async def search_query(
                 "filters": filters_for_response,
                 "size": page_size,
                 "timings_ms": timings,
+                "behavioral_conditions": getattr(query_analysis, "behavioral_conditions", {}),
+                "use_claude_analyzer": bool(use_claude),
+                "extracted_entities": extracted_entities_payload,
             },
             took_ms=int(total_duration_ms),
             page=page,
             page_size=page_size,
             has_more=has_more,
+        )
+        return _finalize_search_response(
+            request=request,
+            response=response,
+            analysis=query_analysis,
+            cache_hit=cache_hit,
+            timings=timings,
         )
 
     except HTTPException:
@@ -1098,6 +2230,131 @@ class NLSearchRequest(BaseModel):
     )
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
     page: int = Field(default=1, ge=1, description="요청할 페이지 번호 (1부터 시작)")
+    use_claude_analyzer: Optional[bool] = Field(
+        default=None,
+        description="Claude 분석기 사용 여부 (None이면 서버 설정값을 따름)"
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="대화/세션 식별자 (Redis 대화 로그 키)"
+    )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="요청 사용자 식별자 (검색 이력 키)"
+    )
+    request_id: Optional[str] = Field(
+        default=None,
+        description="요청 추적을 위한 ID"
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="추가 요청 메타데이터"
+    )
+    log_conversation: bool = Field(
+        default=True,
+        description="Redis 대화 로그 저장 여부"
+    )
+    log_search_history: bool = Field(
+        default=True,
+        description="Redis 검색 이력 저장 여부"
+    )
+    request_llm_summary: bool = Field(
+        default=False,
+        description="LLM 요약/분석 생성 요청 여부"
+    )
+    llm_summary_instructions: Optional[str] = Field(
+        default=None,
+        description="LLM 요약 시 사용할 추가 지침"
+    )
+
+
+def convert_to_simple_response(
+    search_response: SearchResponse,
+    behavioral_conditions: Dict[str, Any],
+    max_results: int = 100
+) -> SimpleResponse:
+    """
+    SearchResponse를 SimpleResponse로 변환 (프론트엔드 친화적)
+
+    Args:
+        search_response: 기존 검색 응답
+        behavioral_conditions: 쿼리의 behavioral 조건 {"smoker": True, "has_vehicle": True}
+        max_results: 최대 결과 수 (기본 100개)
+
+    Returns:
+        SimpleResponse: 간소화된 응답
+    """
+    try:
+        simple_results = []
+
+        for item in search_response.results[:max_results]:
+            # Behavioral 조건 매칭 QA 추출
+            matched_conditions_data = extract_behavioral_qa_pairs(
+                source={'qa_pairs': item.qa_pairs or []},
+                behavioral_conditions=behavioral_conditions
+            )
+
+            # MatchedCondition 객체로 변환
+            matched_objs = [
+                MatchedCondition(
+                    condition_type=mc['condition_type'],
+                    condition_value=mc['condition_value'],
+                    question=mc['q_text'],
+                    answer=mc['answer'],
+                    confidence=mc.get('confidence', 1.0)
+                )
+                for mc in matched_conditions_data
+            ]
+
+            # Demographics 정보 추출
+            demo_info = item.demographic_info or {}
+            demographics = {
+                'gender': demo_info.get('gender', 'N/A'),
+                'age_group': demo_info.get('age_group', 'N/A'),
+                'birth_year': str(demo_info.get('birth_year', 'N/A'))
+            }
+
+            simple_results.append(SimpleResult(
+                user_id=item.user_id,
+                score=item.score,
+                demographics=demographics,
+                matched_conditions=matched_objs
+            ))
+
+        # Query 분석 정보
+        query_analysis = search_response.query_analysis or {}
+        query_info = {
+            'keywords': [
+                *(query_analysis.get('must_terms', [])),
+                *(query_analysis.get('should_terms', []))
+            ],
+            'filters_applied': bool(query_analysis.get('filters')),
+            'behavioral_conditions': behavioral_conditions,
+            'extracted_entities': query_analysis.get('extracted_entities')
+        }
+
+        return SimpleResponse(
+            state="SUCCESS",
+            message="검색 성공",
+            query=search_response.query,
+            total_hits=search_response.total_hits,
+            results=simple_results,
+            query_info=query_info,
+            took_ms=search_response.took_ms
+        )
+
+    except Exception as e:
+        logger.error(f"SimpleResponse 변환 중 에러: {e}", exc_info=True)
+        # 에러 시 빈 응답 반환
+        return SimpleResponse(
+            state="ERROR",
+            message=f"응답 변환 실패: {str(e)}",
+            query=search_response.query if search_response else "",
+            total_hits=0,
+            results=[],
+            query_info=None,
+            took_ms=0
+        )
 
 
 @router.post("/nl", response_model=SearchResponse, summary="자연어 쿼리: 자동 추출+검색")
@@ -1115,6 +2372,8 @@ async def search_natural_language(
         if not os_client or not os_client.ping():
             raise HTTPException(status_code=503, detail="OpenSearch 서버에 연결할 수 없습니다.")
 
+        _ensure_request_defaults(request)
+
         config = getattr(router, 'config', None)
         if config is None:
             from rag_query_analyzer.config import get_config
@@ -1125,7 +2384,8 @@ async def search_natural_language(
         if analyzer is None:
             analyzer = AdvancedRAGQueryAnalyzer(config)
             router.analyzer = analyzer
-        analysis = analyzer.analyze_query(request.query)
+        use_claude = request.use_claude_analyzer if request.use_claude_analyzer is not None else config.ENABLE_CLAUDE_ANALYZER
+        analysis = analyzer.analyze_query(request.query, use_claude=use_claude)
         if analysis is None:
             raise RuntimeError("Query analysis returned None")
         query_analysis = analysis
@@ -1147,15 +2407,26 @@ async def search_natural_language(
         extractor = DemographicExtractor()
         extracted_entities, requested_size = extractor.extract_with_size(request.query)
         filters: List[Dict[str, Any]] = []
+
+        # Demographics 필터
         for demo in extracted_entities.demographics:
-            metadata_only = demo.demographic_type in {DemographicType.AGE, DemographicType.GENDER}
-            include_nested_fallback = demo.demographic_type not in {DemographicType.OCCUPATION}
+            # ✅ welcome_all 인덱스는 metadata에 demographics가 있으므로 metadata만 사용
+            # qa_pairs fallback을 사용하면 여러 nested 쿼리가 충돌하여 0건이 됨!
+            metadata_only = True  # ✅ Changed: metadata만 사용 (welcome_all에는 metadata 있음)
+            include_nested_fallback = False  # ✅ Changed: qa_pairs fallback 비활성화
             filter_clause = demo.to_opensearch_filter(
                 metadata_only=metadata_only,
                 include_qa_fallback=include_nested_fallback,
             )
             if filter_clause and filter_clause != {"match_all": {}}:
                 filters.append(filter_clause)
+
+        # ⭐ 개선: behavioral_conditions를 OpenSearch 필터로 변환
+        if analysis.behavioral_conditions:
+            behavioral_filters = build_behavioral_filters(analysis.behavioral_conditions)
+            filters.extend(behavioral_filters)
+            logger.info(f"✅ Behavioral 필터 추가: {analysis.behavioral_conditions} → {len(behavioral_filters)}개 필터")
+
         filters_for_response = list(filters)
         filters_signature = _normalize_filters_for_cache(filters_for_response)
 
@@ -1167,8 +2438,9 @@ async def search_natural_language(
         cache_limit = getattr(router, "cache_max_results", requested_window)
         cache_prefix = getattr(router, "cache_prefix", "search:results")
         cache_enabled = bool(cache_client) and cache_ttl > 0
-        window_size = max(page_size, requested_window)
-        if cache_limit > 0:
+        min_window_size = 2000
+        window_size = max(requested_window, min_window_size)
+        if cache_limit and cache_limit > 0:
             window_size = min(window_size, cache_limit)
         size = window_size
         cache_key = None
@@ -1176,16 +2448,25 @@ async def search_natural_language(
 
         if cache_enabled:
             try:
+                behavior_signature = ""
+                if getattr(analysis, "behavioral_conditions", None):
+                    try:
+                        behavior_signature = json.dumps(analysis.behavioral_conditions, ensure_ascii=False, sort_keys=True)
+                    except Exception:
+                        behavior_signature = str(analysis.behavioral_conditions)
+
                 cache_key = _make_cache_key(
                     prefix=cache_prefix,
                     query=request.query,
                     index_name=request.index_name,
                     page_size=page_size,
                     use_vector=request.use_vector_search,
+                    use_claude=use_claude,
                     must_terms=analysis.must_terms or [],
                     should_terms=analysis.should_terms or [],
                     must_not_terms=getattr(analysis, "must_not_terms", []) or [],
                     filters_signature=filters_signature,
+                    behavior_signature=behavior_signature,
                 )
                 cached_raw = cache_client.get(cache_key)
                 if cached_raw:
@@ -1195,13 +2476,20 @@ async def search_natural_language(
                     extracted_entities_dict = cache_payload.get("extracted_entities")
                     if extracted_entities_dict is None:
                         extracted_entities_dict = extracted_entities.to_dict()
-                    return _build_cached_response(
+                    cached_response = _build_cached_response(
                         payload=cache_payload,
                         request=request,
                         analysis=analysis,
                         filters_for_response=filters_for_response,
                         overall_start=overall_start,
                         extracted_entities_dict=extracted_entities_dict,
+                    )
+                    return _finalize_search_response(
+                        request=request,
+                        response=cached_response,
+                        analysis=analysis,
+                        cache_hit=True,
+                        timings=cached_response.query_analysis.get("timings_ms") if cached_response.query_analysis else None,
                     )
             except Exception as cache_exc:
                 logger.warning(f"⚠️ Redis 검색 캐시 조회 실패: {cache_exc}")
@@ -1249,93 +2537,28 @@ async def search_natural_language(
                 logger.warning(f"⚠️ 2단계 검색 중 오류: {e}, 기본 파이프라인으로 진행")
 
         if two_phase_response is not None:
-            return two_phase_response
+            return _finalize_search_response(
+                request=request,
+                response=two_phase_response,
+                analysis=analysis,
+                cache_hit=cache_hit,
+                timings=two_phase_response.query_analysis.get("timings_ms") if two_phase_response.query_analysis else timings,
+            )
 
-        # 2) 분석 + 쿼리 빌드
-        # ⭐ 최종 키워드 정제: 메타 키워드, 수량 패턴, Demographics 제거
-        import re
-
-        def strip_korean_particles(term: str) -> str:
-            if not term:
-                return term
-            particles = [
-                '에는', '에서', '으로', '도', '은', '는', '이', '가',
-                '을', '를', '와', '과', '인'
-            ]
-            normalized = term
-            for _ in range(10):
-                changed = False
-                for particle in particles:
-                    if normalized.endswith(particle) and len(normalized) > len(particle):
-                        normalized = normalized[:-len(particle)]
-                        changed = True
-                        break
-                if not changed or len(normalized) <= 1:
-                    break
-            return normalized
-
-        meta_keywords = {
-            '설문조사', '설문', '데이터', '자료', '정보',
-            '보여줘', '보여주세요', '알려줘', '알려주세요',
-            '검색', '찾아줘', '찾아주세요', '조회',
-            '을', '를', '이', '가', '의', '에', '에서',
-            '와', '과', '에게', '한테', '명', '개', '건',
-            '사람', '인', '분', '중', '중에', '중에서'
-        }
-
-        quantity_pattern = re.compile(r'\d+\s*(명|건)')
-
-        extracted_keywords = set()
-        for demo in extracted_entities.demographics:
-            extracted_keywords.add(demo.raw_value)
-            extracted_keywords.update(demo.synonyms)
-
-        extracted_keywords_stripped = set(strip_korean_particles(k) for k in extracted_keywords)
-
+        # 2) 쿼리 빌드
+        # ⭐ 키워드 정제는 analyzer에서 이미 완료되었으므로 그대로 사용
         if analysis is None:
             raise RuntimeError("Query analysis not initialized")
 
-        original_must = analysis.must_terms.copy()
-        original_should = analysis.should_terms.copy()
-
-        def is_demographic_term(term: str) -> bool:
-            if term in extracted_keywords:
-                return True
-            stripped = strip_korean_particles(term)
-            return stripped in extracted_keywords or stripped in extracted_keywords_stripped
-
-        analysis.must_terms = [
-            t for t in analysis.must_terms
-            if (
-                t not in meta_keywords and
-                not quantity_pattern.search(t) and
-                not is_demographic_term(t)
-            )
-        ]
-
-        analysis.should_terms = [
-            t for t in analysis.should_terms
-            if (
-                t not in meta_keywords and
-                not quantity_pattern.search(t) and
-                not is_demographic_term(t)
-            )
-        ]
-
-        removed_meta = [t for t in (original_must + original_should) if t in meta_keywords]
-        removed_demo = [t for t in (original_must + original_should) if is_demographic_term(t)]
-        removed_quantity = [t for t in (original_must + original_should) if quantity_pattern.search(t)]
-
-        logger.info(f"🔍 최종 키워드 정제:")
-        logger.info(f"  - Must terms: {analysis.must_terms} (원본: {original_must})")
-        logger.info(f"  - Should terms: {analysis.should_terms} (원본: {original_should})")
-        if removed_meta:
-            logger.info(f"  - ❌ 제거된 메타 키워드: {removed_meta}")
-        if removed_demo:
-            logger.info(f"  - ❌ 제거된 Demographics: {removed_demo} (필터로만 처리)")
-        if removed_quantity:
-            logger.info(f"  - ❌ 제거된 수량 패턴: {removed_quantity}")
-        logger.info(f"  - ✅ Demographics 필터: {[d.raw_value for d in extracted_entities.demographics]}")
+        # 로깅: 분석기에서 정제된 최종 키워드 확인
+        logger.info(f"🔍 [SearchAPI] 쿼리 분석 완료:")
+        logger.info(f"  ✅ Must terms: {analysis.must_terms}")
+        logger.info(f"  ✅ Should terms: {analysis.should_terms}")
+        logger.info(f"  ✅ Demographics: {[d.raw_value for d in extracted_entities.demographics]}")
+        if hasattr(analysis, 'removed_demographic_terms') and analysis.removed_demographic_terms:
+            logger.info(f"  ℹ️ 제거된 Demographics: {analysis.removed_demographic_terms}")
+        if analysis.behavioral_conditions:
+            logger.info(f"  ✅ Behavioral conditions: {analysis.behavioral_conditions}")
 
         query_builder = OpenSearchHybridQueryBuilder(config)
         query_vector = None
@@ -1608,13 +2831,20 @@ async def search_natural_language(
         rrf_reason: str = ""
         adaptive_threshold: Optional[float] = None
         threshold_reason: str = ""
-        if has_filters:
-            qdrant_limit = min(300, max(150, size * 5))
-            search_size = max(500, min(size * 15, 3000))
-            logger.info(f"🔍 필터 적용: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (size*5 전략)")
+        has_behavioral = bool(getattr(analysis, "behavioral_conditions", None))
+
+        # ⭐ 검색 크기 설정: behavioral 필터가 있으면 더 많은 결과 필요
+        if has_filters or has_behavioral:
+            if has_behavioral:
+                qdrant_limit = min(max(size * 5, 500), 1500)
+                search_size = min(max(size * 10, 1000), 3000)
+            else:
+                qdrant_limit = min(max(size * 3, 300), 800)
+                search_size = min(max(size * 5, 500), 1500)
+            logger.info(f"🔍 필터 적용: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (behavioral={has_behavioral})")
         else:
-            qdrant_limit = min(150, max(60, size * 2))
-            search_size = max(size * 2, 200)
+            qdrant_limit = min(max(size, 60), 150)
+            search_size = min(max(size * 2, 80), 200)
             logger.info(f"🔍 필터 없음: OpenSearch size={search_size}, Qdrant limit={qdrant_limit}")
 
         # 4) 실행: 하이브리드 (OpenSearch + 선택적 Qdrant) with RRF
@@ -1764,7 +2994,7 @@ async def search_natural_language(
             logger.info(f"📊 [2/3] welcome_2nd 검색 중...")
             try:
                 os_response_2nd = data_fetcher.search_opensearch(
-                    index_name="s_welcome_2nd",
+                    index_name=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
                     query=remove_inner_hits(welcome_2nd_query),
                     size=search_size,
                     source_filter=source_filter,
@@ -1778,7 +3008,7 @@ async def search_natural_language(
                     qdrant_client = router.qdrant_client
                     try:
                         r = qdrant_client.search(
-                            collection_name="s_welcome_2nd",
+                            collection_name=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
                             query_vector=query_vector,
                             limit=qdrant_limit,  # 필터 유무에 따라 분기된 limit 사용
                             score_threshold=0.3,
@@ -1788,7 +3018,7 @@ async def search_natural_language(
                                 '_id': str(item.id),
                                 '_score': item.score,
                                 '_source': item.payload,
-                                '_index': 's_welcome_2nd',
+                                '_index': config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
                             })
                         logger.info(f"  ✅ Qdrant: {len(welcome_2nd_vector_results)}건")
                     except Exception as e:
@@ -1892,7 +3122,7 @@ async def search_natural_language(
                 'source': source,
                 'inner_hits': hit.get('inner_hits', {}),
                 'highlight': hit.get('highlight'),
-                'index': 's_welcome_2nd'
+                'index': config.WELCOME_INDEX  # ✅ Changed from s_welcome_2nd to use config
             }
             
             if user_id:
@@ -1993,10 +3223,10 @@ async def search_natural_language(
             best_doc = dict(best_doc_original)
             best_doc['_score'] = total_rrf_score
             best_doc['_rrf_details'] = {
-                'combined_score': total_rrf_score,
+                    'combined_score': total_rrf_score,
                 'source_count': len(docs),
                 'sources': sources,
-            }
+                }
 
             final_rrf_results.append(best_doc)
             # best_doc를 첫 번째로 유지하고, 나머지는 참고용으로 보관
@@ -2016,13 +3246,17 @@ async def search_natural_language(
 
         # 후보 문서 수 제한 (후처리 부담 완화)
         fetch_size = window_size
-        candidate_cap = max(fetch_size * 5, 300)
-        if len(rrf_results) > candidate_cap:
+        candidate_cap = max(
+            fetch_size * 20,
+            cache_limit if cache_limit else 0,
+            2000
+        )
+        if candidate_cap and len(rrf_results) > candidate_cap:
             logger.info(
                 f"  - 후보 문서 제한 적용: {len(rrf_results)} → {candidate_cap} (size={fetch_size})"
             )
             rrf_results = rrf_results[:candidate_cap]
-        if len(rrf_results) < fetch_size:
+        elif len(rrf_results) < fetch_size:
             backup_cap = max(fetch_size * 6, fetch_size + 50)
             logger.info(
                 f"  - 후보 수가 size보다 작아 증가 시도: {len(rrf_results)} → {min(len(final_rrf_results), backup_cap)}"
@@ -2044,8 +3278,10 @@ async def search_natural_language(
             demographic_filters[demo.demographic_type].append(demo)
 
         filtered_rrf_results: List[Dict[str, Any]] = rrf_results
+        total_hits = len(rrf_results)
 
         occupation_display_map: Dict[str, str] = {}
+        behavior_values_map: Dict[str, Dict[str, Optional[bool]]] = {}
         doc_user_map: Dict[int, str] = {}
         welcome_1st_batch: Dict[str, Dict[str, Any]] = {}
         welcome_2nd_batch: Dict[str, Dict[str, Any]] = {}
@@ -2147,20 +3383,23 @@ async def search_natural_language(
             except (ValueError, TypeError):
                 pass
 
-        if has_demographic_filters:
-            filter_start = perf_counter()
+        filter_start = perf_counter()
+        if 'has_filter_constraints' not in locals():
+            has_filter_constraints = has_demographic_filters or has_behavioral_conditions
+        if has_filter_constraints:
 
             gender_dsl_handled = bool(demographic_filters.get(DemographicType.GENDER)) and search_welcome_1st
             age_dsl_handled = bool(demographic_filters.get(DemographicType.AGE)) and search_welcome_1st
             occupation_dsl_handled = bool(demographic_filters.get(DemographicType.OCCUPATION)) and occupation_filter_handled
 
             filters_to_validate: List[DemographicType] = []
-            if demographic_filters.get(DemographicType.GENDER) and not gender_dsl_handled:
-                filters_to_validate.append(DemographicType.GENDER)
-            if demographic_filters.get(DemographicType.AGE) and not age_dsl_handled:
-                filters_to_validate.append(DemographicType.AGE)
-            if demographic_filters.get(DemographicType.OCCUPATION) and not occupation_dsl_handled:
-                filters_to_validate.append(DemographicType.OCCUPATION)
+            for demo_type in (
+                DemographicType.GENDER,
+                DemographicType.AGE,
+                DemographicType.OCCUPATION,
+            ):
+                if demographic_filters.get(demo_type):
+                    filters_to_validate.append(demo_type)
 
             if not filters_to_validate and demographic_filters:
                 filters_to_validate = list(demographic_filters.keys())
@@ -2223,7 +3462,7 @@ async def search_natural_language(
                     cached_1 = _cache_get_welcome_doc("s_welcome_1st", uid)
                     if cached_1:
                         welcome_1st_batch[uid] = cached_1
-                    cached_2 = _cache_get_welcome_doc("s_welcome_2nd", uid)
+                    cached_2 = _cache_get_welcome_doc(config.WELCOME_INDEX, uid)  # ✅ Changed from s_welcome_2nd to use config
                     if cached_2:
                         welcome_2nd_batch[uid] = cached_2
 
@@ -2245,14 +3484,14 @@ async def search_natural_language(
 
                         if uncached_2nd:
                             raw_welcome_2nd_docs = await data_fetcher.multi_get_documents_async(
-                                index_name="s_welcome_2nd",
+                                index_name=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
                                 doc_ids=uncached_2nd,
                                 source_fields=["metadata", "user_id", "qa_pairs"],
                             ) or []
                             fetched_map = data_fetcher.docs_to_user_map(raw_welcome_2nd_docs)
                             welcome_2nd_batch.update(fetched_map)
                             for uid, doc_item in fetched_map.items():
-                                _cache_put_welcome_doc("s_welcome_2nd", uid, doc_item)
+                                _cache_put_welcome_doc(config.WELCOME_INDEX, uid, doc_item)  # ✅ Changed from s_welcome_2nd to use config
                     else:
                         if uncached_1st:
                             for batch_idx in range(0, len(uncached_1st), 200):
@@ -2275,12 +3514,12 @@ async def search_natural_language(
                                 batch_ids = uncached_2nd[batch_idx:batch_idx + 200]
                                 batch_num = (batch_idx // 200) + 1
                                 try:
-                                    mget_body = [{"_index": "s_welcome_2nd", "_id": uid} for uid in batch_ids]
+                                    mget_body = [{"_index": config.WELCOME_INDEX, "_id": uid} for uid in batch_ids]  # ✅ Changed from s_welcome_2nd to use config
                                     mget_response = os_client.mget(body={"docs": mget_body}, ignore=[404], request_timeout=60)
                                     for item in mget_response.get('docs', []):
                                         if item.get('found'):
                                             welcome_2nd_batch[item['_id']] = item['_source']
-                                            _cache_put_welcome_doc("s_welcome_2nd", item['_id'], item['_source'])
+                                            _cache_put_welcome_doc(config.WELCOME_INDEX, item['_id'], item['_source'])  # ✅ Changed from s_welcome_2nd to use config
                                     logger.debug(f"  📦 welcome_2nd 배치 {batch_num}/{total_batches}: {len([d for d in mget_response.get('docs', []) if d.get('found')])}/{len(batch_ids)}건")
                                 except Exception as e:
                                     logger.warning(f"  ⚠️ welcome_2nd 배치 {batch_num}/{total_batches} 실패: {e}")
@@ -2318,14 +3557,14 @@ async def search_natural_language(
                         missing_ids = list(missing_2nd)
                         if data_fetcher.os_async_client:
                             extra_docs_raw = await data_fetcher.multi_get_documents_async(
-                                index_name="s_welcome_2nd",
+                                index_name=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
                                 doc_ids=missing_ids,
                                 source_fields=["metadata", "user_id", "qa_pairs"],
                             )
                             welcome_2nd_batch.update(data_fetcher.docs_to_user_map(extra_docs_raw))
                         else:
                             response = os_client.mget(
-                                index="s_welcome_2nd",
+                                index=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
                                 body={"ids": missing_ids},
                                 _source=["metadata", "user_id", "qa_pairs"],
                                 request_timeout=60,
@@ -2334,7 +3573,7 @@ async def search_natural_language(
                             for doc_item in response.get('docs', []):
                                 if doc_item.get('found'):
                                     welcome_2nd_batch[doc_item['_id']] = doc_item['_source']
-                                    _cache_put_welcome_doc("s_welcome_2nd", doc_item['_id'], doc_item['_source'])
+                                    _cache_put_welcome_doc(config.WELCOME_INDEX, doc_item['_id'], doc_item['_source'])  # ✅ Changed from s_welcome_2nd to use config
                         logger.info(f"  ✅ welcome_2nd 추가 조회 후 총 {len(welcome_2nd_batch)}건")
 
                 except Exception as e:
@@ -2350,7 +3589,7 @@ async def search_natural_language(
                     source: Dict[str, Any],
                     metadata_1st: Dict[str, Any],
                     metadata_2nd: Dict[str, Any],
-                ) -> Tuple[Dict[DemographicType, Set[str]], Dict[DemographicType, bool]]:
+                ) -> Tuple[Dict[DemographicType, Set[str]], Dict[DemographicType, bool], Dict[str, Optional[bool]]]:
                     doc_values: Dict[DemographicType, Set[str]] = {
                         DemographicType.GENDER: set(),
                         DemographicType.AGE: set(),
@@ -2361,6 +3600,55 @@ async def search_natural_language(
                         DemographicType.AGE: False,
                         DemographicType.OCCUPATION: False,
                     }
+                    behavior_values: Dict[str, Optional[bool]] = {
+                        "smoker": None,
+                        "has_vehicle": None,
+                    }
+
+                    def record_behavior(key: str, value: Optional[bool]) -> None:
+                        if value is None:
+                            return
+                        if behavior_values.get(key) is None:
+                            behavior_values[key] = value
+
+                    def parse_yes_no(text: Optional[str]) -> Optional[bool]:
+                        if not text:
+                            return None
+                        normalized = text.lower()
+                        if any(keyword in normalized for keyword in BEHAVIOR_NO_TOKENS):
+                            return False
+                        if any(keyword in normalized for keyword in BEHAVIOR_YES_TOKENS):
+                            return True
+                        return None
+
+                    def parse_smoker_answer(raw: Optional[Any]) -> Optional[bool]:
+                        if raw is None:
+                            return None
+                        if isinstance(raw, (list, tuple, set)):
+                            for item in raw:
+                                decision = parse_smoker_answer(item)
+                                if decision is not None:
+                                    return decision
+                            return None
+                        text = str(raw).strip()
+                        if not text:
+                            return None
+                        normalized = text.lower()
+                        compact = normalized.replace(" ", "")
+                        for keyword in SMOKER_NEGATIVE_KEYWORDS:
+                            keyword_compact = keyword.replace(" ", "")
+                            if keyword in normalized or keyword_compact in compact:
+                                return False
+                        for keyword in SMOKER_POSITIVE_KEYWORDS:
+                            keyword_compact = keyword.replace(" ", "")
+                            if keyword in normalized or keyword_compact in compact:
+                                return True
+                        if (
+                            "담배" in normalized
+                            and not any(token in normalized for token in ("없", "안", "않", "no", "무", "미흡연"))
+                        ):
+                            return True
+                        return parse_yes_no(text)
 
                     metadata_candidates = [
                         metadata_1st,
@@ -2428,6 +3716,11 @@ async def search_natural_language(
                                     doc_values[DemographicType.OCCUPATION].add(normalized_occupation)
                                     metadata_presence[DemographicType.OCCUPATION] = True
 
+                            vehicle_val = meta_source.get("has_vehicle")
+                            if vehicle_val:
+                                normalized_vehicle = normalize_value(vehicle_val)
+                                record_behavior("has_vehicle", parse_yes_no(normalized_vehicle))
+
                     if user_id:
                         qa_sources: List[List[Dict[str, Any]]] = []
                         if isinstance(source, dict):
@@ -2441,6 +3734,7 @@ async def search_natural_language(
                             for qa in qa_pairs:
                                 if not isinstance(qa, dict):
                                     continue
+                                q_text_raw = str(qa.get("q_text", "")).lower()
                                 q_text = normalize_value(qa.get("q_text"))
                                 answer_candidates = [
                                     qa.get("answer"),
@@ -2458,10 +3752,42 @@ async def search_natural_language(
                                 normalized_answers = {normalize_value(ans) for ans in answers if ans}
 
                                 if q_text and normalized_answers:
-                                    if q_text in {"직업", "직무", "occupation"}:
+                                    if any(keyword in q_text_raw for keyword in ("직업", "직무", "occupation")):
                                         doc_values[DemographicType.OCCUPATION].update(normalized_answers)
 
-                    return doc_values, metadata_presence
+                                    if (
+                                        not metadata_presence[DemographicType.GENDER]
+                                        and any(keyword in q_text_raw for keyword in ("성별", "gender"))
+                                    ):
+                                        doc_values[DemographicType.GENDER].update(normalized_answers)
+                                        metadata_presence[DemographicType.GENDER] = True
+
+                                if behavior_values.get("smoker") is None and q_text_raw and any(keyword in q_text_raw for keyword in SMOKER_QUESTION_KEYWORDS):
+                                    for ans in answers:
+                                        smoker_decision = parse_smoker_answer(ans)
+                                        if smoker_decision is not None:
+                                            record_behavior("smoker", smoker_decision)
+                                            if smoker_decision is False:
+                                                break
+                                    if behavior_values.get("smoker") is None:
+                                        for ans in normalized_answers:
+                                            smoker_decision = parse_smoker_answer(ans)
+                                            if smoker_decision is not None:
+                                                record_behavior("smoker", smoker_decision)
+                                                break
+
+                                if behavior_values.get("has_vehicle") is None and q_text_raw and any(keyword in q_text_raw for keyword in VEHICLE_QUESTION_KEYWORDS):
+                                    # 🔍 디버깅: 실제 차량 답변 로그
+                                    normalized_answers_sample = list(normalized_answers)[:3]
+                                    logger.info(f"🚗 [Vehicle Debug] user={user_id}, q_text={q_text_raw[:30]}, answers={normalized_answers_sample}")
+                                    for ans in normalized_answers:
+                                        vehicle_decision = parse_yes_no(ans)
+                                        logger.info(f"   → answer='{ans}' → decision={vehicle_decision}")
+                                        if vehicle_decision is not None:
+                                            record_behavior("has_vehicle", vehicle_decision)
+                                            break
+
+                    return doc_values, metadata_presence, behavior_values
 
                 filtered_list = []
                 source_not_found_count = 0
@@ -2471,6 +3797,8 @@ async def search_natural_language(
                 gender_metadata_missing = 0
                 age_metadata_missing = 0
                 occupation_metadata_missing = 0
+                behavior_filter_failed = 0
+                behavior_metadata_missing = 0
 
                 for doc in rrf_results:
                     user_id = doc_user_map.get(id(doc))
@@ -2485,7 +3813,8 @@ async def search_natural_language(
                     metadata_2nd = welcome_2nd_batch.get(user_id, {}) if isinstance(welcome_2nd_batch.get(user_id), dict) else {}
                     metadata_2nd_full = welcome_2nd_batch.get(user_id, {})
 
-                    doc_values, metadata_presence = collect_doc_values(user_id, source, metadata_1st, metadata_2nd)
+                    doc_values, metadata_presence, behavior_values = collect_doc_values(user_id, source, metadata_1st, metadata_2nd)
+                    behavior_values_map[user_id] = dict(behavior_values)
 
                     gender_pass = True
                     age_pass = True
@@ -2495,21 +3824,34 @@ async def search_natural_language(
                         expected = set()
                         for demo in demographic_filters[DemographicType.GENDER]:
                             expected.update(build_expected_values(demo))
-                        expand_gender_aliases(doc_values[DemographicType.GENDER])
-                        gender_pass = values_match(doc_values[DemographicType.GENDER], expected)
+
+                        # ⭐ Metadata 우선: metadata가 있으면 metadata만 확인
+                        if metadata_presence[DemographicType.GENDER]:
+                            # metadata로 수집된 값만 사용 (qa_pairs 무시)
+                            # doc_values에서 metadata 소스만 확인하기 위해 다시 수집
+                            gender_from_metadata = set()
+                            for meta_source in [metadata_1st, metadata_2nd, source.get("metadata", {})]:
+                                if isinstance(meta_source, dict):
+                                    gender_val = meta_source.get("gender") or meta_source.get("gender_code")
+                                    if gender_val:
+                                        normalized_gender = normalize_value(gender_val)
+                                        if normalized_gender:
+                                            gender_from_metadata.add(normalized_gender)
+
+                            if gender_from_metadata:
+                                expand_gender_aliases(gender_from_metadata)
+                                gender_pass = values_match(gender_from_metadata, expected)
+                            else:
+                                # metadata_presence가 True인데 값이 없으면 오류
+                                gender_metadata_missing += 1
+                                gender_pass = False
+                        else:
+                            # metadata 없으면 qa_pairs 사용
+                            expand_gender_aliases(doc_values[DemographicType.GENDER])
+                            gender_pass = values_match(doc_values[DemographicType.GENDER], expected)
+
                         if not gender_pass:
                             gender_filter_failed += 1
-                            if logger.isEnabledFor(logging.DEBUG):
-                                logger.debug(
-                                    "🚫 성별 불일치 | user_id=%s | doc_values=%s | expected=%s | metadata=%s",
-                                    user_id,
-                                    doc_values[DemographicType.GENDER],
-                                    expected,
-                                    {
-                                        "metadata_1st": metadata_1st,
-                                        "metadata_2nd": metadata_2nd,
-                                    },
-                                )
 
                     if gender_pass and DemographicType.AGE in filters_to_validate:
                         expected = set()
@@ -2568,12 +3910,27 @@ async def search_natural_language(
                             if display_occupation:
                                 occupation_display_map[user_id] = display_occupation
 
-                    if gender_pass and age_pass and occupation_pass:
+                    # ⭐ Behavioral 검증: OpenSearch는 후보를 넓게 가져오고, Python에서 정확히 검증
+                    behavior_pass = True
+                    if analysis.behavioral_conditions:
+                        for condition_key, expected_value in analysis.behavioral_conditions.items():
+                            actual_value = behavior_values.get(condition_key)
+                            if actual_value is None:
+                                behavior_metadata_missing += 1
+                                behavior_pass = False
+                                break
+                            if actual_value != expected_value:
+                                behavior_filter_failed += 1
+                                behavior_pass = False
+                                break
+
+                    if gender_pass and age_pass and occupation_pass and behavior_pass:
                         filtered_list.append(doc)
 
                 filter_duration_ms = (perf_counter() - filter_start) * 1000
                 timings["post_filter_ms"] = filter_duration_ms
                 filtered_rrf_results = filtered_list
+                total_hits = len(filtered_rrf_results)
 
                 logger.info(f"  - 소스 누락 문서: {source_not_found_count}건")
                 if DemographicType.GENDER in filters_to_validate:
@@ -2586,6 +3943,10 @@ async def search_natural_language(
                     logger.info(f"  - 직업 metadata 없음: {occupation_metadata_missing}건")
                     logger.info(f"  - 직업 필터 미충족: {occupation_filter_failed}건")
                 logger.info(f"  - 필터 조건 충족 문서: {len(filtered_rrf_results)}건")
+                if analysis.behavioral_conditions:
+                    logger.info(f"  ✅ 행동 필터 검증 완료")
+                    logger.info(f"  - 행동 정보 없음: {behavior_metadata_missing}건")
+                    logger.info(f"  - 행동 필터 미충족: {behavior_filter_failed}건")
         else:
             timings.setdefault('post_filter_ms', timings.get('post_filter_ms', 0.0))
 
@@ -2594,7 +3955,7 @@ async def search_natural_language(
                 source: Dict[str, Any],
                 metadata_1st: Dict[str, Any],
                 metadata_2nd: Dict[str, Any],
-            ) -> Tuple[Dict[DemographicType, Set[str]], Dict[DemographicType, bool]]:
+            ) -> Tuple[Dict[DemographicType, Set[str]], Dict[DemographicType, bool], Dict[str, Optional[bool]]]:
                 doc_values: Dict[DemographicType, Set[str]] = {
                     DemographicType.GENDER: set(),
                     DemographicType.AGE: set(),
@@ -2605,8 +3966,56 @@ async def search_natural_language(
                     DemographicType.AGE: False,
                     DemographicType.OCCUPATION: False,
                 }
+                behavior_values: Dict[str, Optional[bool]] = {
+                    "smoker": None,
+                    "has_vehicle": None,
+                }
 
-                # Common metadata sources
+                def record_behavior(key: str, value: Optional[bool]) -> None:
+                    if value is None:
+                        return
+                    if behavior_values.get(key) is None:
+                        behavior_values[key] = value
+
+                def parse_yes_no(text: Optional[str]) -> Optional[bool]:
+                    if not text:
+                        return None
+                    normalized = text.lower()
+                    if any(keyword in normalized for keyword in BEHAVIOR_NO_TOKENS):
+                        return False
+                    if any(keyword in normalized for keyword in BEHAVIOR_YES_TOKENS):
+                        return True
+                    return None
+
+                def parse_smoker_answer(raw: Optional[Any]) -> Optional[bool]:
+                    if raw is None:
+                        return None
+                    if isinstance(raw, (list, tuple, set)):
+                        for item in raw:
+                            decision = parse_smoker_answer(item)
+                            if decision is not None:
+                                return decision
+                        return None
+                    text = str(raw).strip()
+                    if not text:
+                        return None
+                    normalized = text.lower()
+                    compact = normalized.replace(" ", "")
+                    for keyword in SMOKER_NEGATIVE_KEYWORDS:
+                        keyword_compact = keyword.replace(" ", "")
+                        if keyword in normalized or keyword_compact in compact:
+                            return False
+                    for keyword in SMOKER_POSITIVE_KEYWORDS:
+                        keyword_compact = keyword.replace(" ", "")
+                        if keyword in normalized or keyword_compact in compact:
+                            return True
+                    if (
+                        "담배" in normalized
+                        and not any(token in normalized for token in ("없", "안", "않", "no", "무", "미흡연"))
+                    ):
+                        return True
+                    return parse_yes_no(text)
+
                 metadata_candidates = [
                     metadata_1st,
                     metadata_2nd,
@@ -2703,7 +4112,7 @@ async def search_natural_language(
                         expand_gender_aliases(normalized)
                     doc_values[demo_type] = normalized
 
-                return doc_values, metadata_presence
+                return doc_values, metadata_presence, behavior_values
 
             filtered_list: List[Dict[str, Any]] = []
             source_not_found_count = 0
@@ -2713,6 +4122,8 @@ async def search_natural_language(
             gender_metadata_missing = 0
             age_metadata_missing = 0
             occupation_metadata_missing = 0
+            behavior_filter_failed = 0
+            behavior_metadata_missing = 0
             for doc in rrf_results:
                 source = doc.get("_source")
                 if not source and "doc" in doc:
@@ -2737,7 +4148,8 @@ async def search_natural_language(
                 welcome_2nd_doc_full = welcome_2nd_batch.get(user_id, {})
                 metadata_2nd = welcome_2nd_doc_full.get("metadata", {}) if isinstance(welcome_2nd_doc_full, dict) else {}
 
-                doc_values, metadata_presence = collect_doc_values(user_id, source, metadata_1st, metadata_2nd)
+                doc_values, metadata_presence, behavior_values = collect_doc_values(user_id, source, metadata_1st, metadata_2nd)
+                behavior_values_map[user_id] = dict(behavior_values)
 
                 gender_pass = True
                 age_pass = True
@@ -2747,9 +4159,30 @@ async def search_natural_language(
                     expected = set()
                     for demo in demographic_filters[DemographicType.GENDER]:
                         expected.update(build_expected_values(demo))
-                    if not metadata_presence[DemographicType.GENDER]:
+
+                    # ⭐ Metadata 우선: metadata가 있으면 metadata만 확인
+                    if metadata_presence[DemographicType.GENDER]:
+                        # metadata로 수집된 값만 사용
+                        gender_from_metadata = set()
+                        for meta_source in [metadata_1st, metadata_2nd, source.get("metadata", {})]:
+                            if isinstance(meta_source, dict):
+                                gender_val = meta_source.get("gender") or meta_source.get("gender_code")
+                                if gender_val:
+                                    normalized_gender = normalize_value(gender_val)
+                                    if normalized_gender:
+                                        gender_from_metadata.add(normalized_gender)
+
+                        if gender_from_metadata:
+                            expand_gender_aliases(gender_from_metadata)
+                            gender_pass = values_match(gender_from_metadata, expected)
+                        else:
+                            gender_metadata_missing += 1
+                            gender_pass = False
+                    else:
+                        # metadata 없으면 qa_pairs 사용
                         gender_metadata_missing += 1
-                    gender_pass = values_match(doc_values[DemographicType.GENDER], expected)
+                        gender_pass = values_match(doc_values[DemographicType.GENDER], expected)
+
                     if not gender_pass:
                         gender_filter_failed += 1
 
@@ -2812,7 +4245,21 @@ async def search_natural_language(
                         if display_occupation:
                             occupation_display_map[user_id] = display_occupation
 
-                if gender_pass and age_pass and occupation_pass:
+                # ⭐ Behavioral 검증: OpenSearch는 후보를 넓게 가져오고, Python에서 정확히 검증
+                behavior_pass = True
+                if analysis.behavioral_conditions:
+                    for condition_key, expected_value in analysis.behavioral_conditions.items():
+                        actual_value = behavior_values.get(condition_key)
+                        if actual_value is None:
+                            behavior_metadata_missing += 1
+                            behavior_pass = False
+                            break
+                        if actual_value != expected_value:
+                            behavior_filter_failed += 1
+                            behavior_pass = False
+                            break
+
+                if gender_pass and age_pass and occupation_pass and behavior_pass:
                     filtered_list.append(doc)
 
             filter_duration_ms = (perf_counter() - filter_start) * 1000
@@ -2830,6 +4277,10 @@ async def search_natural_language(
                 logger.info(f"  - 직업 metadata 없음: {occupation_metadata_missing}건")
             logger.info(f"  - 직업 필터 미충족: {occupation_filter_failed}건")
             logger.info(f"  - 필터 조건 충족 문서: {len(filtered_rrf_results)}건")
+            if analysis.behavioral_conditions:
+                logger.info(f"  ✅ 행동 필터 검증 완료")
+                logger.info(f"  - 행동 정보 없음: {behavior_metadata_missing}건")
+                logger.info(f"  - 행동 필터 미충족: {behavior_filter_failed}건")
 
         lazy_join_start = perf_counter()
         final_hits = filtered_rrf_results[:window_size]
@@ -2894,6 +4345,13 @@ async def search_natural_language(
             metadata_2nd_cached = (
                 welcome_2nd_doc.get("metadata", {}) if isinstance(welcome_2nd_doc, dict) else {}
             )
+
+            behavioral_values = behavior_values_map.get(user_id, {}) if user_id else {}
+            behavioral_info: Dict[str, Any] = {}
+            if behavioral_values.get("smoker") is not None:
+                behavioral_info["smoker"] = behavioral_values.get("smoker")
+            if behavioral_values.get("has_vehicle") is not None:
+                behavioral_info["has_vehicle"] = behavioral_values.get("has_vehicle")
 
             demographic_info: Dict[str, Any] = {}
             if metadata_1st:
@@ -2961,6 +4419,7 @@ async def search_natural_language(
                     score=doc.get("_score", 0.0),
                     timestamp=source.get("timestamp") if isinstance(source, dict) else None,
                     demographic_info=demographic_info if demographic_info else None,
+                    behavioral_info=behavioral_info if behavioral_info else None,
                     qa_pairs=qa_pairs_display[:5],
                     matched_qa_pairs=matched_qa_pairs,
                     highlights=doc.get("highlight"),
@@ -3014,13 +4473,32 @@ async def search_natural_language(
         if threshold_reason:
             logger.info(f"   • Qdrant: {threshold_reason}")
 
+        _log_final_summary(
+            stage="search_nl",
+            query=request.query,
+            analysis=analysis,
+            total_hits=total_hits,
+            returned_count=len(page_results),
+            page=page,
+            page_size=page_size,
+            cache_hit=cache_hit,
+            timings=timings,
+            took_ms=total_duration_ms,
+            filters=filters_for_response,
+            behavioral_conditions=getattr(analysis, "behavioral_conditions", {}),
+            use_claude=use_claude,
+        )
+
         if cache_enabled and cache_key and stored_items:
             cache_payload = {
                 "total_hits": total_hits,
                 "max_score": max_score,
                 "items": stored_items,
+                "page_size": page_size,
                 "filters": filters_for_response,
                 "extracted_entities": extracted_entities.to_dict(),
+                "behavioral_conditions": getattr(analysis, "behavioral_conditions", {}),
+                "use_claude": bool(use_claude),
             }
             try:
                 cache_client.setex(
@@ -3032,7 +4510,7 @@ async def search_natural_language(
             except Exception as cache_exc:
                 logger.warning(f"⚠️ Redis 검색 캐시 저장 실패: {cache_exc}")
 
-        return SearchResponse(
+        response = SearchResponse(
             query=request.query,
             total_hits=total_hits,
             max_score=max_score,
@@ -3047,11 +4525,20 @@ async def search_natural_language(
                 "size": page_size,
                 "timings_ms": timings,
                 "extracted_entities": extracted_entities.to_dict(),
+                "behavioral_conditions": getattr(analysis, "behavioral_conditions", {}),
+                "use_claude_analyzer": bool(use_claude),
             },
             took_ms=response_took_ms,
             page=page,
             page_size=page_size,
             has_more=has_more,
+        )
+        return _finalize_search_response(
+            request=request,
+            response=response,
+            analysis=analysis,
+            cache_hit=cache_hit,
+            timings=timings,
         )
 
     except HTTPException:
@@ -3059,6 +4546,75 @@ async def search_natural_language(
     except Exception as e:
         logger.error(f"[ERROR] 자연어 검색 중 오류: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------
+# 프론트엔드 친화적 간소화 엔드포인트
+# -----------------------------
+
+@router.post("/nl/simple", response_model=SimpleResponse, summary="자연어 쿼리: 간소화 응답 (프론트엔드용)")
+async def search_natural_language_simple(
+    query: str = Query(..., description="자연어 검색 쿼리"),
+    size: int = Query(default=100, ge=1, le=500, description="결과 개수"),
+    use_claude: Optional[bool] = Query(default=None, description="Claude 분석기 사용 여부"),
+    session_id: Optional[str] = Query(default=None, description="세션 ID"),
+    user_id: Optional[str] = Query(default=None, description="사용자 ID"),
+    os_client: OpenSearch = Depends(lambda: router.os_client),
+) -> SimpleResponse:
+    """
+    자연어 검색 - 프론트엔드 친화적 간소화 응답
+
+    - Demographics와 behavioral 조건 매칭 정보만 반환
+    - 불필요한 qa_pairs 제거
+    - matched_conditions로 behavioral QA 명시적 표시
+
+    예시 쿼리:
+    - "흡연하고 차를 소유하는 30대 남성"
+    - "맥주를 마시는 40대 여성"
+    """
+    try:
+        # 기존 NLSearchRequest 생성
+        nl_request = NLSearchRequest(
+            query=query,
+            size=size,
+            use_claude=use_claude,
+            session_id=session_id,
+            user_id=user_id,
+            log_conversation=False,  # 로그 비활성화
+            log_search_history=False,
+            request_llm_summary=False
+        )
+
+        # 기존 검색 수행
+        full_response = await search_natural_language(
+            request=nl_request,
+            os_client=os_client
+        )
+
+        # Behavioral 조건 추출
+        query_analysis = full_response.query_analysis or {}
+        behavioral_conditions = query_analysis.get('behavioral_conditions', {})
+
+        # SimpleResponse로 변환
+        simple_response = convert_to_simple_response(
+            search_response=full_response,
+            behavioral_conditions=behavioral_conditions,
+            max_results=size
+        )
+
+        return simple_response
+
+    except Exception as e:
+        logger.error(f"Simple search 에러: {e}", exc_info=True)
+        return SimpleResponse(
+            state="ERROR",
+            message=f"검색 실패: {str(e)}",
+            query=query,
+            total_hits=0,
+            results=[],
+            query_info=None,
+            took_ms=0
+        )
 
 
 # -----------------------------
@@ -3435,6 +4991,76 @@ async def test_filters(
     except Exception as e:
         logger.error(f"[ERROR] 필터 테스트 중 오류: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/logs/conversation/{session_id}",
+    summary="대화 히스토리 조회 (Redis)",
+)
+async def get_conversation_logs_endpoint(
+    session_id: str,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    client = getattr(router, "redis_client", None)
+    if client is None:
+        raise HTTPException(status_code=503, detail="Redis 클라이언트가 구성되지 않았습니다.")
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit 값은 1 이상이어야 합니다.")
+
+    key = _make_conversation_key(
+        getattr(router, "conversation_history_prefix", None),
+        session_id,
+    )
+    if not key:
+        raise HTTPException(status_code=400, detail="session_id 또는 prefix가 올바르지 않습니다.")
+
+    raw_items = client.lrange(key, -limit, -1)
+    messages: List[ConversationMessage] = []
+    for item in raw_items:
+        parsed = _parse_conversation_record(item)
+        if parsed is not None:
+            messages.append(parsed)
+
+    return {
+        "session_id": session_id,
+        "count": len(messages),
+        "messages": [msg.model_dump() for msg in messages],
+    }
+
+
+@router.get(
+    "/logs/search-history/{owner_id}",
+    summary="검색 이력 조회 (Redis)",
+)
+async def get_search_history_endpoint(
+    owner_id: str,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    client = getattr(router, "redis_client", None)
+    if client is None:
+        raise HTTPException(status_code=503, detail="Redis 클라이언트가 구성되지 않았습니다.")
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit 값은 1 이상이어야 합니다.")
+
+    key = _make_history_key(
+        getattr(router, "search_history_prefix", None),
+        owner_id,
+    )
+    if not key:
+        raise HTTPException(status_code=400, detail="owner_id 또는 prefix가 올바르지 않습니다.")
+
+    raw_items = client.lrange(key, -limit, -1)
+    entries: List[SearchHistoryEntry] = []
+    for item in raw_items:
+        parsed = _parse_search_history_record(item)
+        if parsed is not None:
+            entries.append(parsed)
+
+    return {
+        "owner_id": owner_id,
+        "count": len(entries),
+        "history": [entry.model_dump() for entry in entries],
+    }
 
 
 @router.get("/qdrant/collections", summary="Qdrant 컬렉션 목록 및 통계")
@@ -3829,11 +5455,18 @@ async def run_two_phase_demographic_search(
         welcome_1st_doc = welcome_1st_docs.get(user_id, {})
         metadata_1st = welcome_1st_doc.get('metadata', {}) if isinstance(welcome_1st_doc, dict) else {}
 
+        behavioral_values = behavior_values_map.get(user_id, {}) if user_id else {}
+        behavioral_info: Dict[str, Any] = {}
+        if behavioral_values.get("smoker") is not None:
+            behavioral_info["smoker"] = behavioral_values.get("smoker")
+        if behavioral_values.get("has_vehicle") is not None:
+            behavioral_info["has_vehicle"] = behavioral_values.get("has_vehicle")
+
         demographic_info: Dict[str, Any] = {}
         if metadata_1st:
-            demographic_info['age_group'] = metadata_1st.get('age_group')
-            demographic_info['gender'] = metadata_1st.get('gender')
-            demographic_info['birth_year'] = metadata_1st.get('birth_year')
+            demographic_info["age_group"] = metadata_1st.get("age_group")
+            demographic_info["gender"] = metadata_1st.get("gender")
+            demographic_info["birth_year"] = metadata_1st.get("birth_year")
         if metadata_2nd:
             demographic_info['occupation'] = metadata_2nd.get('occupation')
 
@@ -3863,6 +5496,7 @@ async def run_two_phase_demographic_search(
                 score=hit.get('_score', 0.0),
                 timestamp=source.get('timestamp') if isinstance(source, dict) else None,
                 demographic_info=demographic_info if demographic_info else None,
+                behavioral_info=behavioral_info if behavioral_info else None,
                 qa_pairs=source.get('qa_pairs', [])[:5] if isinstance(source, dict) else [],
                 matched_qa_pairs=matched_qa,
                 highlights=hit.get('highlight'),
