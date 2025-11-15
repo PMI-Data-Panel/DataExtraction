@@ -131,73 +131,92 @@ def create_app() -> FastAPI:
         )
         search_router.anthropic_client = anthropic_client
 
+        # Visualization 라우터에 의존성 주입
+        visualization_router.os_client = os_client
+
         # 시작 이벤트 등록
         @app.on_event("startup")
         async def startup_event():
             """애플리케이션 시작 시 연결 상태 확인"""
-            logger.info("=" * 60)
-            logger.info("RAG Query Analyzer API 시작")
-            logger.info("=" * 60)
-            
-            # 동의어 확장기 초기화 (정적 사전 + Qdrant 동적 확장)
+            import asyncio
             try:
-                from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
-                expander = get_synonym_expander(
-                    qdrant_client=qdrant_client,
-                    embedding_model=embedding_model
-                )
-                stats = expander.get_stats()
-                logger.info("📚 동의어 확장기 정보:")
-                logger.info(f"   - Terms: {stats['total_terms']}개")
-                logger.info(f"   - 동의어: {stats['total_synonyms']}개")
-                logger.info(f"   - 평균: {stats['avg_synonyms']:.1f}개/term")
-                logger.info(f"   - 파일: {stats['loaded_from']}")
-                logger.info(f"   - Qdrant 동적 확장: {'활성화' if stats['dynamic_enabled'] else '비활성화'}")
-                if stats['dynamic_enabled']:
-                    logger.info(f"   - 동적 캐시 크기: {stats['dynamic_cache_size']}/{stats['cache_size_limit']}")
-            except Exception as e:
-                logger.warning(f"⚠️  동의어 확장기 초기화 실패: {e}")
-                logger.info(f"   생성 방법: python scripts/generate_synonyms.py")
-            logger.info("=" * 60)
+                logger.info("=" * 60)
+                logger.info("RAG Query Analyzer API 시작")
+                logger.info("=" * 60)
+                
+                # 동의어 확장기 초기화 (정적 사전 + Qdrant 동적 확장)
+                try:
+                    from rag_query_analyzer.utils.synonym_expander import get_synonym_expander
+                    expander = get_synonym_expander(
+                        qdrant_client=qdrant_client,
+                        embedding_model=embedding_model
+                    )
+                    stats = expander.get_stats()
+                    logger.info("📚 동의어 확장기 정보:")
+                    logger.info(f"   - Terms: {stats['total_terms']}개")
+                    logger.info(f"   - 동의어: {stats['total_synonyms']}개")
+                    logger.info(f"   - 평균: {stats['avg_synonyms']:.1f}개/term")
+                    logger.info(f"   - 파일: {stats['loaded_from']}")
+                    logger.info(f"   - Qdrant 동적 확장: {'활성화' if stats['dynamic_enabled'] else '비활성화'}")
+                    if stats['dynamic_enabled']:
+                        logger.info(f"   - 동적 캐시 크기: {stats['dynamic_cache_size']}/{stats['cache_size_limit']}")
+                except Exception as e:
+                    logger.warning(f"⚠️  동의어 확장기 초기화 실패: {e}")
+                    logger.info(f"   생성 방법: python scripts/generate_synonyms.py")
+                logger.info("=" * 60)
 
-            # OpenSearch 연결 확인
-            try:
-                if os_client.ping():
-                    logger.info("[OK] OpenSearch 연결 성공")
-                    info = os_client.info()
-                    logger.info(f"   - 버전: {info['version']['number']}")
-                    logger.info(f"   - 클러스터: {info['cluster_name']}")
-                else:
-                    logger.warning("[WARNING] OpenSearch 연결 실패")
-            except Exception as e:
-                logger.warning(f"[WARNING] OpenSearch 연결 실패: {e}")
+                # OpenSearch 연결 확인
+                try:
+                    if os_client.ping():
+                        logger.info("[OK] OpenSearch 연결 성공")
+                        info = os_client.info()
+                        logger.info(f"   - 버전: {info['version']['number']}")
+                        logger.info(f"   - 클러스터: {info['cluster_name']}")
+                    else:
+                        logger.warning("[WARNING] OpenSearch 연결 실패")
+                except Exception as e:
+                    logger.warning(f"[WARNING] OpenSearch 연결 실패: {e}")
 
-            # Async OpenSearch 연결 확인
-            try:
-                if async_os_client and await async_os_client.ping():
-                    logger.info("[OK] Async OpenSearch 연결 성공")
-            except Exception as e:
-                logger.warning(f"[WARNING] Async OpenSearch 연결 실패: {e}")
+                # Async OpenSearch 연결 확인
+                try:
+                    if async_os_client and await async_os_client.ping():
+                        logger.info("[OK] Async OpenSearch 연결 성공")
+                except Exception as e:
+                    logger.warning(f"[WARNING] Async OpenSearch 연결 실패: {e}")
 
-            logger.info("\n사용 가능한 엔드포인트:")
-            logger.info("   - GET  /                          : API 환영 메시지")
-            logger.info("   - GET  /health                    : 헬스 체크")
-            logger.info("   - GET  /system-status             : 시스템 상태 확인")
-            logger.info("   - POST /indexer/index-survey-data : 설문 데이터 색인")
-            logger.info("   - DELETE /indexer/index/{name}    : 인덱스 삭제")
-            logger.info("   - POST /search/query              : 검색 쿼리 실행")
-            logger.info("   - GET  /docs                      : API 문서 (Swagger UI)")
-            logger.info("   - GET  /redoc                     : API 문서 (ReDoc)")
-            logger.info("=" * 60 + "\n")
+                logger.info("\n사용 가능한 엔드포인트:")
+                logger.info("   - GET  /                          : API 환영 메시지")
+                logger.info("   - GET  /health                    : 헬스 체크")
+                logger.info("   - GET  /system-status             : 시스템 상태 확인")
+                logger.info("   - POST /indexer/index-survey-data : 설문 데이터 색인")
+                logger.info("   - DELETE /indexer/index/{name}    : 인덱스 삭제")
+                logger.info("   - POST /search/nl                : 자연어 검색 쿼리 실행")
+                logger.info("   - GET  /docs                      : API 문서 (Swagger UI)")
+                logger.info("   - GET  /redoc                     : API 문서 (ReDoc)")
+                logger.info("=" * 60 + "\n")
+            except asyncio.CancelledError:
+                # 정상적인 종료 과정에서 발생할 수 있는 취소 에러는 무시
+                pass
+            except Exception as e:
+                logger.error(f"⚠️ Startup 이벤트 처리 중 오류: {e}")
 
         @app.on_event("shutdown")
         async def shutdown_event():
             """리소스 정리"""
+            import asyncio
             logger.info("🛑 애플리케이션 종료: 리소스 정리 중...")
             try:
                 if async_os_client:
-                    await async_os_client.close()
-                    logger.info("[OK] Async OpenSearch 클라이언트 종료")
+                    try:
+                        await asyncio.wait_for(async_os_client.close(), timeout=2.0)
+                        logger.info("[OK] Async OpenSearch 클라이언트 종료")
+                    except asyncio.CancelledError:
+                        logger.info("[INFO] Async OpenSearch 클라이언트 종료 취소됨")
+                    except asyncio.TimeoutError:
+                        logger.warning("⚠️ Async OpenSearch 클라이언트 종료 타임아웃")
+            except asyncio.CancelledError:
+                # 정상적인 종료 과정에서 발생할 수 있는 취소 에러는 무시
+                pass
             except Exception as e:
                 logger.warning(f"⚠️ Async OpenSearch 종료 실패: {e}")
 
@@ -206,6 +225,7 @@ def create_app() -> FastAPI:
         def read_root():
             """API 기본 정보"""
             return {
+                
                 "message": "RAG Query Analyzer API에 오신 것을 환영합니다!",
                 "version": "4.0.0",
                 "description": "설문조사 데이터를 OpenSearch에 색인하고 검색합니다.",
@@ -220,45 +240,7 @@ def create_app() -> FastAPI:
                 }
             }
 
-        @app.get("/health", summary="헬스 체크")
-        def health_check():
-            """간단한 헬스 체크"""
-            return {"status": "ok"}
-
-        @app.get("/system-status", summary="시스템 상태 확인")
-        def system_status():
-            """시스템의 주요 구성 요소 상태를 확인합니다."""
-            # OpenSearch 연결 상태
-            opensearch_status = "disconnected"
-            opensearch_info = None
-            try:
-                if os_client.ping():
-                    opensearch_status = "connected"
-                    info = os_client.info()
-                    opensearch_info = {
-                        "version": info['version']['number'],
-                        "cluster_name": info['cluster_name']
-                    }
-            except Exception as e:
-                opensearch_status = f"error: {str(e)}"
-
-            return {
-                "status": "operational",
-                "components": {
-                    "opensearch": {
-                        "status": opensearch_status,
-                        "info": opensearch_info
-                    },
-                    "embedding_model": {
-                        "status": "loaded",
-                        "model": config.EMBEDDING_MODEL,
-                        "dimension": config.EMBEDDING_DIM,
-                        "device": str(embedding_model.device)
-                    }
-                },
-                "version": "4.0.0"
-            }
-
+        
         # 라우터 등록
         app.include_router(indexer_router)
         app.include_router(search_router)

@@ -22,27 +22,24 @@ from connectors.data_fetcher import DataFetcher
 from connectors.qdrant_helper import search_qdrant_async, search_qdrant_collections_async
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+# main_api.py에서 이미 basicConfig로 루트 로거가 설정되어 있으므로
+# propagate만 True로 설정하여 루트 로거로 전파되도록 함
+logger.propagate = True
 
 router = APIRouter(
     prefix="/search",
     tags=["Search"]
 )
 
-# ⚠️ 임시 확장 타임아웃 (중첩 필터 제거 전까지 8~10초 유지)
-DEFAULT_OS_TIMEOUT = 10
+# OpenSearch 요청 타임아웃 (복잡한 쿼리나 대용량 검색을 위해 30초로 설정)
+DEFAULT_OS_TIMEOUT = 30
 
 # 런타임 공유 객체 (한 번만 초기화 후 재사용)
 router.analyzer = None  # type: ignore[attr-defined]
 router.embedding_model = None  # type: ignore[attr-defined]
 router.config = None  # type: ignore[attr-defined]
 
-# 간단한 인메모리 LRU 캐시 (welcome 인덱스 전용)
-_WELCOME_CACHE_MAX = 5000
-_welcome_cache: Dict[str, OrderedDict] = {
-    "s_welcome_1st": OrderedDict(),
-    "s_welcome_2nd": OrderedDict(),
-}
+# ⭐ survey_responses_merged만 사용하므로 welcome 인덱스 캐시 제거
 
 _SUMMARY_RESPONSE_TEMPLATE = (
     "{\n"
@@ -476,25 +473,7 @@ def _finalize_search_response(
     return response
 
 
-def _cache_get_welcome_doc(index_name: str, user_id: str) -> Optional[Dict[str, Any]]:
-    bucket = _welcome_cache.get(index_name)
-    if bucket is None:
-        return None
-    doc = bucket.get(user_id)
-    if doc is not None:
-        # 최근 사용 업데이트
-        bucket.move_to_end(user_id)
-    return doc
-
-
-def _cache_put_welcome_doc(index_name: str, user_id: str, doc: Dict[str, Any]) -> None:
-    bucket = _welcome_cache.get(index_name)
-    if bucket is None:
-        return
-    bucket[user_id] = doc
-    bucket.move_to_end(user_id)
-    if len(bucket) > _WELCOME_CACHE_MAX:
-        bucket.popitem(last=False)
+# ⭐ survey_responses_merged만 사용하므로 welcome 인덱스 캐시 함수 제거
 
 
 def calculate_rrf_score_adaptive(
@@ -766,9 +745,10 @@ def build_occupation_dsl_filter(occupation_entities: List["DemographicEntity"]) 
         {"terms": {"qa_pairs.answer.keyword": values_list}},
         {"terms": {"qa_pairs.answer_text.keyword": values_list}},
     ]
+    # ⭐ match 대신 match_phrase 사용: "전문직"과 "사무직"이 "직" 토큰으로 잘못 매칭되는 것 방지
     for value in values_list:
-        answer_should.append({"match": {"qa_pairs.answer": value}})
-        answer_should.append({"match": {"qa_pairs.answer_text": value}})
+        answer_should.append({"match_phrase": {"qa_pairs.answer": value}})
+        answer_should.append({"match_phrase": {"qa_pairs.answer_text": value}})
 
     nested_filter = {
         "nested": {
@@ -1134,8 +1114,8 @@ class SearchRequest(BaseModel):
     """검색 요청"""
     query: str = Field(..., description="검색 쿼리")
     index_name: str = Field(
-        default="welcome_all",
-        description="검색할 인덱스 이름 (기본값: alias 'welcome_all'; 와일드카드 사용 가능)"
+        default="survey_responses_merged",
+        description="검색할 인덱스 이름 (기본값: survey_responses_merged; 와일드카드 사용 가능)"
     )
     size: int = Field(default=10, ge=1, le=100, description="반환할 결과 개수")
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
@@ -1183,7 +1163,7 @@ class SearchResult(BaseModel):
     user_id: str
     score: float
     timestamp: Optional[str] = None
-    demographic_info: Optional[Dict[str, Any]] = Field(default=None, description="인구통계 정보 (welcome_1st, welcome_2nd에서 조회)")
+    demographic_info: Optional[Dict[str, Any]] = Field(default=None, description="인구통계 정보 (survey_responses_merged에서 조회)")
     behavioral_info: Optional[Dict[str, Any]] = Field(default=None, description="행동/습관 정보 (예: 흡연 여부, 차량 보유 여부)")
     qa_pairs: Optional[List[Dict[str, Any]]] = None
     matched_qa_pairs: Optional[List[Dict[str, Any]]] = None
@@ -1287,6 +1267,68 @@ NON_DRINKER_KEYWORDS = {
     "술을 마시지 않음", "술 마시지 않음", "술 안 마심", "술 안마심", "술 못마심", "술 못 마심",
     "비음주", "금주", "최근 1년 이내 술을 마시지 않음", "음주 경험 없음", "음주경험 없음"
 }
+DRINKER_POSITIVE_KEYWORDS = {
+    # 술 종류
+    "맥주", "beer", "소주", "soju", "막걸리", "탁주", "와인", "wine",
+    "양주", "위스키", "whiskey", "보드카", "vodka", "데킬라", "tequila", "진", "gin",
+    "저도주", "청주", "매실주", "복분자주", "과일칵테일주", "KGB", "후치", "크루저",
+    "일본청주", "사케", "sake", "칵테일", "cocktail",
+    # 음주 긍정 표현
+    "술 마심", "술 마셔", "술마심", "술마셔", "음주함", "음주 경험 있음", "음주경험 있음",
+    "가끔 마심", "자주 마심", "주말에 마심"
+}
+
+
+def extract_behavioral_conditions_from_query(query: str) -> Dict[str, bool]:
+    """쿼리 텍스트에서 behavioral 조건 자동 추출
+
+    Args:
+        query: 검색 쿼리
+
+    Returns:
+        behavioral 조건 딕셔너리 {"drinker": True, "smoker": False, ...}
+    """
+    query_lower = query.lower()
+    query_normalized = query_lower.replace(" ", "")
+    conditions = {}
+
+    # ⭐ 음주 여부 감지
+    drinker_positive = ["술마", "술도마", "음주", "술먹", "술마신", "음주경험", "음주 경험", "주류"]
+    drinker_negative = ["비음주", "금주", "술안", "술을마시지", "술을안마시", "술도안"]
+
+    has_drinker_negative = any(keyword in query_normalized for keyword in drinker_negative)
+    has_drinker_positive = any(keyword in query_normalized for keyword in drinker_positive)
+
+    if has_drinker_negative:
+        conditions["drinker"] = False
+    elif has_drinker_positive:
+        conditions["drinker"] = True
+
+    # ⭐ 흡연 여부 감지
+    smoker_positive = ["흡연자", "담배피", "담배 피", "담배를피"]
+    smoker_negative = ["비흡연", "금연", "담배안", "담배도안", "흡연안", "흡연을안", "안피는", "안 피는"]
+
+    has_smoker_negative = any(keyword in query_normalized for keyword in smoker_negative)
+    has_smoker_positive = any(keyword in query_normalized for keyword in smoker_positive)
+
+    if has_smoker_negative:
+        conditions["smoker"] = False
+    elif has_smoker_positive:
+        conditions["smoker"] = True
+
+    # ⭐ 차량 보유 여부 감지
+    vehicle_positive = ["차량", "자동차", "차보유", "차있는"]
+    vehicle_negative = ["차없는", "차량없는", "차가없는"]
+
+    has_vehicle_negative = any(keyword in query_normalized for keyword in vehicle_negative)
+    has_vehicle_positive = any(keyword in query_normalized for keyword in vehicle_positive)
+
+    if has_vehicle_negative:
+        conditions["has_vehicle"] = False
+    elif has_vehicle_positive:
+        conditions["has_vehicle"] = True
+
+    return conditions
 
 
 def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dict[str, Any]]:
@@ -1395,6 +1437,57 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dic
                 answer_must_not = [
                     {"match": {"qa_pairs.answer": kw}}  # ✅ Changed to match (answer is text type)
                     for kw in BEHAVIOR_YES_TOKENS
+                ]
+
+            filters.append({
+                "nested": {
+                    "path": "qa_pairs",
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "bool": {
+                                        "should": question_should,
+                                        "minimum_should_match": 1
+                                    }
+                                },
+                                {
+                                    "bool": {
+                                        "should": answer_should,
+                                        "must_not": answer_must_not,
+                                        "minimum_should_match": 1
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            })
+
+        elif key == "drinker":
+            # ⭐ 음주 여부 필터
+            question_should = [
+                {"match": {"qa_pairs.q_text": q}}
+                for q in ALCOHOL_QUESTION_KEYWORDS
+            ]
+
+            if value:  # 음주자
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}
+                    for kw in DRINKER_POSITIVE_KEYWORDS
+                ]
+                answer_must_not = [
+                    {"match": {"qa_pairs.answer": kw}}
+                    for kw in NON_DRINKER_KEYWORDS
+                ]
+            else:  # 비음주자
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}
+                    for kw in NON_DRINKER_KEYWORDS
+                ]
+                answer_must_not = [
+                    {"match": {"qa_pairs.answer": kw}}
+                    for kw in DRINKER_POSITIVE_KEYWORDS
                 ]
 
             filters.append({
@@ -1536,697 +1629,17 @@ def search_root():
         "message": "Search API 실행 중",
         "version": "1.0",
         "endpoints": [
-            "/search/query",
-            "/search/similar"
+            "/search/nl"
         ]
     }
-
-
-@router.post("/query", response_model=SearchResponse, summary="검색 쿼리 실행")
-async def search_query(
-    request: SearchRequest,
-    os_client: OpenSearch = Depends(lambda: router.os_client),
-):
-    """
-    자연어 쿼리로 설문 데이터 검색
-
-    - 쿼리 분석 (의도 파악, 키워드 추출)
-    - 하이브리드 검색 (키워드 + 벡터)
-    - 인구통계 필터링
-    - 결과 랭킹 및 포매팅
-    """
-    try:
-        # OpenSearch 연결 확인
-        if not os_client or not os_client.ping():
-            raise HTTPException(
-                status_code=503,
-                detail="OpenSearch 서버에 연결할 수 없습니다."
-            )
-
-        _ensure_request_defaults(request)
-
-        # 임베딩 모델 및 설정 확인
-        embedding_model = getattr(router, 'embedding_model', None)
-        config = getattr(router, 'config', None)
-        if config is None:
-            from rag_query_analyzer.config import get_config
-            config = get_config()
-            router.config = config
-        if embedding_model is None and hasattr(router, 'embedding_model_factory'):
-            embedding_model = router.embedding_model_factory()
-            router.embedding_model = embedding_model
-
-        logger.info(f"\n{'='*60}")
-        logger.info(f"[SEARCH] 검색 쿼리: '{request.query}'")
-        logger.info(f"{'='*60}")
-
-        # 1단계: 쿼리 분석
-        logger.info("\n[1/3] 쿼리 분석 중...")
-        analyzer = getattr(router, 'analyzer', None)
-        if analyzer is None:
-            analyzer = AdvancedRAGQueryAnalyzer(config)
-            router.analyzer = analyzer
-
-        use_claude = request.use_claude_analyzer if request.use_claude_analyzer is not None else config.ENABLE_CLAUDE_ANALYZER
-        query_analysis = analyzer.analyze_query(request.query, use_claude=use_claude)
-        analysis = query_analysis
-
-        logger.info(f"   - 의도: {query_analysis.intent}")
-        logger.info(f"   - must_terms: {query_analysis.must_terms}")
-        logger.info(f"   - should_terms: {query_analysis.should_terms}")
-        logger.info(f"   - alpha: {query_analysis.alpha}")
-
-        timings: Dict[str, float] = {}
-        overall_start = perf_counter()
-
-        # 페이지 및 캐시 설정
-        page_size = max(1, request.size)
-        page = max(1, request.page)
-        requested_window = page_size * page
-        cache_client = getattr(router, "redis_client", None)
-        cache_ttl = getattr(router, "cache_ttl_seconds", 0)
-        cache_limit = getattr(router, "cache_max_results", requested_window)
-        cache_prefix = getattr(router, "cache_prefix", "search:results")
-        cache_enabled = bool(cache_client) and cache_ttl > 0
-        min_window_size = 2000
-        window_size = max(requested_window, min_window_size)
-        if cache_limit and cache_limit > 0:
-            window_size = min(window_size, cache_limit)
-        filters_for_response: List[Dict[str, Any]] = []
-        filters_signature = _normalize_filters_for_cache(filters_for_response)
-        behavioral_conditions = getattr(analysis, "behavioral_conditions", {}) or {}
-        has_behavioral_conditions = bool(behavioral_conditions)
-        has_demographic_filters = bool(filters_for_response)
-        has_filter_constraints = has_demographic_filters or has_behavioral_conditions
-        cache_key = None
-        cache_hit = False
-
-        if cache_enabled:
-            try:
-                behavior_signature = ""
-                if getattr(query_analysis, "behavioral_conditions", None):
-                    try:
-                        behavior_signature = json.dumps(query_analysis.behavioral_conditions, ensure_ascii=False, sort_keys=True)
-                    except Exception:
-                        behavior_signature = str(query_analysis.behavioral_conditions)
-
-                cache_key = _make_cache_key(
-                    prefix=cache_prefix,
-                    query=request.query,
-                    index_name=request.index_name,
-                    page_size=page_size,
-                    use_vector=request.use_vector_search,
-                    use_claude=use_claude,
-                    must_terms=analysis.must_terms or [],
-                    should_terms=analysis.should_terms or [],
-                    must_not_terms=getattr(analysis, "must_not_terms", []) or [],
-                    filters_signature=filters_signature,
-                    behavior_signature=behavior_signature,
-                )
-                cached_raw = cache_client.get(cache_key)
-                if cached_raw:
-                    cache_payload = json.loads(cached_raw)
-                    cache_hit = True
-                    logger.info(f"🔁 Redis 검색 캐시 히트: key={cache_key}")
-                    cached_response = _build_cached_response(
-                        payload=cache_payload,
-                        request=request,
-                        analysis=analysis,
-                        filters_for_response=filters_for_response,
-                        overall_start=overall_start,
-                        extracted_entities_dict=cache_payload.get("extracted_entities"),
-                    )
-                    return _finalize_search_response(
-                        request=request,
-                        response=cached_response,
-                        analysis=analysis,
-                        cache_hit=True,
-                        timings=cached_response.query_analysis.get("timings_ms") if cached_response.query_analysis else None,
-                    )
-            except Exception as cache_exc:
-                logger.warning(f"⚠️ Redis 검색 캐시 조회 실패: {cache_exc}")
-                cache_key = None
-                cache_enabled = False
-
-        # 2단계: 쿼리 빌드
-        logger.info("\n[2/3] 검색 쿼리 생성 중...")
-        query_builder = OpenSearchHybridQueryBuilder(config)
-
-        # 임베딩 벡터 생성
-        query_vector = None
-        if request.use_vector_search and embedding_model:
-            query_vector = embedding_model.encode(request.query).tolist()
-            logger.info(f"   - 쿼리 벡터 생성 완료 (dim: {len(query_vector)})")
-
-        # OpenSearch 쿼리 생성
-        os_query = query_builder.build_query(
-            analysis=query_analysis,
-            query_vector=query_vector,
-            size=window_size
-        )
-
-        # ⭐ 개선: behavioral_conditions를 OpenSearch 필터로 추가
-        if getattr(query_analysis, "behavioral_conditions", None):
-            behavioral_filters = build_behavioral_filters(query_analysis.behavioral_conditions)
-            if behavioral_filters:
-                logger.info(f"✅ Behavioral 필터 추가: {query_analysis.behavioral_conditions} → {len(behavioral_filters)}개")
-                logger.info(f"   Behavioral 필터 상세:\n{json.dumps(behavioral_filters[0], ensure_ascii=False, indent=2)}")
-
-                # os_query에 필터 추가
-                if not os_query.get("query"):
-                    os_query["query"] = {"match_all": {}}
-
-                current_query = os_query["query"]
-
-                # 기존 쿼리를 must 절에 포함
-                if current_query != {"match_all": {}}:
-                    os_query["query"] = {
-                        "bool": {
-                            "must": [current_query] + behavioral_filters
-                        }
-                    }
-                else:
-                    # match_all이면 behavioral 필터만 사용
-                    if len(behavioral_filters) == 1:
-                        os_query["query"] = behavioral_filters[0]
-                    else:
-                        os_query["query"] = {
-                            "bool": {
-                                "must": behavioral_filters
-                            }
-                        }
-
-        # 3단계: 검색 실행
-        logger.info("\n[3/3] 검색 실행 중...")
-
-        # OpenSearch는 body에 반드시 객체 형태의 query가 있어야 합니다.
-        # 하이브리드 빌더가 키워드가 없을 때 {'query': None}을 돌려주는 경우가 있어,
-        # 그대로 전달하면 parsing_exception이 발생하므로 match_all로 치환합니다.
-        query_clause = os_query.get("query")
-        if query_clause in (None, {}):
-            logger.warning("⚠️ 검색 쿼리가 비어 있어 match_all 로 대체합니다")
-            os_query["query"] = {"match_all": {}}
-        elif not isinstance(query_clause, dict):
-            logger.warning(
-                "⚠️ 검색 쿼리 타입이 dict가 아닙니다. fallback으로 match_all을 사용합니다. "
-                f"type={type(query_clause)} value={str(query_clause)[:200]}"
-            )
-            os_query["query"] = {"match_all": {}}
-
-        # 하이브리드 검색 (OpenSearch + Qdrant + RRF)
-        if request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
-            logger.info("   - 하이브리드 검색 모드 (OpenSearch + Qdrant + RRF)")
-
-            # OpenSearch 키워드 검색
-            logger.info("   - [1/3] OpenSearch 키워드 검색...")
-            
-            # OpenSearch _source filtering: 필요한 필드만 조회
-            source_filter = {
-                "includes": ["user_id", "metadata", "timestamp"],
-                "excludes": []
-            }
-
-            # ------------------------------------------------------------
-            # OpenSearch 검색 (필요시 병렬 실행)
-            # ------------------------------------------------------------
-           
-
-            data_fetcher = DataFetcher(
-                opensearch_client=os_client,
-                qdrant_client=getattr(router, 'qdrant_client', None),
-                async_opensearch_client=getattr(router, 'async_os_client', None)
-            )
-            # ⭐ 필터가 있는 경우, 교집합을 위해 더 많은 결과를 가져와야 함
-            has_filters = bool(os_query.get('query', {}).get('bool', {}).get('must'))
-            
-            # ⭐ 개선: 검색 크기 최적화 (과도한 조회 방지)
-            # Qdrant top-N 제한: 필터 유무에 따라 분기
-            if has_filters:
-                # 필터 있음: 적절한 후보 확보 (기존 4000-12000 → 200-300)
-                search_size = min(max(window_size * 3, 150), 300)
-                qdrant_limit = min(max(window_size * 2, 100), 200)
-                logger.info(f"🔍 필터 적용: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (최적화)")
-            else:
-                # 필터 없음: 기본 검색 (기존 2000-10000 → 100-200)
-                search_size = min(max(window_size * 2, 80), 200)
-                qdrant_limit = min(max(window_size, 60), 150)
-                logger.info(f"🔍 필터 없음: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (최적화)")
-            
-            # OpenSearch _source filtering: 필요한 필드만 조회
-            source_filter = {
-                "includes": ["user_id", "metadata", "timestamp"],
-                "excludes": []  # 필요시 제외할 필드 추가
-            }
-            
-            os_response = data_fetcher.search_opensearch(
-                index_name=request.index_name,
-                query=os_query,
-                size=search_size,
-                source_filter=source_filter,
-                request_timeout=DEFAULT_OS_TIMEOUT,
-            )
-            logger.info(f"      → OpenSearch: {len(os_response['hits']['hits'])}건")
-
-            inner_hits_map: Dict[str, List[Dict[str, Any]]] = {}
-            for hit in os_response['hits']['hits']:
-                user_id = hit.get('_source', {}).get('user_id') or hit.get('_id')
-                if not user_id:
-                    continue
-                matches = extract_inner_hit_matches(hit)
-                if matches:
-                    inner_hits_map[user_id] = matches
-                    logger.debug(
-                        "[inner_hits_map] user_id=%s matches=%d", user_id, len(matches)
-                    )
-
-            # Qdrant 벡터 검색 (모든 컬렉션)
-            logger.info("   - [2/3] Qdrant 벡터 검색 (모든 컬렉션)...")
-            qdrant_client = router.qdrant_client
-
-            collection_names: List[str] = []
-            try:
-                collections = qdrant_client.get_collections()
-                collection_names = [col.name for col in collections.collections]
-                logger.info(f"      → 검색할 컬렉션: {collection_names}")
-            except Exception as e:
-                logger.warning(f"      → Qdrant 컬렉션 목록 가져오기 실패: {e}")
-
-            qdrant_results_raw = []
-            if collection_names:
-                try:
-                    qdrant_start = perf_counter()
-                    adaptive_threshold, threshold_reason = get_adaptive_score_threshold(
-                        query=request.query,
-                        has_filters=has_demographic_filters,
-                        must_terms_count=len(getattr(analysis, "must_terms", []) or []),
-                    )
-                    results_map = await search_qdrant_collections_async(
-                        qdrant_client=qdrant_client,
-                        collection_names=collection_names,
-                        query_vector=query_vector,
-                        limit=qdrant_limit,
-                        score_threshold=adaptive_threshold,
-                    )
-                    duration_ms = (perf_counter() - qdrant_start) * 1000
-                    for name, items in results_map.items():
-                        logger.info(f"      → {name}: {len(items)}건 (limit={qdrant_limit})")
-                        qdrant_results_raw.extend(items)
-                    logger.info(
-                        f"      → 병렬 Qdrant 검색 완료: {len(qdrant_results_raw)}건 "
-                        f"(총 컬렉션 {len(collection_names)}개, {duration_ms:.1f}ms)"
-                    )
-                except Exception as e:
-                    logger.warning(f"      → Qdrant 병렬 검색 실패: {e}")
-
-            # 점수 순으로 정렬
-            qdrant_results_raw.sort(key=lambda x: x.get('_score', 0.0), reverse=True)
-            qdrant_results_raw = qdrant_results_raw[:qdrant_limit]
-
-            # RRF로 결합
-            logger.info("   - [3/3] RRF 결합 중...")
-            keyword_results = os_response['hits']['hits']
-            vector_results = [
-                {
-                    '_id': item.get('_id'),
-                    '_score': item.get('_score'),
-                    '_source': item.get('_source', {})
-                }
-                for item in qdrant_results_raw
-            ]
-
-            combined_results, rrf_k_used, rrf_reason = calculate_rrf_score_adaptive(
-                keyword_results=keyword_results,
-                vector_results=vector_results,
-                query_intent=getattr(analysis, "intent", None),
-                has_filters=has_demographic_filters,
-                use_vector_search=request.use_vector_search,
-            )
-
-            # ⭐ 개선: must_terms 검증 제거 (OpenSearch 쿼리에서 이미 처리)
-            # OpenSearch의 nested bool.must로 이미 필터링되었으므로
-            # Python 레벨의 추가 검증은 불필요하며 성능만 저하
-            must_terms: List[str] = []
-            if getattr(analysis, "must_terms", None):
-                must_terms = [term for term in analysis.must_terms if term]
-                if must_terms:
-                    logger.info(f"   ℹ️ Must-terms (이미 OpenSearch 쿼리에 적용됨): {must_terms}")
-                    # Python 검증 제거 - OpenSearch가 이미 처리함
-
-            # 상위 N개만 선택
-            final_hits = combined_results[:window_size]
-            logger.info(f"      → RRF 결합 완료: {len(final_hits)}건")
-
-            # 최종 상세 정보 (_mget) 조회
-            user_docs_map: Dict[str, Dict[str, Any]] = {}
-            user_ids_for_mget: List[str] = []
-            for doc in final_hits:
-                source_candidate = doc.get('_source') or {}
-                if not source_candidate and 'doc' in doc:
-                    source_candidate = doc.get('doc', {}).get('_source', {})
-                user_id_candidate = (
-                    source_candidate.get('user_id')
-                    or doc.get('_id')
-                    or doc.get('id')
-                )
-                if not user_id_candidate and 'payload' in doc:
-                    payload = doc['payload']
-                    if isinstance(payload, dict):
-                        user_id_candidate = payload.get('user_id')
-                if user_id_candidate and user_id_candidate not in user_docs_map:
-                    user_docs_map[user_id_candidate] = source_candidate if isinstance(source_candidate, dict) else {}
-                    user_ids_for_mget.append(user_id_candidate)
-
-            if user_ids_for_mget:
-                try:
-                    final_docs_raw = await data_fetcher.multi_get_documents_async(
-                        index_name=request.index_name,
-                        doc_ids=user_ids_for_mget,
-                        source_fields=["user_id", "metadata", "demographic_info", "qa_pairs", "timestamp"],
-                    )
-                    for doc_item in final_docs_raw:
-                        if not isinstance(doc_item, dict):
-                            continue
-                        if not doc_item.get('found'):
-                            continue
-                        doc_id = doc_item.get('_id')
-                        src = doc_item.get('_source', {})
-                        if doc_id and isinstance(src, dict):
-                            user_docs_map[doc_id] = src
-                except Exception as e:
-                    logger.warning(f"     ⚠️ 최종 문서 조회 실패: {e}")
-
-            # 결과 포매팅 (RRF 순서 유지)
-            results = []
-            for doc in final_hits:
-                source = doc.get('_source') or {}
-                if not source and 'doc' in doc:
-                    source = doc.get('doc', {}).get('_source', {})
-                if not source and 'payload' in doc:
-                    source = doc['payload']
-
-                if isinstance(source, dict) and 'payload' in source and 'user_id' not in source:
-                    payload = source['payload']
-                    user_id = payload.get('user_id', '') if isinstance(payload, dict) else ''
-                else:
-                    user_id = source.get('user_id') or doc.get('_id', '')
-
-                if user_id and user_id in user_docs_map:
-                    merged_source = {}
-                    if isinstance(source, dict):
-                        merged_source.update(source)
-                    merged_source.update(user_docs_map[user_id])
-                    source = merged_source
-                    logger.debug(
-                        "[mget_merge] user_id=%s qa_pairs=%d", 
-                        user_id,
-                        len(source.get('qa_pairs', [])) if isinstance(source, dict) else -1,
-                    )
-                elif isinstance(source, dict) and user_id:
-                    user_docs_map.setdefault(user_id, source)
-
-                qa_pairs_display = get_display_qa_pairs(source, must_terms, limit=10)
-                matched_qa_pairs = inner_hits_map.get(user_id, [])
-                if not matched_qa_pairs:
-                    matched_qa_pairs = extract_matched_qa_pairs(source, must_terms)
-
-                qa_pairs_display = reorder_with_matches(
-                    source.get('qa_pairs', []),
-                    matched_qa_pairs,
-                    limit=10
-                ) if isinstance(source, dict) else qa_pairs_display
-
-                behavioral_values = behavior_values_map.get(user_id, {}) if user_id else {}
-                behavioral_info: Dict[str, Any] = {}
-                if behavioral_values.get("smoker") is not None:
-                    behavioral_info["smoker"] = behavioral_values.get("smoker")
-                if behavioral_values.get("has_vehicle") is not None:
-                    behavioral_info["has_vehicle"] = behavioral_values.get("has_vehicle")
-
-                demographic_info: Dict[str, Any] = {}
-                if metadata_1st:
-                    demographic_info["age_group"] = metadata_1st.get("age_group")
-                    demographic_info["gender"] = metadata_1st.get("gender")
-                    demographic_info["birth_year"] = metadata_1st.get("birth_year")
-
-                occupation_candidate = metadata_2nd.get("occupation") if isinstance(metadata_2nd, dict) else None
-                if not occupation_candidate and isinstance(metadata_2nd_cached, dict):
-                    occupation_candidate = metadata_2nd_cached.get("occupation")
-                if not occupation_candidate and isinstance(payload, dict):
-                    occupation_candidate = payload.get("occupation")
-                if occupation_candidate:
-                    demographic_info["occupation"] = occupation_candidate
-
-                occupation_expected = set()
-                for demo in demographic_filters.get(DemographicType.OCCUPATION, []):
-                    occupation_expected.update(build_expected_values(demo))
-
-                if ("occupation" not in demographic_info or not demographic_info["occupation"]) and user_id:
-                    mapped_occupation = occupation_display_map.get(user_id) if has_demographic_filters else None
-                    if mapped_occupation:
-                        demographic_info["occupation"] = mapped_occupation
-
-                def occupation_matches(candidate: str) -> bool:
-                    normalized_candidate = normalize_value(candidate)
-                    if not normalized_candidate:
-                        return False
-                    for expected in occupation_expected:
-                        if not expected:
-                            continue
-                        if normalized_candidate == expected or normalized_candidate in expected or expected in normalized_candidate:
-                            return True
-                    return False
-
-                if ("occupation" not in demographic_info or not demographic_info["occupation"]) and isinstance(source, dict):
-                    qa_pairs_for_occ = source.get("qa_pairs", [])
-                    for qa in qa_pairs_for_occ:
-                        if not isinstance(qa, dict):
-                            continue
-                        q_text = str(qa.get("q_text", "")).lower()
-                        answer = qa.get("answer")
-                        if answer is None:
-                            answer = qa.get("answer_text")
-                        if answer is None:
-                            continue
-                        answer_str = str(answer)
-                        if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")) and occupation_matches(answer_str):
-                            demographic_info["occupation"] = answer_str
-                            break
-
-                matched_qa_pairs: List[Dict[str, Any]] = extract_inner_hit_matches(inner_hit_wrapper)
-                if not matched_qa_pairs and analysis.must_terms:
-                    matched_qa_pairs = extract_matched_qa_pairs(source, analysis.must_terms)
-
-                qa_pairs_display = reorder_with_matches(
-                    source.get("qa_pairs", []) if isinstance(source, dict) else [],
-                    matched_qa_pairs,
-                    limit=10
-                )
-
-                results.append(
-                    SearchResult(
-                    user_id=user_id,
-                        score=doc.get("_score", 0.0),
-                        timestamp=source.get("timestamp") if isinstance(source, dict) else None,
-                        demographic_info=demographic_info if demographic_info else None,
-                        behavioral_info=behavioral_info if behavioral_info else None,
-                    qa_pairs=qa_pairs_display[:5],
-                    matched_qa_pairs=matched_qa_pairs,
-                        highlights=doc.get("highlight"),
-                )
-                )
-                logger.debug(
-                    "[match_check] user_id=%s inner_hits=%d matched=%d", 
-                    user_id,
-                    len(inner_hits_map.get(user_id, [])),
-                    len(matched_qa_pairs),
-                )
-
-            total_hits = max(os_response['hits']['total']['value'], len(qdrant_results_raw))
-            max_score = final_hits[0].get('_score', 0.0) if final_hits else 0.0
-            took_ms = os_response['took']
-
-        else:
-            # 기존 OpenSearch 단독 검색
-            logger.info("   - OpenSearch 키워드 검색만 사용")
-            data_fetcher = DataFetcher(
-                opensearch_client=os_client,
-                qdrant_client=getattr(router, 'qdrant_client', None),
-                async_opensearch_client=getattr(router, 'async_os_client', None)
-            )
-            search_response = data_fetcher.search_opensearch(
-                index_name=request.index_name,
-                query=os_query,
-                size=window_size
-            )
-
-            # 결과 포매팅
-            results = []
-            for hit in search_response['hits']['hits']:
-                # inner_hits에서 매칭된 qa_pairs 추출
-                matched_qa = []
-                if 'inner_hits' in hit and 'qa_pairs' in hit['inner_hits']:
-                    for inner_hit in hit['inner_hits']['qa_pairs']['hits']['hits']:
-                        qa_data = inner_hit['_source'].copy()
-                        qa_data['match_score'] = inner_hit['_score']
-                        if 'highlight' in inner_hit:
-                            qa_data['highlights'] = inner_hit['highlight']
-                        matched_qa.append(qa_data)
-
-                if not matched_qa and must_terms:
-                    matched_qa = extract_matched_qa_pairs(hit['_source'], must_terms)
-
-                qa_pairs_display = reorder_with_matches(
-                    hit['_source'].get('qa_pairs', []) if isinstance(hit['_source'], dict) else [],
-                    matched_qa,
-                    limit=10
-                )
-
-                behavioral_values = behavior_values_map.get(hit['_source'].get('user_id', ''), {}) if hit['_source'].get('user_id') else {}
-                behavioral_info: Dict[str, Any] = {}
-                if behavioral_values.get("smoker") is not None:
-                    behavioral_info["smoker"] = behavioral_values.get("smoker")
-                if behavioral_values.get("has_vehicle") is not None:
-                    behavioral_info["has_vehicle"] = behavioral_values.get("has_vehicle")
-
-                demographic_info: Dict[str, Any] = {}
-                if hit['_source'].get('metadata'):
-                    metadata = hit['_source'].get('metadata')
-                    if isinstance(metadata, dict):
-                        if 'age_group' in metadata:
-                            demographic_info["age_group"] = metadata['age_group']
-                        if 'gender' in metadata:
-                            demographic_info["gender"] = metadata['gender']
-                        if 'birth_year' in metadata:
-                            demographic_info["birth_year"] = metadata['birth_year']
-
-                result = SearchResult(
-                    user_id=hit['_source'].get('user_id', ''),
-                    score=hit['_score'],
-                    timestamp=hit['_source'].get('timestamp'),
-                    demographic_info=demographic_info if demographic_info else None,
-                    behavioral_info=behavioral_info if behavioral_info else None,
-                    qa_pairs=qa_pairs_display[:5],
-                    matched_qa_pairs=matched_qa,
-                    highlights=hit.get('highlight')
-                )
-                results.append(result)
-
-            total_hits = search_response['hits']['total']['value']
-            max_score = search_response['hits']['max_score']
-            took_ms = search_response['took']
-
-        total_duration_ms = (perf_counter() - overall_start) * 1000
-        timings = {
-            "opensearch_ms": took_ms,
-            "total_ms": total_duration_ms,
-            "cache_hit": 1.0 if cache_hit else 0.0,
-        }
-
-        extracted_entities_payload: Dict[str, Any] = {}
-        extracted_entities_attr = getattr(query_analysis, "extracted_entities", None)
-        if extracted_entities_attr is not None:
-            if hasattr(extracted_entities_attr, "to_dict"):
-                try:
-                    extracted_entities_payload = extracted_entities_attr.to_dict()
-                except Exception:
-                    extracted_entities_payload = {}
-            elif isinstance(extracted_entities_attr, dict):
-                extracted_entities_payload = extracted_entities_attr
-
-        serialized_results = [_serialize_result(res) for res in results]
-        stored_items = serialized_results
-        if cache_enabled and cache_limit > 0:
-            stored_items = serialized_results[:cache_limit]
-        page_results, has_more_local = _slice_results(stored_items, page, page_size)
-        has_more = has_more_local and ((page * page_size) < total_hits)
-
-        if cache_enabled and cache_key and stored_items:
-            cache_payload = {
-                "total_hits": total_hits,
-                "max_score": max_score,
-                "items": stored_items,
-                "page_size": page_size,
-                "filters": filters_for_response,
-                "extracted_entities": extracted_entities_payload,
-                "behavioral_conditions": getattr(query_analysis, "behavioral_conditions", {}),
-                "use_claude": bool(use_claude),
-            }
-            try:
-                cache_client.setex(
-                    cache_key,
-                    cache_ttl,
-                    json.dumps(cache_payload, ensure_ascii=False),
-                )
-                logger.info(f"💾 Redis 검색 캐시 저장: key={cache_key}, ttl={cache_ttl}s")
-            except Exception as cache_exc:
-                logger.warning(f"⚠️ Redis 검색 캐시 저장 실패: {cache_exc}")
-
-        logger.info(f"\n[OK] 검색 완료: {len(page_results)}건 반환 (page={page}, size={page_size})")
-        logger.info(f"{'='*60}\n")
-
-        _log_final_summary(
-            stage="search_query",
-            query=request.query,
-            analysis=query_analysis,
-            total_hits=total_hits,
-            returned_count=len(page_results),
-            page=page,
-            page_size=page_size,
-            cache_hit=cache_hit,
-            timings=timings,
-            took_ms=total_duration_ms,
-            filters=filters_for_response,
-            behavioral_conditions=getattr(query_analysis, "behavioral_conditions", {}),
-            use_claude=use_claude,
-        )
-
-        response = SearchResponse(
-            query=request.query,
-            total_hits=total_hits,
-            max_score=max_score,
-            results=page_results,
-            query_analysis={
-                "intent": query_analysis.intent,
-                "must_terms": query_analysis.must_terms,
-                "should_terms": query_analysis.should_terms,
-                "alpha": query_analysis.alpha,
-                "confidence": query_analysis.confidence,
-                "filters": filters_for_response,
-                "size": page_size,
-                "timings_ms": timings,
-                "behavioral_conditions": getattr(query_analysis, "behavioral_conditions", {}),
-                "use_claude_analyzer": bool(use_claude),
-                "extracted_entities": extracted_entities_payload,
-            },
-            took_ms=int(total_duration_ms),
-            page=page,
-            page_size=page_size,
-            has_more=has_more,
-        )
-        return _finalize_search_response(
-            request=request,
-            response=response,
-            analysis=query_analysis,
-            cache_hit=cache_hit,
-            timings=timings,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[ERROR] 검색 중 오류 발생: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"검색 중 오류 발생: {str(e)}"
-        )
 
 
 class NLSearchRequest(BaseModel):
     """자연어 기반 검색 요청 (필터/size 자동 추출)"""
     query: str = Field(..., description="자연어 쿼리 (예: '30대 사무직 300명 데이터 보여줘')")
     index_name: str = Field(
-        default="welcome_all",
-        description="검색할 인덱스 이름 (기본값: alias 'welcome_all'; 와일드카드 사용 가능)"
+        default="survey_responses_merged",
+        description="검색할 인덱스 이름 (기본값: survey_responses_merged; 와일드카드 사용 가능)"
     )
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
     page: int = Field(default=1, ge=1, description="요청할 페이지 번호 (1부터 시작)")
@@ -2390,6 +1803,17 @@ async def search_natural_language(
             raise RuntimeError("Query analysis returned None")
         query_analysis = analysis
 
+        # ⭐ 자동으로 쿼리에서 behavioral 조건 추출 및 병합
+        auto_behavioral = extract_behavioral_conditions_from_query(request.query)
+        if auto_behavioral:
+            # 기존 behavioral_conditions와 병합 (자동 추출이 우선)
+            if not analysis.behavioral_conditions:
+                analysis.behavioral_conditions = {}
+            for key, value in auto_behavioral.items():
+                if key not in analysis.behavioral_conditions:
+                    analysis.behavioral_conditions[key] = value
+            logger.info(f"✅ 자동 추출된 behavioral 조건: {auto_behavioral}")
+
         embedding_model = getattr(router, 'embedding_model', None)
         if embedding_model is None and hasattr(router, 'embedding_model_factory'):
             embedding_model = router.embedding_model_factory()
@@ -2410,10 +1834,13 @@ async def search_natural_language(
 
         # Demographics 필터
         for demo in extracted_entities.demographics:
-            # ✅ welcome_all 인덱스는 metadata에 demographics가 있으므로 metadata만 사용
-            # qa_pairs fallback을 사용하면 여러 nested 쿼리가 충돌하여 0건이 됨!
-            metadata_only = True  # ✅ Changed: metadata만 사용 (welcome_all에는 metadata 있음)
-            include_nested_fallback = False  # ✅ Changed: qa_pairs fallback 비활성화
+            # ⭐ 인덱스별 필터 전략:
+            # - survey_responses_merged: metadata와 qa_pairs 모두 있음
+            # - survey_responses_merged: 일부는 metadata, 일부는 qa_pairs에만 있음 → qa_fallback 활성화
+            # 예: region은 metadata에, marital_status는 qa_pairs에만 있을 수 있음
+            is_survey_merged = request.index_name in ["survey_responses_merged", "s_survey*"]
+            metadata_only = not is_survey_merged  # survey_responses_merged는 False
+            include_nested_fallback = is_survey_merged  # survey_responses_merged는 True (qa_pairs도 검색)
             filter_clause = demo.to_opensearch_filter(
                 metadata_only=metadata_only,
                 include_qa_fallback=include_nested_fallback,
@@ -2427,10 +1854,42 @@ async def search_natural_language(
             filters.extend(behavioral_filters)
             logger.info(f"✅ Behavioral 필터 추가: {analysis.behavioral_conditions} → {len(behavioral_filters)}개 필터")
 
+        # ⭐ inner_hits 제거 (중복 key 에러 방지)
+        def remove_inner_hits_from_filter(query_dict):
+            """재귀적으로 inner_hits 제거"""
+            import copy
+            cleaned = copy.deepcopy(query_dict)
+
+            if isinstance(cleaned, dict):
+                if 'nested' in cleaned:
+                    if 'inner_hits' in cleaned['nested']:
+                        del cleaned['nested']['inner_hits']
+                    if 'query' in cleaned['nested']:
+                        cleaned['nested']['query'] = remove_inner_hits_from_filter(cleaned['nested']['query'])
+
+                if 'bool' in cleaned:
+                    for key in ['must', 'should', 'must_not', 'filter']:
+                        if key in cleaned['bool']:
+                            if isinstance(cleaned['bool'][key], list):
+                                cleaned['bool'][key] = [remove_inner_hits_from_filter(item) for item in cleaned['bool'][key]]
+                            else:
+                                cleaned['bool'][key] = remove_inner_hits_from_filter(cleaned['bool'][key])
+
+            return cleaned
+
+        # filters에서 inner_hits 제거
+        logger.info(f"🔍 필터 상태 before inner_hits removal: filters={len(filters) if filters else 0}개")
+        if filters:
+            filters = [remove_inner_hits_from_filter(f) for f in filters]
+            logger.info(f"✅ inner_hits 제거 완료: {len(filters)}개 필터")
+        else:
+            logger.warning(f"⚠️ filters가 비어있음!")
+
         filters_for_response = list(filters)
         filters_signature = _normalize_filters_for_cache(filters_for_response)
 
-        page_size = max(1, min(requested_size, 100))
+        # ⭐ page_size 제한 완화: 100 → 5000 (전체 결과 확인 가능하도록)
+        page_size = max(1, min(requested_size, 5000))
         page = max(1, request.page)
         requested_window = page_size * page
         cache_client = getattr(router, "redis_client", None)
@@ -2500,7 +1959,8 @@ async def search_natural_language(
         occupation_filters = [f for f in filters if is_occupation_filter(f)]
         other_filters = [f for f in filters if f not in age_gender_filters and f not in occupation_filters]
 
-        filters_os = age_gender_filters + other_filters
+        # ⭐ occupation_filters도 포함시키기 (이전에는 two-phase search에만 사용됨)
+        filters_os = age_gender_filters + occupation_filters + other_filters
         filters = filters_os  # 유지보수: 기존 로직과 호환성을 위해
         has_demographic_filters = bool(filters_for_response)
         occupation_filter_handled = False
@@ -2509,6 +1969,9 @@ async def search_natural_language(
         logger.info(f"  - age_gender_filters: {len(age_gender_filters)}개")
         logger.info(f"  - occupation_filters: {len(occupation_filters)}개")
         logger.info(f"  - other_filters: {len(other_filters)}개")
+        logger.info(f"  - filters_os (합계): {len(filters_os)}개")
+        if occupation_filters:
+            logger.info(f"  - occupation_filters 샘플: {json.dumps(occupation_filters[0] if occupation_filters else {}, ensure_ascii=False)[:500]}")
 
         two_phase_applicable = bool(age_gender_filters and occupation_filters)
         two_phase_response: Optional[SearchResponse] = None
@@ -2580,6 +2043,10 @@ async def search_natural_language(
             query_vector=query_vector,
             size=size,
         )
+
+        # 🔍 Base Query 로깅
+        logger.info(f"🔍 [BASE QUERY] 생성 완료")
+        logger.info(json.dumps(base_query, ensure_ascii=False, indent=2))
 
         # 3) 필터 적용 전략: 필터는 must로, 키워드는 should로 완화
         # - 필터(30대, 사무직)는 반드시 매칭되어야 함
@@ -2716,7 +2183,7 @@ async def search_natural_language(
                                                 elif '성별' in str(q_text_val):
                                                     filter_type = 'gender'
                                                     break
-                                                elif '직업' in str(q_text_val):
+                                                elif '직업' in str(q_text_val) or '직무' in str(q_text_val):
                                                     filter_type = 'occupation'
                                                     break
                                 elif 'match' in nq:
@@ -2729,7 +2196,7 @@ async def search_natural_language(
                                         elif '성별' in str(q_text_val):
                                             filter_type = 'gender'
                                             break
-                                        elif '직업' in str(q_text_val):
+                                        elif '직업' in str(q_text_val) or '직무' in str(q_text_val):
                                             filter_type = 'occupation'
                                             break
                         if filter_type:
@@ -2772,12 +2239,16 @@ async def search_natural_language(
             # 각 타입별로 OR, 타입 간은 AND (should로 완화)
             should_filters = []
             for filter_type, type_filters in filter_by_type.items():
-                if len(type_filters) == 1:
+                if filter_type == 'unknown':
+                    # ⭐ unknown 타입은 각각 개별적으로 추가 (AND 처리)
+                    # region, marital_status 등 서로 다른 필터는 모두 만족해야 함
+                    should_filters.extend(type_filters)
+                elif len(type_filters) == 1:
                     # 단일 필터: 필터를 그대로 사용 (이미 bool 쿼리 형태)
                     filter_item = type_filters[0]
                     should_filters.append(filter_item)
                 else:
-                    # 같은 타입 필터는 OR
+                    # 같은 타입 필터는 OR (예: 30대 OR 40대)
                     should_filters.append({
                         'bool': {
                             'should': type_filters,
@@ -2786,7 +2257,7 @@ async def search_natural_language(
                     })
             
             # ⭐ 기존 쿼리와 필터 결합 (must로 결합: 모든 필터를 만족해야 함)
-            # welcome_1st: 연령/성별, welcome_2nd: 직업 정보
+            # survey_responses_merged: 모든 인구통계 정보 포함
             # 각 인덱스에서 정보를 가져와야 하므로 must로 결합
             if existing_query is None or existing_query == {"match_all": {}} or existing_query == {"match_none": {}}:
                 # 키워드 쿼리가 없거나 match_all/match_none인 경우: 필터를 must로 사용
@@ -2834,304 +2305,92 @@ async def search_natural_language(
         has_behavioral = bool(getattr(analysis, "behavioral_conditions", None))
 
         # ⭐ 검색 크기 설정: behavioral 필터가 있으면 더 많은 결과 필요
+        # ⭐ 최소값을 10으로 설정 (테스트/디버깅용)
         if has_filters or has_behavioral:
             if has_behavioral:
-                qdrant_limit = min(max(size * 5, 500), 1500)
-                search_size = min(max(size * 10, 1000), 3000)
+                qdrant_limit = min(max(size * 5, 500), 5000)
+                search_size = min(max(size * 10, 10), 10000)  # 최소값 1000 → 10
             else:
-                qdrant_limit = min(max(size * 3, 300), 800)
-                search_size = min(max(size * 5, 500), 1500)
+                qdrant_limit = min(max(size * 3, 300), 5000)
+                search_size = min(max(size * 5, 10), 10000)  # 최소값 500 → 10
             logger.info(f"🔍 필터 적용: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (behavioral={has_behavioral})")
         else:
-            qdrant_limit = min(max(size, 60), 150)
-            search_size = min(max(size * 2, 80), 200)
+            qdrant_limit = min(max(size, 60), 5000)
+            search_size = min(max(size * 2, 10), 10000)  # 최소값 80 → 10
             logger.info(f"🔍 필터 없음: OpenSearch size={search_size}, Qdrant limit={qdrant_limit}")
 
         # 4) 실행: 하이브리드 (OpenSearch + 선택적 Qdrant) with RRF
-        # ⭐ STEP 1: welcome_1st와 welcome_2nd를 각각 별도로 검색
+        # ⭐ survey_responses_merged 단일 인덱스만 검색
         
         # OpenSearch _source filtering: 필요한 필드만 조회
+        # ⭐ qa_pairs 포함: marital_status, region 등이 qa_pairs에 있을 수 있음
         source_filter = {
-            "includes": ["user_id", "metadata", "timestamp"],
+            "includes": ["user_id", "metadata", "timestamp", "qa_pairs"],
             "excludes": []  # 필요시 제외할 필드 추가
         }
         
-        # welcome_1st와 welcome_2nd를 별도로 검색할지 결정
-        # 필터에 연령/성별이 있으면 welcome_1st 검색, 직업이 있으면 welcome_2nd 검색
-        search_welcome_1st = False
-        search_welcome_2nd = False
-        search_other_indices = True
+        # ⭐⭐⭐ survey_responses_merged 단일 인덱스만 사용
+        logger.info(f"🔍 인덱스 검색: {request.index_name} (survey_responses_merged만 사용)")
         
-        if filters:
-            for demo in extracted_entities.demographics:
-                if demo.demographic_type == DemographicType.AGE or demo.demographic_type == DemographicType.GENDER:
-                    search_welcome_1st = True
-                elif demo.demographic_type == DemographicType.OCCUPATION:
-                    search_welcome_2nd = True
+        # survey_responses_merged 인덱스 검색
+        keyword_results: List[Dict[str, Any]] = []
+        vector_results: List[Dict[str, Any]] = []
         
-        # 필터가 없거나 모든 인덱스를 검색해야 하는 경우
-        if not filters or request.index_name == '*':
-            search_welcome_1st = True
-            search_welcome_2nd = True
-        
-        logger.info(f"🔍 인덱스별 검색 전략:")
-        logger.info(f"  - welcome_1st 검색: {search_welcome_1st}")
-        logger.info(f"  - welcome_2nd 검색: {search_welcome_2nd}")
-        logger.info(f"  - 기타 인덱스 검색: {search_other_indices}")
-        
-        # ⭐ 인덱스별 필터 분리: welcome_1st는 연령/성별만, welcome_2nd는 직업만
-        logger.info(f"🔍 인덱스별 검색 전략:")
-        logger.info(f"  - welcome_1st 검색: {search_welcome_1st}")
-        logger.info(f"  - welcome_2nd 검색: {search_welcome_2nd}")
-        logger.info(f"  - 기타 인덱스 검색: {search_other_indices}")
+        try:
+            # OpenSearch 키워드 검색
+            query_body = final_query.copy()
+            if not isinstance(query_body.get('query'), dict):
+                logger.warning("  ⚠️ 쿼리가 비어 있어 match_all로 대체합니다")
+                query_body['query'] = {"match_all": {}}
 
-        def create_safe_query_template(size_value: int) -> Dict[str, Any]:
-            """안전한 기본 쿼리 생성"""
-            return {
-                'query': {'match_all': {}},
-                'size': size_value,
-                '_source': {
-                'includes': ['user_id', 'metadata', 'timestamp']
-                }
-            }
+            # 🔍 OpenSearch 쿼리 로깅 (디버깅용)
+            logger.info(f"🔍 OpenSearch 쿼리:")
+            logger.info(json.dumps(query_body, ensure_ascii=False, indent=2))
 
-        welcome_1st_query = create_safe_query_template(search_size)
-        welcome_2nd_query = create_safe_query_template(search_size)
-
-        if filters:
-            logger.info(f"🔍 인덱스별 필터 분리 중...")
-
-            age_gender_filters_split = [f for f in filters if is_age_or_gender_filter(f)]
-            occupation_filters_split = [f for f in filters if is_occupation_filter(f)]
-            occupation_entities = [
-                demo for demo in extracted_entities.demographics
-                if demo.demographic_type == DemographicType.OCCUPATION
-            ]
-
-            logger.info(f"  - 연령/성별 필터: {len(age_gender_filters_split)}개")
-            logger.info(f"  - 직업 필터: {len(occupation_filters_split)}개")
-
-            if age_gender_filters_split:
-                welcome_1st_query['query'] = {
-                    'bool': {
-                        'must': age_gender_filters_split
-                    }
-                }
-                logger.info(f"  ✅ welcome_1st: 연령/성별 필터 {len(age_gender_filters_split)}개 적용")
-            else:
-                logger.info(f"  ⚠️ welcome_1st: 필터 없음, match_all 사용")
-
-            occupation_dsl_filter = build_occupation_dsl_filter(occupation_entities)
-            if occupation_dsl_filter and occupation_dsl_filter != {"match_all": {}}:
-                welcome_2nd_query['query'] = {
-                    'bool': {
-                        'must': [occupation_dsl_filter]
-                    }
-                }
-                occupation_filter_handled = True
-                logger.info(f"  ✅ welcome_2nd: 직업 필터 DSL 적용 ({len(occupation_entities)}개)")
-            elif occupation_filters_split:
-                welcome_2nd_query['query'] = {
-                    'bool': {
-                        'must': occupation_filters_split
-                    }
-                }
-                logger.info(f"  ⚠️ welcome_2nd: DSL 생성 실패 → 기존 필터 {len(occupation_filters_split)}개 적용")
-            else:
-                logger.info(f"  ⚠️ welcome_2nd: 필터 없음, match_all 사용")
-        else:
-            logger.info(f"  ⚠️ 필터 없음: 모든 인덱스에서 match_all 사용")
-
-        logger.info(f"📋 최종 쿼리 확인:")
-        logger.info(f"  welcome_1st: {json.dumps(welcome_1st_query, ensure_ascii=False)[:200]}...")
-        logger.info(f"  welcome_2nd: {json.dumps(welcome_2nd_query, ensure_ascii=False)[:200]}...")
-
-        welcome_1st_keyword_results: List[Dict[str, Any]] = []
-        welcome_1st_vector_results: List[Dict[str, Any]] = []
-        if search_welcome_1st:
-            logger.info(f"📊 [1/3] welcome_1st 검색 중...")
-            try:
-                if 'query' not in welcome_1st_query or not welcome_1st_query['query']:
-                    raise ValueError("welcome_1st_query에 'query' 키가 없습니다")
-
-                os_response_1st = data_fetcher.search_opensearch(
-                    index_name="s_welcome_1st",
-                    query=remove_inner_hits(welcome_1st_query),
-                    size=search_size,
-                    source_filter=source_filter,
-                    request_timeout=DEFAULT_OS_TIMEOUT,
-                )
-                welcome_1st_keyword_results = os_response_1st['hits']['hits']
-                logger.info(f"  ✅ OpenSearch: {len(welcome_1st_keyword_results)}건")
-                
-                # Qdrant 벡터 검색
-                if request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
-                    qdrant_client = router.qdrant_client
-                    try:
-                        r = qdrant_client.search(
-                            collection_name="s_welcome_1st",
-                            query_vector=query_vector,
-                            limit=qdrant_limit,  # 필터 유무에 따라 분기된 limit 사용
-                            score_threshold=0.3,
-                        )
-                        for item in r:
-                            welcome_1st_vector_results.append({
-                                '_id': str(item.id),
-                                '_score': item.score,
-                                '_source': item.payload,
-                                '_index': 's_welcome_1st',
-                            })
-                        logger.info(f"  ✅ Qdrant: {len(welcome_1st_vector_results)}건")
-                    except Exception as e:
-                        logger.debug(f"  ⚠️ Qdrant 검색 실패: {e}")
-            except Exception as e:
-                logger.warning(f"  ⚠️ welcome_1st 검색 실패: {e}")
-        
-        # welcome_2nd 검색
-        welcome_2nd_keyword_results: List[Dict[str, Any]] = []
-        welcome_2nd_vector_results: List[Dict[str, Any]] = []
-        if search_welcome_2nd:
-            logger.info(f"📊 [2/3] welcome_2nd 검색 중...")
-            try:
-                os_response_2nd = data_fetcher.search_opensearch(
-                    index_name=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
-                    query=remove_inner_hits(welcome_2nd_query),
-                    size=search_size,
-                    source_filter=source_filter,
-                    request_timeout=DEFAULT_OS_TIMEOUT,
-                )
-                welcome_2nd_keyword_results = os_response_2nd['hits']['hits']
-                logger.info(f"  ✅ OpenSearch: {len(welcome_2nd_keyword_results)}건")
-                
-                # Qdrant 벡터 검색
-                if request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
-                    qdrant_client = router.qdrant_client
-                    try:
-                        r = qdrant_client.search(
-                            collection_name=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
-                            query_vector=query_vector,
-                            limit=qdrant_limit,  # 필터 유무에 따라 분기된 limit 사용
-                            score_threshold=0.3,
-                        )
-                        for item in r:
-                            welcome_2nd_vector_results.append({
-                                '_id': str(item.id),
-                                '_score': item.score,
-                                '_source': item.payload,
-                                '_index': config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
-                            })
-                        logger.info(f"  ✅ Qdrant: {len(welcome_2nd_vector_results)}건")
-                    except Exception as e:
-                        logger.debug(f"  ⚠️ Qdrant 검색 실패: {e}")
-            except Exception as e:
-                logger.warning(f"  ⚠️ welcome_2nd 검색 실패: {e}")
-        
-        # 기타 인덱스 검색 (survey_* 등)
-        other_keyword_results: List[Dict[str, Any]] = []
-        other_vector_results: List[Dict[str, Any]] = []
-        if search_other_indices:
-            logger.info(f"📊 [3/3] 기타 인덱스 검색 중...")
-            # welcome_1st, welcome_2nd를 제외한 인덱스 검색
-            other_index_pattern = request.index_name
-            if request.index_name == '*':
-                # survey_* 패턴으로 검색 (welcome_1st, welcome_2nd 제외)
-                other_index_pattern = "survey_*"
-            elif 's_welcome_1st' in request.index_name or 's_welcome_2nd' in request.index_name:
-                # welcome 인덱스를 제외한 패턴 생성
-                indices = [idx.strip() for idx in request.index_name.split(',')]
-                other_indices = [idx for idx in indices if idx not in ['s_welcome_1st', 's_welcome_2nd']]
-                if other_indices:
-                    other_index_pattern = ','.join(other_indices)
-                else:
-                    search_other_indices = False
+            os_response = data_fetcher.search_opensearch(
+                index_name=request.index_name,
+                query=query_body,
+                size=search_size,
+                source_filter=source_filter,
+                request_timeout=DEFAULT_OS_TIMEOUT,
+            )
+            keyword_results = os_response['hits']['hits']
+            logger.info(f"  ✅ OpenSearch: {len(keyword_results)}건")
             
-            if search_other_indices:
+            # Qdrant 벡터 검색
+            if request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
+                qdrant_client = router.qdrant_client
                 try:
-                    other_query_body = final_query.copy()
-                    if not isinstance(other_query_body.get('query'), dict):
-                        logger.warning("  ⚠️ 기타 인덱스 쿼리가 비어 있어 match_all로 대체합니다")
-                        other_query_body['query'] = {"match_all": {}}
-                    os_response_other = data_fetcher.search_opensearch(
-                        index_name=other_index_pattern,
-                        query=other_query_body,
-                        size=search_size,
-                        source_filter=source_filter,
-                        request_timeout=DEFAULT_OS_TIMEOUT,
-                    )
-                    other_keyword_results = os_response_other['hits']['hits']
-                    logger.info(f"  ✅ OpenSearch: {len(other_keyword_results)}건")
-                    
-                    # Qdrant 벡터 검색 (기타 컬렉션)
-                    if request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
-                        qdrant_client = router.qdrant_client
-                        try:
-                            collections = qdrant_client.get_collections()
-                            for col in collections.collections:
-                                if col.name not in ['s_welcome_1st', 's_welcome_2nd']:
-                                    try:
-                                        r = qdrant_client.search(
-                                            collection_name=col.name,
-                                            query_vector=query_vector,
-                                            limit=qdrant_limit,  # 필터 유무에 따라 분기된 limit 사용
-                                            score_threshold=0.3,
-                                        )
-                                        for item in r:
-                                            other_vector_results.append({
-                                                '_id': str(item.id),
-                                                '_score': item.score,
-                                                '_source': item.payload,
-                                                '_index': col.name,
-                                            })
-                                    except Exception:
-                                        continue
-                            logger.info(f"  ✅ Qdrant: {len(other_vector_results)}건")
-                        except Exception as e:
-                            logger.debug(f"  ⚠️ Qdrant 검색 실패: {e}")
+                    # survey_responses_merged 컬렉션만 검색
+                    collection_name = request.index_name  # survey_responses_merged
+                    try:
+                        r = qdrant_client.search(
+                            collection_name=collection_name,
+                            query_vector=query_vector,
+                            limit=qdrant_limit,
+                            score_threshold=0.3,
+                        )
+                        for item in r:
+                            vector_results.append({
+                                '_id': str(item.id),
+                                '_score': item.score,
+                                '_source': item.payload,
+                                '_index': collection_name,
+                            })
+                        logger.info(f"  ✅ Qdrant: {len(vector_results)}건")
+                    except Exception as e:
+                        logger.debug(f"  ⚠️ Qdrant 컬렉션 '{collection_name}' 검색 실패: {e}")
                 except Exception as e:
-                    logger.warning(f"  ⚠️ 기타 인덱스 검색 실패: {e}")
+                    logger.debug(f"  ⚠️ Qdrant 검색 실패: {e}")
+        except Exception as e:
+            logger.warning(f"  ⚠️ 인덱스 검색 실패: {e}")
         
-        # user_id 및 _id -> 원본 문서 매핑 생성 (모든 인덱스 결과에서)
+        # user_id 및 _id -> 원본 문서 매핑 생성
         user_doc_map = {}
-        id_doc_map = {}  # _id 기반 매핑도 추가
+        id_doc_map = {}
         
-        # welcome_1st 매핑
-        for hit in welcome_1st_keyword_results:
-            source = hit.get('_source', {})
-            user_id = source.get('user_id')
-            doc_id = hit.get('_id')
-            
-            doc_info = {
-                'source': source,
-                'inner_hits': hit.get('inner_hits', {}),
-                'highlight': hit.get('highlight'),
-                'index': 's_welcome_1st'
-            }
-            
-            if user_id:
-                user_doc_map[user_id] = doc_info
-            if doc_id:
-                id_doc_map[doc_id] = doc_info
-        
-        # welcome_2nd 매핑
-        for hit in welcome_2nd_keyword_results:
-            source = hit.get('_source', {})
-            user_id = source.get('user_id')
-            doc_id = hit.get('_id')
-            
-            doc_info = {
-                'source': source,
-                'inner_hits': hit.get('inner_hits', {}),
-                'highlight': hit.get('highlight'),
-                'index': config.WELCOME_INDEX  # ✅ Changed from s_welcome_2nd to use config
-            }
-            
-            if user_id:
-                user_doc_map[user_id] = doc_info
-            if doc_id:
-                id_doc_map[doc_id] = doc_info
-        
-        # 기타 인덱스 매핑
-        for hit in other_keyword_results:
+        # 검색 결과 매핑
+        for hit in keyword_results:
             source = hit.get('_source', {})
             user_id = source.get('user_id')
             doc_id = hit.get('_id')
@@ -3148,52 +2407,31 @@ async def search_natural_language(
             if doc_id:
                 id_doc_map[doc_id] = doc_info
 
-        # ⭐ 통합 RRF 결합: 한 번만 실행
+        # ⭐ RRF 결합
         logger.info(f"\n{'='*60}")
-        logger.info("📊 RRF 결합: 단일 패스 실행")
+        logger.info("📊 RRF 결합")
         logger.info(f"{'='*60}")
 
         # 벡터 결과에 인덱스 메타데이터 보강
-        for doc in welcome_1st_vector_results:
-            doc.setdefault('_index', 's_welcome_1st')
-        for doc in welcome_2nd_vector_results:
-            doc.setdefault('_index', 's_welcome_2nd')
-        for doc in other_vector_results:
+        for doc in vector_results:
             if '_index' not in doc:
-                doc['_index'] = doc.get('collection', doc.get('_source', {}).get('index', 'unknown'))
+                doc['_index'] = doc.get('collection', doc.get('_source', {}).get('index', request.index_name))
 
-        all_keyword_results: List[Dict[str, Any]] = []
-        all_vector_results: List[Dict[str, Any]] = []
-
-        if welcome_1st_keyword_results:
-            all_keyword_results.extend(welcome_1st_keyword_results)
-        if welcome_2nd_keyword_results:
-            all_keyword_results.extend(welcome_2nd_keyword_results)
-        if other_keyword_results:
-            all_keyword_results.extend(other_keyword_results)
-
-        if welcome_1st_vector_results:
-            all_vector_results.extend(welcome_1st_vector_results)
-        if welcome_2nd_vector_results:
-            all_vector_results.extend(welcome_2nd_vector_results)
-        if other_vector_results:
-            all_vector_results.extend(other_vector_results)
-
-        logger.info(f"  - 총 키워드 결과: {len(all_keyword_results)}건")
-        logger.info(f"  - 총 벡터   결과: {len(all_vector_results)}건")
+        logger.info(f"  - 키워드 결과: {len(keyword_results)}건")
+        logger.info(f"  - 벡터   결과: {len(vector_results)}건")
 
         rrf_start = perf_counter()
 
-        if request.use_vector_search and all_vector_results:
+        if request.use_vector_search and vector_results:
             combined_rrf, rrf_k_used, rrf_reason = calculate_rrf_score_adaptive(
-                keyword_results=all_keyword_results,
-                vector_results=all_vector_results,
+                keyword_results=keyword_results,
+                vector_results=vector_results,
                 query_intent=getattr(analysis, "intent", None),
                 has_filters=has_filters,
                 use_vector_search=request.use_vector_search,
             )
         else:
-            combined_rrf = all_keyword_results
+            combined_rrf = keyword_results
             if request.use_vector_search:
                 rrf_reason = "벡터 결과 없음 → 키워드 결과 사용"
             else:
@@ -3283,8 +2521,7 @@ async def search_natural_language(
         occupation_display_map: Dict[str, str] = {}
         behavior_values_map: Dict[str, Dict[str, Optional[bool]]] = {}
         doc_user_map: Dict[int, str] = {}
-        welcome_1st_batch: Dict[str, Dict[str, Any]] = {}
-        welcome_2nd_batch: Dict[str, Dict[str, Any]] = {}
+        # ⭐ survey_responses_merged만 사용하므로 welcome_1st/welcome_2nd 배치 제거
         synonym_cache: Dict[str, List[str]] = {}
 
         PLACEHOLDER_TOKENS: Set[str] = {
@@ -3388,22 +2625,19 @@ async def search_natural_language(
             has_filter_constraints = has_demographic_filters or has_behavioral_conditions
         if has_filter_constraints:
 
-            gender_dsl_handled = bool(demographic_filters.get(DemographicType.GENDER)) and search_welcome_1st
-            age_dsl_handled = bool(demographic_filters.get(DemographicType.AGE)) and search_welcome_1st
+            # ⭐ survey_responses_merged만 사용하므로 welcome_1st 관련 로직 제거
+            gender_dsl_handled = bool(demographic_filters.get(DemographicType.GENDER))
+            age_dsl_handled = bool(demographic_filters.get(DemographicType.AGE))
             occupation_dsl_handled = bool(demographic_filters.get(DemographicType.OCCUPATION)) and occupation_filter_handled
 
-            filters_to_validate: List[DemographicType] = []
-            for demo_type in (
-                DemographicType.GENDER,
-                DemographicType.AGE,
-                DemographicType.OCCUPATION,
-            ):
-                if demographic_filters.get(demo_type):
-                    filters_to_validate.append(demo_type)
-
-            if not filters_to_validate and demographic_filters:
-                filters_to_validate = list(demographic_filters.keys())
-                logger.info("  ⚠️ DSL에서 필터를 적용했지만 안전성 확인을 위해 후처리 검증을 수행합니다.")
+            # ⭐ 모든 demographic_filters를 검증 (REGION, MARITAL_STATUS 포함!)
+            # ⭐ 단, OCCUPATION과 JOB_FUNCTION은 OpenSearch에서 qa_pairs로 검색하므로 후처리 검증 스킵
+            filters_to_validate: List[DemographicType] = [
+                f for f in demographic_filters.keys()
+                if f not in {DemographicType.OCCUPATION, DemographicType.JOB_FUNCTION}
+            ]
+            logger.info(f"  ✅ 후처리 검증 대상: {[f.value for f in filters_to_validate]}")
+            logger.info(f"  ⚠️ 후처리 검증 제외 (OpenSearch 필터만 사용): {[f.value for f in demographic_filters.keys() if f in {DemographicType.OCCUPATION, DemographicType.JOB_FUNCTION}]}")
 
             for demo in extracted_entities.demographics:
                 cache_key = f"{demo.demographic_type.value}:{demo.raw_value}"
@@ -3421,8 +2655,6 @@ async def search_natural_language(
             
             user_ids_to_fetch: Set[str] = set()
             doc_user_map.clear()
-            welcome_1st_batch.clear()
-            welcome_2nd_batch.clear()
             
             logger.info(f"🔍 user_id 수집 중: RRF 결과 {len(rrf_results)}건...")
             for doc in rrf_results:
@@ -3452,132 +2684,7 @@ async def search_natural_language(
                     doc_user_map[id(doc)] = user_id
             
             logger.info(f"  ✅ 수집된 user_id: {len(user_ids_to_fetch)}건")
-            
-            if user_ids_to_fetch:
-                user_ids_list = list(user_ids_to_fetch)
-                total_batches = (len(user_ids_list) + 199) // 200
-                logger.info(f"🔍 배치 조회: welcome_1st/welcome_2nd {len(user_ids_list)}건 조회 중...")
-
-                for uid in list(user_ids_list):
-                    cached_1 = _cache_get_welcome_doc("s_welcome_1st", uid)
-                    if cached_1:
-                        welcome_1st_batch[uid] = cached_1
-                    cached_2 = _cache_get_welcome_doc(config.WELCOME_INDEX, uid)  # ✅ Changed from s_welcome_2nd to use config
-                    if cached_2:
-                        welcome_2nd_batch[uid] = cached_2
-
-                uncached_1st = [uid for uid in user_ids_list if uid not in welcome_1st_batch]
-                uncached_2nd = [uid for uid in user_ids_list if uid not in welcome_2nd_batch]
-
-                try:
-                    if data_fetcher.os_async_client:
-                        if uncached_1st:
-                            raw_welcome_1st_docs = await data_fetcher.multi_get_documents_async(
-                                index_name="s_welcome_1st",
-                                doc_ids=uncached_1st,
-                                source_fields=["metadata", "user_id", "qa_pairs"],
-                            ) or []
-                            fetched_map = data_fetcher.docs_to_user_map(raw_welcome_1st_docs)
-                            welcome_1st_batch.update(fetched_map)
-                            for uid, doc_item in fetched_map.items():
-                                _cache_put_welcome_doc("s_welcome_1st", uid, doc_item)
-
-                        if uncached_2nd:
-                            raw_welcome_2nd_docs = await data_fetcher.multi_get_documents_async(
-                                index_name=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
-                                doc_ids=uncached_2nd,
-                                source_fields=["metadata", "user_id", "qa_pairs"],
-                            ) or []
-                            fetched_map = data_fetcher.docs_to_user_map(raw_welcome_2nd_docs)
-                            welcome_2nd_batch.update(fetched_map)
-                            for uid, doc_item in fetched_map.items():
-                                _cache_put_welcome_doc(config.WELCOME_INDEX, uid, doc_item)  # ✅ Changed from s_welcome_2nd to use config
-                    else:
-                        if uncached_1st:
-                            for batch_idx in range(0, len(uncached_1st), 200):
-                                batch_ids = uncached_1st[batch_idx:batch_idx + 200]
-                                batch_num = (batch_idx // 200) + 1
-                                try:
-                                    mget_body = [{"_index": "s_welcome_1st", "_id": uid} for uid in batch_ids]
-                                    mget_response = os_client.mget(body={"docs": mget_body}, ignore=[404], request_timeout=60)
-                                    for item in mget_response.get('docs', []):
-                                        if item.get('found'):
-                                            welcome_1st_batch[item['_id']] = item['_source']
-                                            _cache_put_welcome_doc("s_welcome_1st", item['_id'], item['_source'])
-                                    logger.debug(f"  📦 welcome_1st 배치 {batch_num}/{total_batches}: {len([d for d in mget_response.get('docs', []) if d.get('found')])}/{len(batch_ids)}건")
-                                except Exception as e:
-                                    logger.warning(f"  ⚠️ welcome_1st 배치 {batch_num}/{total_batches} 실패: {e}")
-                                    continue
-
-                        if uncached_2nd:
-                            for batch_idx in range(0, len(uncached_2nd), 200):
-                                batch_ids = uncached_2nd[batch_idx:batch_idx + 200]
-                                batch_num = (batch_idx // 200) + 1
-                                try:
-                                    mget_body = [{"_index": config.WELCOME_INDEX, "_id": uid} for uid in batch_ids]  # ✅ Changed from s_welcome_2nd to use config
-                                    mget_response = os_client.mget(body={"docs": mget_body}, ignore=[404], request_timeout=60)
-                                    for item in mget_response.get('docs', []):
-                                        if item.get('found'):
-                                            welcome_2nd_batch[item['_id']] = item['_source']
-                                            _cache_put_welcome_doc(config.WELCOME_INDEX, item['_id'], item['_source'])  # ✅ Changed from s_welcome_2nd to use config
-                                    logger.debug(f"  📦 welcome_2nd 배치 {batch_num}/{total_batches}: {len([d for d in mget_response.get('docs', []) if d.get('found')])}/{len(batch_ids)}건")
-                                except Exception as e:
-                                    logger.warning(f"  ⚠️ welcome_2nd 배치 {batch_num}/{total_batches} 실패: {e}")
-                                    continue
-
-                    missing_1st = user_ids_to_fetch - set(welcome_1st_batch.keys())
-                    missing_2nd = user_ids_to_fetch - set(welcome_2nd_batch.keys())
-
-                    if missing_1st and len(missing_1st) <= 1000:
-                        logger.info(f"  🔍 welcome_1st 추가 조회 시도: {len(missing_1st)}건...")
-                        missing_ids = list(missing_1st)
-                        if data_fetcher.os_async_client:
-                            extra_docs_raw = await data_fetcher.multi_get_documents_async(
-                                index_name="s_welcome_1st",
-                                doc_ids=missing_ids,
-                                source_fields=["metadata", "user_id", "qa_pairs"],
-                            )
-                            welcome_1st_batch.update(data_fetcher.docs_to_user_map(extra_docs_raw))
-                        else:
-                            response = os_client.mget(
-                                index="s_welcome_1st",
-                                body={"ids": missing_ids},
-                                _source=["metadata", "user_id", "qa_pairs"],
-                                request_timeout=60,
-                                ignore=[404]
-                            )
-                            for doc_item in response.get('docs', []):
-                                if doc_item.get('found'):
-                                    welcome_1st_batch[doc_item['_id']] = doc_item['_source']
-                                    _cache_put_welcome_doc("s_welcome_1st", doc_item['_id'], doc_item['_source'])
-                        logger.info(f"  ✅ welcome_1st 추가 조회 후 총 {len(welcome_1st_batch)}건")
-
-                    if missing_2nd and len(missing_2nd) <= 1000:
-                        logger.info(f"  🔍 welcome_2nd 추가 조회 시도: {len(missing_2nd)}건...")
-                        missing_ids = list(missing_2nd)
-                        if data_fetcher.os_async_client:
-                            extra_docs_raw = await data_fetcher.multi_get_documents_async(
-                                index_name=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
-                                doc_ids=missing_ids,
-                                source_fields=["metadata", "user_id", "qa_pairs"],
-                            )
-                            welcome_2nd_batch.update(data_fetcher.docs_to_user_map(extra_docs_raw))
-                        else:
-                            response = os_client.mget(
-                                index=config.WELCOME_INDEX,  # ✅ Changed from s_welcome_2nd to use config
-                                body={"ids": missing_ids},
-                                _source=["metadata", "user_id", "qa_pairs"],
-                                request_timeout=60,
-                                ignore=[404]
-                            )
-                            for doc_item in response.get('docs', []):
-                                if doc_item.get('found'):
-                                    welcome_2nd_batch[doc_item['_id']] = doc_item['_source']
-                                    _cache_put_welcome_doc(config.WELCOME_INDEX, doc_item['_id'], doc_item['_source'])  # ✅ Changed from s_welcome_2nd to use config
-                        logger.info(f"  ✅ welcome_2nd 추가 조회 후 총 {len(welcome_2nd_batch)}건")
-
-                except Exception as e:
-                    logger.warning(f"  ⚠️ 배치 조회 실패: {e}, 개별 조회로 fallback")
+            # ⭐ survey_responses_merged만 사용하므로 welcome_1st/welcome_2nd 배치 조회 제거
             
             if not filters_to_validate:
                 timings["post_filter_ms"] = (perf_counter() - filter_start) * 1000
@@ -3587,8 +2694,8 @@ async def search_natural_language(
                 def collect_doc_values(
                     user_id: str,
                     source: Dict[str, Any],
-                    metadata_1st: Dict[str, Any],
-                    metadata_2nd: Dict[str, Any],
+                    metadata: Dict[str, Any],
+                    _unused: Dict[str, Any],  # 호환성을 위해 유지하지만 사용하지 않음
                 ) -> Tuple[Dict[DemographicType, Set[str]], Dict[DemographicType, bool], Dict[str, Optional[bool]]]:
                     doc_values: Dict[DemographicType, Set[str]] = {
                         DemographicType.GENDER: set(),
@@ -3603,6 +2710,7 @@ async def search_natural_language(
                     behavior_values: Dict[str, Optional[bool]] = {
                         "smoker": None,
                         "has_vehicle": None,
+                        "drinker": None,  # ⭐ 음주 여부 추가
                     }
 
                     def record_behavior(key: str, value: Optional[bool]) -> None:
@@ -3650,9 +2758,45 @@ async def search_natural_language(
                             return True
                         return parse_yes_no(text)
 
+                    def parse_drinker_answer(raw: Optional[Any]) -> Optional[bool]:
+                        """음주 여부 파싱: 술 종류가 있으면 True, '술을 마시지 않음'이 있으면 False"""
+                        if raw is None:
+                            return None
+                        if isinstance(raw, (list, tuple, set)):
+                            for item in raw:
+                                decision = parse_drinker_answer(item)
+                                if decision is not None:
+                                    return decision
+                            return None
+                        text = str(raw).strip()
+                        if not text:
+                            return None
+                        normalized = text.lower()
+                        compact = normalized.replace(" ", "")
+
+                        # 네거티브 키워드 우선 체크
+                        for keyword in NON_DRINKER_KEYWORDS:
+                            keyword_compact = keyword.replace(" ", "")
+                            if keyword in normalized or keyword_compact in compact:
+                                return False
+
+                        # 포지티브 키워드 체크
+                        for keyword in DRINKER_POSITIVE_KEYWORDS:
+                            keyword_compact = keyword.replace(" ", "")
+                            if keyword in normalized or keyword_compact in compact:
+                                return True
+
+                        # "술" 언급이 있지만 부정 표현이 없으면 음주자로 간주
+                        if (
+                            "술" in normalized
+                            and not any(token in normalized for token in ("없", "안", "않", "no", "무", "못"))
+                        ):
+                            return True
+
+                        return None
+
                     metadata_candidates = [
-                        metadata_1st,
-                        metadata_2nd,
+                        metadata,  # 이제 단일 metadata만 사용
                         source.get("metadata", {}) if isinstance(source, dict) else {},
                     ]
 
@@ -3725,10 +2869,7 @@ async def search_natural_language(
                         qa_sources: List[List[Dict[str, Any]]] = []
                         if isinstance(source, dict):
                             qa_sources.append(source.get("qa_pairs", []) or [])
-                        if isinstance(welcome_2nd_batch.get(user_id), dict):
-                            qa_sources.append(welcome_2nd_batch[user_id].get("qa_pairs", []) or [])
-                        if isinstance(welcome_1st_batch.get(user_id), dict):
-                            qa_sources.append(welcome_1st_batch[user_id].get("qa_pairs", []) or [])
+                        # ⭐ survey_responses_merged만 사용하므로 welcome_1st/welcome_2nd 배치 제거
 
                         for qa_pairs in qa_sources:
                             for qa in qa_pairs:
@@ -3779,13 +2920,28 @@ async def search_natural_language(
                                 if behavior_values.get("has_vehicle") is None and q_text_raw and any(keyword in q_text_raw for keyword in VEHICLE_QUESTION_KEYWORDS):
                                     # 🔍 디버깅: 실제 차량 답변 로그
                                     normalized_answers_sample = list(normalized_answers)[:3]
-                                    logger.info(f"🚗 [Vehicle Debug] user={user_id}, q_text={q_text_raw[:30]}, answers={normalized_answers_sample}")
+
                                     for ans in normalized_answers:
                                         vehicle_decision = parse_yes_no(ans)
-                                        logger.info(f"   → answer='{ans}' → decision={vehicle_decision}")
+
                                         if vehicle_decision is not None:
                                             record_behavior("has_vehicle", vehicle_decision)
                                             break
+
+                                # ⭐ 음주 여부 추출
+                                if behavior_values.get("drinker") is None and q_text_raw and any(keyword in q_text_raw for keyword in ALCOHOL_QUESTION_KEYWORDS):
+                                    for ans in answers:
+                                        drinker_decision = parse_drinker_answer(ans)
+                                        if drinker_decision is not None:
+                                            record_behavior("drinker", drinker_decision)
+                                            if drinker_decision is False:
+                                                break
+                                    if behavior_values.get("drinker") is None:
+                                        for ans in normalized_answers:
+                                            drinker_decision = parse_drinker_answer(ans)
+                                            if drinker_decision is not None:
+                                                record_behavior("drinker", drinker_decision)
+                                                break
 
                     return doc_values, metadata_presence, behavior_values
 
@@ -3797,6 +2953,12 @@ async def search_natural_language(
                 gender_metadata_missing = 0
                 age_metadata_missing = 0
                 occupation_metadata_missing = 0
+                region_filter_failed = 0  # ⭐ REGION 필터 카운터
+                region_metadata_missing = 0  # ⭐ REGION 메타데이터 누락 카운터
+                marital_status_filter_failed = 0  # ⭐ MARITAL_STATUS 필터 카운터
+                marital_status_metadata_missing = 0  # ⭐ MARITAL_STATUS 메타데이터 누락 카운터
+                sub_region_filter_failed = 0  # ⭐ SUB_REGION 필터 카운터
+                sub_region_metadata_missing = 0  # ⭐ SUB_REGION 메타데이터 누락 카운터
                 behavior_filter_failed = 0
                 behavior_metadata_missing = 0
 
@@ -3809,16 +2971,19 @@ async def search_natural_language(
                     if not isinstance(source, dict):
                         source = {}
 
-                    metadata_1st = welcome_1st_batch.get(user_id, {}) if isinstance(welcome_1st_batch.get(user_id), dict) else {}
-                    metadata_2nd = welcome_2nd_batch.get(user_id, {}) if isinstance(welcome_2nd_batch.get(user_id), dict) else {}
-                    metadata_2nd_full = welcome_2nd_batch.get(user_id, {})
+                    # ⭐ survey_responses_merged만 사용하므로 welcome_1st/welcome_2nd 배치 제거
+                    # source에서 직접 metadata 가져오기
+                    metadata = source.get("metadata", {}) if isinstance(source.get("metadata"), dict) else {}
 
-                    doc_values, metadata_presence, behavior_values = collect_doc_values(user_id, source, metadata_1st, metadata_2nd)
+                    doc_values, metadata_presence, behavior_values = collect_doc_values(user_id, source, metadata, {})
                     behavior_values_map[user_id] = dict(behavior_values)
 
                     gender_pass = True
                     age_pass = True
                     occupation_pass = True
+                    region_pass = True  # ⭐ REGION 필터 검증 추가
+                    marital_status_pass = True  # ⭐ MARITAL_STATUS 필터 검증 추가
+                    sub_region_pass = True  # ⭐ SUB_REGION 필터 검증 추가
 
                     if DemographicType.GENDER in filters_to_validate:
                         expected = set()
@@ -3830,7 +2995,7 @@ async def search_natural_language(
                             # metadata로 수집된 값만 사용 (qa_pairs 무시)
                             # doc_values에서 metadata 소스만 확인하기 위해 다시 수집
                             gender_from_metadata = set()
-                            for meta_source in [metadata_1st, metadata_2nd, source.get("metadata", {})]:
+                            for meta_source in [metadata, source.get("metadata", {})]:
                                 if isinstance(meta_source, dict):
                                     gender_val = meta_source.get("gender") or meta_source.get("gender_code")
                                     if gender_val:
@@ -3873,9 +3038,9 @@ async def search_natural_language(
                         else:
                             display_occupation = None
                             occupation_candidates = [
-                                metadata_2nd.get("occupation"),
-                                metadata_2nd.get("job"),
-                                metadata_2nd.get("occupation_group"),
+                                metadata.get("occupation") if isinstance(metadata, dict) else None,
+                                metadata.get("job") if isinstance(metadata, dict) else None,
+                                metadata.get("occupation_group") if isinstance(metadata, dict) else None,
                             ]
                             for candidate in occupation_candidates:
                                 normalized_candidate = normalize_value(candidate)
@@ -3886,8 +3051,7 @@ async def search_natural_language(
                                 qa_sources: List[List[Dict[str, Any]]] = []
                                 if isinstance(source, dict):
                                     qa_sources.append(source.get("qa_pairs", []) or [])
-                                if isinstance(metadata_2nd_full, dict):
-                                    qa_sources.append(metadata_2nd_full.get("qa_pairs", []) or [])
+                                # ⭐ survey_responses_merged만 사용하므로 metadata_2nd_full 제거
                                 for qa_pairs in qa_sources:
                                     for qa in qa_pairs:
                                         if not isinstance(qa, dict):
@@ -3910,6 +3074,90 @@ async def search_natural_language(
                             if display_occupation:
                                 occupation_display_map[user_id] = display_occupation
 
+                    # ⭐ REGION 검증
+                    if DemographicType.REGION in filters_to_validate:
+                        expected = set()
+                        for demo in demographic_filters[DemographicType.REGION]:
+                            expected.update(build_expected_values(demo))
+
+                        # metadata에서 region 가져오기
+                        region_val = metadata.get("region") if isinstance(metadata, dict) else None
+                        if region_val:
+                            normalized_region = normalize_value(region_val)
+                            if normalized_region:
+                                region_pass = values_match({normalized_region}, expected)
+                                if not region_pass:
+                                    region_filter_failed += 1
+                            else:
+                                region_pass = False
+                                region_filter_failed += 1
+                        else:
+                            region_metadata_missing += 1
+                            region_pass = False
+
+                    # ⭐ MARITAL_STATUS 검증
+                    if DemographicType.MARITAL_STATUS in filters_to_validate:
+                        expected = set()
+                        for demo in demographic_filters[DemographicType.MARITAL_STATUS]:
+                            expected.update(build_expected_values(demo))
+
+                        # metadata에서 marital_status 가져오기
+                        marital_val = metadata.get("marital_status") if isinstance(metadata, dict) else None
+
+                        if not marital_val:
+                            # qa_pairs에서도 찾아보기
+                            qa_sources: List[List[Dict[str, Any]]] = []
+                            if isinstance(source, dict):
+                                qa_sources.append(source.get("qa_pairs", []) or [])
+
+                            for qa_pairs in qa_sources:
+                                for qa in qa_pairs:
+                                    if not isinstance(qa, dict):
+                                        continue
+                                    q_text = str(qa.get("q_text", "")).lower()
+                                    if not any(keyword in q_text for keyword in ("결혼", "혼인", "marital")):
+                                        continue
+                                    answer = qa.get("answer") or qa.get("answer_text")
+                                    if answer:
+                                        marital_val = str(answer)
+                                        break
+                                if marital_val:
+                                    break
+
+                        if marital_val:
+                            normalized_marital = normalize_value(marital_val)
+                            if normalized_marital:
+                                marital_status_pass = values_match({normalized_marital}, expected)
+                                if not marital_status_pass:
+                                    marital_status_filter_failed += 1
+                            else:
+                                marital_status_pass = False
+                                marital_status_filter_failed += 1
+                        else:
+                            marital_status_metadata_missing += 1
+                            marital_status_pass = False
+
+                    # ⭐ SUB_REGION 검증
+                    if DemographicType.SUB_REGION in filters_to_validate:
+                        expected = set()
+                        for demo in demographic_filters[DemographicType.SUB_REGION]:
+                            expected.update(build_expected_values(demo))
+
+                        # metadata에서 sub_region 가져오기
+                        sub_region_val = metadata.get("sub_region") if isinstance(metadata, dict) else None
+                        if sub_region_val:
+                            normalized_sub_region = normalize_value(sub_region_val)
+                            if normalized_sub_region:
+                                sub_region_pass = values_match({normalized_sub_region}, expected)
+                                if not sub_region_pass:
+                                    sub_region_filter_failed += 1
+                            else:
+                                sub_region_pass = False
+                                sub_region_filter_failed += 1
+                        else:
+                            sub_region_metadata_missing += 1
+                            sub_region_pass = False
+
                     # ⭐ Behavioral 검증: OpenSearch는 후보를 넓게 가져오고, Python에서 정확히 검증
                     behavior_pass = True
                     if analysis.behavioral_conditions:
@@ -3924,7 +3172,8 @@ async def search_natural_language(
                                 behavior_pass = False
                                 break
 
-                    if gender_pass and age_pass and occupation_pass and behavior_pass:
+                    # ⭐ 모든 demographic 필터 검증 (REGION, MARITAL_STATUS, SUB_REGION 포함)
+                    if gender_pass and age_pass and occupation_pass and region_pass and marital_status_pass and sub_region_pass and behavior_pass:
                         filtered_list.append(doc)
 
                 filter_duration_ms = (perf_counter() - filter_start) * 1000
@@ -3942,6 +3191,15 @@ async def search_natural_language(
                 if DemographicType.OCCUPATION in filters_to_validate:
                     logger.info(f"  - 직업 metadata 없음: {occupation_metadata_missing}건")
                     logger.info(f"  - 직업 필터 미충족: {occupation_filter_failed}건")
+                if DemographicType.REGION in filters_to_validate:
+                    logger.info(f"  - 지역 metadata 없음: {region_metadata_missing}건")
+                    logger.info(f"  - 지역 필터 미충족: {region_filter_failed}건")
+                if DemographicType.MARITAL_STATUS in filters_to_validate:
+                    logger.info(f"  - 결혼여부 metadata 없음: {marital_status_metadata_missing}건")
+                    logger.info(f"  - 결혼여부 필터 미충족: {marital_status_filter_failed}건")
+                if DemographicType.SUB_REGION in filters_to_validate:
+                    logger.info(f"  - 세부지역 metadata 없음: {sub_region_metadata_missing}건")
+                    logger.info(f"  - 세부지역 필터 미충족: {sub_region_filter_failed}건")
                 logger.info(f"  - 필터 조건 충족 문서: {len(filtered_rrf_results)}건")
                 if analysis.behavioral_conditions:
                     logger.info(f"  ✅ 행동 필터 검증 완료")
@@ -3953,8 +3211,8 @@ async def search_natural_language(
             def collect_doc_values(
                 user_id: str,
                 source: Dict[str, Any],
-                metadata_1st: Dict[str, Any],
-                metadata_2nd: Dict[str, Any],
+                metadata: Dict[str, Any],
+                _unused: Dict[str, Any],  # 호환성을 위해 유지하지만 사용하지 않음
             ) -> Tuple[Dict[DemographicType, Set[str]], Dict[DemographicType, bool], Dict[str, Optional[bool]]]:
                 doc_values: Dict[DemographicType, Set[str]] = {
                     DemographicType.GENDER: set(),
@@ -4017,8 +3275,7 @@ async def search_natural_language(
                     return parse_yes_no(text)
 
                 metadata_candidates = [
-                    metadata_1st,
-                    metadata_2nd,
+                    metadata,  # 이제 단일 metadata만 사용
                     source.get("metadata", {}) if isinstance(source, dict) else {},
                 ]
 
@@ -4088,9 +3345,7 @@ async def search_natural_language(
                     qa_sources: List[List[Dict[str, Any]]] = []
                     if isinstance(source, dict):
                         qa_sources.append(source.get("qa_pairs", []) or [])
-                    welcome_2nd_doc = welcome_2nd_batch.get(user_id, {})
-                    if isinstance(welcome_2nd_doc, dict):
-                        qa_sources.append(welcome_2nd_doc.get("qa_pairs", []) or [])
+                    # ⭐ survey_responses_merged만 사용하므로 welcome_2nd_batch 제거
 
                     for qa_pairs in qa_sources:
                         for qa in qa_pairs:
@@ -4143,12 +3398,11 @@ async def search_natural_language(
                     source_not_found_count += 1
                     continue
 
-                welcome_1st_doc_full = welcome_1st_batch.get(user_id, {})
-                metadata_1st = welcome_1st_doc_full.get("metadata", {}) if isinstance(welcome_1st_doc_full, dict) else {}
-                welcome_2nd_doc_full = welcome_2nd_batch.get(user_id, {})
-                metadata_2nd = welcome_2nd_doc_full.get("metadata", {}) if isinstance(welcome_2nd_doc_full, dict) else {}
+                # ⭐ survey_responses_merged만 사용하므로 welcome_1st/welcome_2nd 배치 제거
+                # source에서 직접 metadata 가져오기
+                metadata = source.get("metadata", {}) if isinstance(source.get("metadata"), dict) else {}
 
-                doc_values, metadata_presence, behavior_values = collect_doc_values(user_id, source, metadata_1st, metadata_2nd)
+                doc_values, metadata_presence, behavior_values = collect_doc_values(user_id, source, metadata, {})
                 behavior_values_map[user_id] = dict(behavior_values)
 
                 gender_pass = True
@@ -4164,7 +3418,7 @@ async def search_natural_language(
                     if metadata_presence[DemographicType.GENDER]:
                         # metadata로 수집된 값만 사용
                         gender_from_metadata = set()
-                        for meta_source in [metadata_1st, metadata_2nd, source.get("metadata", {})]:
+                        for meta_source in [metadata, source.get("metadata", {})]:
                             if isinstance(meta_source, dict):
                                 gender_val = meta_source.get("gender") or meta_source.get("gender_code")
                                 if gender_val:
@@ -4208,9 +3462,9 @@ async def search_natural_language(
                     else:
                         display_occupation = None
                         occupation_candidates = [
-                            metadata_2nd.get("occupation"),
-                            metadata_2nd.get("job"),
-                            metadata_2nd.get("occupation_group"),
+                            metadata.get("occupation") if isinstance(metadata, dict) else None,
+                            metadata.get("job") if isinstance(metadata, dict) else None,
+                            metadata.get("occupation_group") if isinstance(metadata, dict) else None,
                         ]
                         for candidate in occupation_candidates:
                             normalized_candidate = normalize_value(candidate)
@@ -4221,8 +3475,7 @@ async def search_natural_language(
                             qa_sources: List[List[Dict[str, Any]]] = []
                             if isinstance(source, dict):
                                 qa_sources.append(source.get("qa_pairs", []) or [])
-                            if isinstance(welcome_2nd_doc_full, dict):
-                                qa_sources.append(welcome_2nd_doc_full.get("qa_pairs", []) or [])
+                            # ⭐ survey_responses_merged만 사용하므로 welcome_2nd_doc_full 제거
                             for qa_pairs in qa_sources:
                                 for qa in qa_pairs:
                                     if not isinstance(qa, dict):
@@ -4323,28 +3576,21 @@ async def search_natural_language(
                     merged_source.update(src_info)
                     merged_source.update(source)
                     source = merged_source
-                    logger.debug(
-                        "[mget_merge] user_id=%s qa_pairs=%d", 
-                        user_id,
-                        len(source.get('qa_pairs', [])) if isinstance(source, dict) else -1,
-                    )
+                    
                 inner_hit_wrapper = {"inner_hits": doc_info.get("inner_hits", {})}
             else:
                 inner_hit_wrapper = doc
 
-            metadata_2nd = source.get("metadata", {}) if isinstance(source, dict) else {}
-            if not metadata_2nd and isinstance(payload, dict):
-                metadata_2nd = payload.get("metadata", {}) or {}
-
-            welcome_1st_doc = welcome_1st_batch.get(user_id, {}) if user_id else {}
-            metadata_1st = (
-                welcome_1st_doc.get("metadata", {}) if isinstance(welcome_1st_doc, dict) else {}
-            )
-
-            welcome_2nd_doc = welcome_2nd_batch.get(user_id, {}) if user_id else {}
-            metadata_2nd_cached = (
-                welcome_2nd_doc.get("metadata", {}) if isinstance(welcome_2nd_doc, dict) else {}
-            )
+            # ⭐ survey_responses_merged만 사용하므로 source의 metadata에서 직접 가져오기
+            source_metadata = source.get("metadata", {}) if isinstance(source, dict) else {}
+            if not source_metadata:
+                # source가 비어있으면 doc에서 직접 가져오기
+                doc_source = doc.get("_source") or {}
+                if isinstance(doc_source, dict):
+                    source_metadata = doc_source.get("metadata", {})
+                # payload에서도 확인
+                if not source_metadata and isinstance(payload, dict):
+                    source_metadata = payload.get("metadata", {})
 
             behavioral_values = behavior_values_map.get(user_id, {}) if user_id else {}
             behavioral_info: Dict[str, Any] = {}
@@ -4352,20 +3598,18 @@ async def search_natural_language(
                 behavioral_info["smoker"] = behavioral_values.get("smoker")
             if behavioral_values.get("has_vehicle") is not None:
                 behavioral_info["has_vehicle"] = behavioral_values.get("has_vehicle")
+            if behavioral_values.get("drinker") is not None:
+                behavioral_info["drinker"] = behavioral_values.get("drinker")
 
             demographic_info: Dict[str, Any] = {}
-            if metadata_1st:
-                demographic_info["age_group"] = metadata_1st.get("age_group")
-                demographic_info["gender"] = metadata_1st.get("gender")
-                demographic_info["birth_year"] = metadata_1st.get("birth_year")
-
-            occupation_candidate = metadata_2nd.get("occupation") if isinstance(metadata_2nd, dict) else None
-            if not occupation_candidate and isinstance(metadata_2nd_cached, dict):
-                occupation_candidate = metadata_2nd_cached.get("occupation")
-            if not occupation_candidate and isinstance(payload, dict):
-                occupation_candidate = payload.get("occupation")
-            if occupation_candidate:
-                demographic_info["occupation"] = occupation_candidate
+            if source_metadata:
+                demographic_info["age_group"] = source_metadata.get("age_group")
+                demographic_info["gender"] = source_metadata.get("gender")
+                demographic_info["birth_year"] = source_metadata.get("birth_year")
+                demographic_info["region"] = source_metadata.get("region")
+                demographic_info["occupation"] = source_metadata.get("occupation")
+                demographic_info["marital_status"] = source_metadata.get("marital_status")
+                demographic_info["sub_region"] = source_metadata.get("sub_region")
 
             occupation_expected = set()
             for demo in demographic_filters.get(DemographicType.OCCUPATION, []):
@@ -4403,12 +3647,57 @@ async def search_natural_language(
                         demographic_info["occupation"] = answer_str
                         break
 
+            # marital_status를 qa_pairs에서 찾기
+            if ("marital_status" not in demographic_info or not demographic_info["marital_status"]) and isinstance(source, dict):
+                qa_pairs_list = source.get("qa_pairs", [])
+                for qa in qa_pairs_list:
+                    if not isinstance(qa, dict):
+                        continue
+                    q_text = str(qa.get("q_text", "")).lower()
+                    answer = qa.get("answer")
+                    if answer is None:
+                        answer = qa.get("answer_text")
+                    if answer is None:
+                        continue
+                    answer_str = str(answer)
+                    if any(keyword in q_text for keyword in ("결혼", "혼인")):
+                        demographic_info["marital_status"] = answer_str
+                        break
+
+            # sub_region을 qa_pairs에서 찾기
+            if ("sub_region" not in demographic_info or not demographic_info["sub_region"]) and isinstance(source, dict):
+                qa_pairs_list = source.get("qa_pairs", [])
+                for qa in qa_pairs_list:
+                    if not isinstance(qa, dict):
+                        continue
+                    q_text = str(qa.get("q_text", "")).lower()
+                    answer = qa.get("answer")
+                    if answer is None:
+                        answer = qa.get("answer_text")
+                    if answer is None:
+                        continue
+                    answer_str = str(answer)
+                    if any(keyword in q_text for keyword in ("구", "군", "세부지역", "어느 구")):
+                        demographic_info["sub_region"] = answer_str
+                        break
+
             matched_qa_pairs: List[Dict[str, Any]] = extract_inner_hit_matches(inner_hit_wrapper)
             if not matched_qa_pairs and analysis.must_terms:
                 matched_qa_pairs = extract_matched_qa_pairs(source, analysis.must_terms)
 
+            # ⭐ 개선: source에 qa_pairs가 없으면 doc에서 직접 가져오기
+            qa_pairs_from_source = source.get("qa_pairs", []) if isinstance(source, dict) else []
+            if not qa_pairs_from_source:
+                # source가 비어있으면 doc에서 직접 가져오기
+                doc_source = doc.get("_source") or {}
+                if isinstance(doc_source, dict):
+                    qa_pairs_from_source = doc_source.get("qa_pairs", [])
+                # payload에서도 확인
+                if not qa_pairs_from_source and isinstance(payload, dict):
+                    qa_pairs_from_source = payload.get("qa_pairs", [])
+
             qa_pairs_display = reorder_with_matches(
-                source.get("qa_pairs", []) if isinstance(source, dict) else [],
+                qa_pairs_from_source if isinstance(qa_pairs_from_source, list) else [],
                 matched_qa_pairs,
                 limit=10
             )
@@ -4425,12 +3714,7 @@ async def search_natural_language(
                     highlights=doc.get("highlight"),
                 )
             )
-            logger.debug(
-                "[match_check] user_id=%s inner_hits=%d matched=%d", 
-                user_id,
-                len(inner_hits_map.get(user_id, [])),
-                len(matched_qa_pairs),
-            )
+           
 
         timings["lazy_join_ms"] = (perf_counter() - lazy_join_start) * 1000
         timings.setdefault('post_filter_ms', timings.get('post_filter_ms', 0.0))
@@ -4552,320 +3836,7 @@ async def search_natural_language(
 # 프론트엔드 친화적 간소화 엔드포인트
 # -----------------------------
 
-@router.post("/nl/simple", response_model=SimpleResponse, summary="자연어 쿼리: 간소화 응답 (프론트엔드용)")
-async def search_natural_language_simple(
-    query: str = Query(..., description="자연어 검색 쿼리"),
-    size: int = Query(default=100, ge=1, le=500, description="결과 개수"),
-    use_claude: Optional[bool] = Query(default=None, description="Claude 분석기 사용 여부"),
-    session_id: Optional[str] = Query(default=None, description="세션 ID"),
-    user_id: Optional[str] = Query(default=None, description="사용자 ID"),
-    os_client: OpenSearch = Depends(lambda: router.os_client),
-) -> SimpleResponse:
-    """
-    자연어 검색 - 프론트엔드 친화적 간소화 응답
 
-    - Demographics와 behavioral 조건 매칭 정보만 반환
-    - 불필요한 qa_pairs 제거
-    - matched_conditions로 behavioral QA 명시적 표시
-
-    예시 쿼리:
-    - "흡연하고 차를 소유하는 30대 남성"
-    - "맥주를 마시는 40대 여성"
-    """
-    try:
-        # 기존 NLSearchRequest 생성
-        nl_request = NLSearchRequest(
-            query=query,
-            size=size,
-            use_claude=use_claude,
-            session_id=session_id,
-            user_id=user_id,
-            log_conversation=False,  # 로그 비활성화
-            log_search_history=False,
-            request_llm_summary=False
-        )
-
-        # 기존 검색 수행
-        full_response = await search_natural_language(
-            request=nl_request,
-            os_client=os_client
-        )
-
-        # Behavioral 조건 추출
-        query_analysis = full_response.query_analysis or {}
-        behavioral_conditions = query_analysis.get('behavioral_conditions', {})
-
-        # SimpleResponse로 변환
-        simple_response = convert_to_simple_response(
-            search_response=full_response,
-            behavioral_conditions=behavioral_conditions,
-            max_results=size
-        )
-
-        return simple_response
-
-    except Exception as e:
-        logger.error(f"Simple search 에러: {e}", exc_info=True)
-        return SimpleResponse(
-            state="ERROR",
-            message=f"검색 실패: {str(e)}",
-            query=query,
-            total_hits=0,
-            results=[],
-            query_info=None,
-            took_ms=0
-        )
-
-
-# -----------------------------
-# Qdrant 진단/헬스 엔드포인트 (읽기 전용)
-# -----------------------------
-
-@router.get("/debug/welcome-1st", summary="welcome_1st 인덱스 샘플 데이터 확인 (디버깅용)")
-async def get_welcome_1st_samples(
-    user_id: str = None,
-    age_group: str = None,
-    size: int = 5,
-    os_client: OpenSearch = Depends(lambda: router.os_client),
-):
-    """
-    welcome_1st 인덱스의 샘플 데이터 확인 (디버깅용)
-    
-    - user_id로 특정 사용자 조회
-    - age_group으로 필터링
-    - metadata 구조 확인
-    """
-    try:
-        if not os_client or not os_client.ping():
-            raise HTTPException(status_code=503, detail="OpenSearch 서버에 연결할 수 없습니다.")
-        
-        query = {"match_all": {}}
-        
-        if user_id:
-            # 특정 user_id 조회
-            query = {"term": {"_id": user_id}}
-        elif age_group:
-            # age_group으로 필터링
-            query = {
-                "term": {
-                    "metadata.age_group.keyword": age_group
-                }
-            }
-        
-        response = os_client.search(
-            index="s_welcome_1st",
-            body={
-                "query": query,
-                "size": size,
-                "_source": {
-                    "includes": ["user_id", "metadata", "qa_pairs"]
-                }
-            }
-        )
-        
-        results = []
-        for hit in response['hits']['hits']:
-            source = hit.get('_source', {})
-            results.append({
-                "_id": hit.get('_id'),
-                "user_id": source.get('user_id'),
-                "metadata": source.get('metadata', {}),
-                "qa_pairs_sample": source.get('qa_pairs', [])[:10] if source.get('qa_pairs') else []
-            })
-        
-        return {
-            "index_name": "s_welcome_1st",
-            "query": {
-                "user_id": user_id,
-                "age_group": age_group
-            },
-            "total_hits": response['hits']['total']['value'],
-            "samples": results
-        }
-    
-    except Exception as e:
-        logger.error(f"[ERROR] welcome_1st 샘플 데이터 조회 중 오류: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/debug/welcome-2nd", summary="welcome_2nd 인덱스 샘플 데이터 확인 (디버깅용)")
-async def get_welcome_2nd_samples(
-    user_id: str = None,
-    occupation: str = None,
-    size: int = 5,
-    os_client: OpenSearch = Depends(lambda: router.os_client),
-):
-    """
-    welcome_2nd 인덱스의 샘플 데이터 확인 (디버깅용)
-    
-    - user_id로 특정 사용자 조회
-    - occupation으로 필터링 (qa_pairs에서)
-    - metadata 구조 확인
-    """
-    try:
-        if not os_client or not os_client.ping():
-            raise HTTPException(status_code=503, detail="OpenSearch 서버에 연결할 수 없습니다.")
-        
-        query = {"match_all": {}}
-        
-        if user_id:
-            # 특정 user_id 조회
-            query = {"term": {"_id": user_id}}
-        elif occupation:
-            # qa_pairs에서 직업으로 필터링
-            query = {
-                "nested": {
-                    "path": "qa_pairs",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"match": {"qa_pairs.q_text": "직업"}},
-                                {"match": {"qa_pairs.answer_text": occupation}}
-                            ]
-                        }
-                    }
-                }
-            }
-        
-        response = os_client.search(
-            index="s_welcome_2nd",
-            body={
-                "query": query,
-                "size": size,
-                "_source": {
-                    "includes": ["user_id", "metadata", "qa_pairs"]
-                }
-            }
-        )
-        
-        results = []
-        for hit in response['hits']['hits']:
-            source = hit.get('_source', {})
-            results.append({
-                "_id": hit.get('_id'),
-                "user_id": source.get('user_id'),
-                "metadata": source.get('metadata', {}),
-                "qa_pairs_sample": source.get('qa_pairs', [])[:10] if source.get('qa_pairs') else []
-            })
-        
-        return {
-            "index_name": "s_welcome_2nd",
-            "query": {
-                "user_id": user_id,
-                "occupation": occupation
-            },
-            "total_hits": response['hits']['total']['value'],
-            "samples": results
-        }
-    
-    except Exception as e:
-        logger.error(f"[ERROR] welcome_2nd 샘플 데이터 조회 중 오류: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/debug/sample-data", summary="인덱스별 샘플 데이터 확인 (디버깅용)")
-async def get_sample_data(
-    index_name: str = "*",
-    question_keyword: str = None,
-    answer_keyword: str = None,
-    os_client: OpenSearch = Depends(lambda: router.os_client),
-):
-    """
-    인덱스별 샘플 데이터 확인 (디버깅용)
-    
-    - 특정 질문 키워드로 샘플 데이터 조회
-    - 특정 답변 키워드로 샘플 데이터 조회
-    - 실제 답변 형식 확인
-    """
-    try:
-        if not os_client or not os_client.ping():
-            raise HTTPException(status_code=503, detail="OpenSearch 서버에 연결할 수 없습니다.")
-        
-        query = {"match_all": {}}
-        if question_keyword or answer_keyword:
-            nested_query = {}
-            if question_keyword and answer_keyword:
-                nested_query = {
-                    "bool": {
-                        "must": [
-                            {"match": {"qa_pairs.q_text": question_keyword}},
-                            {
-                                "bool": {
-                                    "should": [
-                                        {"match_phrase": {"qa_pairs.answer_text": answer_keyword}},
-                                        {"match_phrase": {"qa_pairs.answer": answer_keyword}},
-                                        {"match": {"qa_pairs.answer_text": {"query": answer_keyword, "operator": "or"}}},
-                                        {"match": {"qa_pairs.answer": {"query": answer_keyword, "operator": "or"}}}
-                                    ],
-                                    "minimum_should_match": 1
-                                }
-                            }
-                        ]
-                    }
-                }
-            elif question_keyword:
-                nested_query = {"match": {"qa_pairs.q_text": question_keyword}}
-            elif answer_keyword:
-                nested_query = {
-                    "bool": {
-                        "should": [
-                            {"match_phrase": {"qa_pairs.answer_text": answer_keyword}},
-                            {"match_phrase": {"qa_pairs.answer": answer_keyword}},
-                            {"match": {"qa_pairs.answer_text": {"query": answer_keyword, "operator": "or"}}},
-                            {"match": {"qa_pairs.answer": {"query": answer_keyword, "operator": "or"}}}
-                        ],
-                        "minimum_should_match": 1
-                    }
-                }
-            
-            query = {
-                "nested": {
-                    "path": "qa_pairs",
-                    "query": nested_query,
-                    "inner_hits": {
-                        "size": 5,
-                        "_source": {"includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]}
-                    }
-                }
-            }
-        
-        response = os_client.search(
-            index=index_name,
-            body={
-                "query": query,
-                "size": 5,
-                "_source": {"includes": ["user_id", "metadata", "qa_pairs"]}
-            }
-        )
-        
-        results = []
-        for hit in response['hits']['hits']:
-            source = hit.get('_source', {})
-            result = {
-                "index": hit.get('_index'),
-                "user_id": source.get('user_id'),
-                "metadata": source.get('metadata', {}),
-                "qa_pairs_sample": source.get('qa_pairs', [])[:5]
-            }
-            
-            if (question_keyword or answer_keyword) and 'inner_hits' in hit:
-                result['matched_qa_pairs'] = []
-                for inner_hit in hit['inner_hits']['qa_pairs']['hits']['hits']:
-                    result['matched_qa_pairs'].append(inner_hit.get('_source', {}))
-            
-            results.append(result)
-        
-        return {
-            "index_name": index_name,
-            "question_keyword": question_keyword,
-            "answer_keyword": answer_keyword,
-            "total_hits": response['hits']['total']['value'],
-            "samples": results
-        }
-    
-    except Exception as e:
-        logger.error(f"[ERROR] 샘플 데이터 조회 중 오류: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 class TestFiltersRequest(BaseModel):
@@ -5063,118 +4034,6 @@ async def get_search_history_endpoint(
     }
 
 
-@router.get("/qdrant/collections", summary="Qdrant 컬렉션 목록 및 통계")
-async def list_qdrant_collections():
-    qdrant_client = getattr(router, 'qdrant_client', None)
-    if not qdrant_client:
-        raise HTTPException(status_code=503, detail="Qdrant 클라이언트가 초기화되지 않았습니다.")
-    try:
-        cols = qdrant_client.get_collections()
-        items = []
-        for c in cols.collections:
-            try:
-                info = qdrant_client.get_collection(c.name)
-                items.append({
-                    "name": c.name,
-                    "vectors_count": info.vectors_count if hasattr(info, 'vectors_count') else None,
-                    "points_count": getattr(info, 'points_count', None),
-                    "config": getattr(info, 'config', None).__dict__ if hasattr(info, 'config') else None,
-                })
-            except Exception:
-                items.append({"name": c.name})
-        return {"collections": items}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class QdrantTestSearchRequest(BaseModel):
-    query: str = Field(..., description="임베딩으로 검색할 텍스트")
-    limit: int = Field(5, ge=1, le=100)
-
-
-@router.post("/qdrant/test-search", summary="Qdrant 전 컬렉션 테스트 검색 (읽기 전용)")
-async def qdrant_test_search(req: QdrantTestSearchRequest):
-    qdrant_client = getattr(router, 'qdrant_client', None)
-    embedding_model = getattr(router, 'embedding_model', None)
-    if not qdrant_client:
-        raise HTTPException(status_code=503, detail="Qdrant 클라이언트가 초기화되지 않았습니다.")
-    if not embedding_model:
-        raise HTTPException(status_code=503, detail="임베딩 모델이 로드되지 않았습니다.")
-
-    try:
-        qvec = embedding_model.encode(req.query).tolist()
-        cols = qdrant_client.get_collections()
-        results = []
-        for c in cols.collections:
-            try:
-                r = qdrant_client.search(
-                    collection_name=c.name,
-                    query_vector=qvec,
-                    limit=req.limit,
-                )
-                results.append({
-                    "collection": c.name,
-                    "hits": [
-                        {
-                            "id": str(h.id),
-                            "score": h.score,
-                            "payload": getattr(h, 'payload', None)
-                        } for h in r
-                    ]
-                })
-            except Exception as e:
-                results.append({"collection": c.name, "error": str(e)})
-        return {"query": req.query, "results": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/similar", summary="유사 문서 검색 (플레이스홀더)")
-async def search_similar(
-    user_id: str,
-    index_name: str = "s_welcome_2nd",
-    size: int = 10
-):
-    """
-    특정 사용자와 유사한 응답을 가진 사용자 검색 (향후 구현)
-    """
-    raise HTTPException(
-        status_code=501,
-        detail="유사 문서 검색 기능은 향후 구현 예정입니다."
-    )
-
-
-@router.get("/stats/{index_name}", summary="검색 통계")
-async def get_search_stats(
-    index_name: str,
-    os_client: OpenSearch = Depends(lambda: router.os_client),
-):
-    """인덱스 검색 통계 조회"""
-    try:
-        if not os_client.indices.exists(index=index_name):
-            raise HTTPException(
-                status_code=404,
-                detail=f"인덱스를 찾을 수 없습니다: {index_name}"
-            )
-
-        stats = os_client.indices.stats(index=index_name)
-        count = os_client.count(index=index_name)
-
-        return {
-            "index_name": index_name,
-            "doc_count": count['count'],
-            "size_mb": round(stats['_all']['total']['store']['size_in_bytes'] / 1024 / 1024, 2),
-            "search_total": stats['_all']['total']['search']['query_total'],
-            "search_time_ms": stats['_all']['total']['search']['query_time_in_millis']
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[ERROR] 통계 조회 중 오류: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 def _filter_to_string(filter_dict: Dict[str, Any]) -> str:
     try:
         return json.dumps(filter_dict, ensure_ascii=False)
@@ -5235,9 +4094,10 @@ async def run_two_phase_demographic_search(
     }
 
     try:
+        # ⭐ survey_responses_merged만 사용
         if async_client:
             response_1st = await data_fetcher.search_opensearch_async(
-                index_name="s_welcome_1st",
+                index_name=request.index_name,  # survey_responses_merged
                 query=stage1_query,
                 size=stage1_query_size,
                 source_filter=None,
@@ -5245,7 +4105,7 @@ async def run_two_phase_demographic_search(
             )
         else:
             response_1st = data_fetcher.search_opensearch(
-                index_name="s_welcome_1st",
+                index_name=request.index_name,  # survey_responses_merged
                 query=stage1_query,
                 size=stage1_query_size,
                 source_filter=None,
@@ -5358,9 +4218,10 @@ async def run_two_phase_demographic_search(
 
     stage2_start = perf_counter()
     try:
+        # ⭐ survey_responses_merged만 사용
         if async_client:
             response_2nd = await data_fetcher.search_opensearch_async(
-                index_name="s_welcome_2nd",
+                index_name=request.index_name,  # survey_responses_merged
                 query=stage2_query,
                 size=detail_size,
                 source_filter=None,
@@ -5368,7 +4229,7 @@ async def run_two_phase_demographic_search(
             )
         else:
             response_2nd = data_fetcher.search_opensearch(
-                index_name="s_welcome_2nd",
+                index_name=request.index_name,  # survey_responses_merged
                 query=stage2_query,
                 size=detail_size,
                 source_filter=None,
@@ -5416,34 +4277,8 @@ async def run_two_phase_demographic_search(
     final_hits = hits_2nd[:size]
     final_user_ids = [hit.get('_id') or hit.get('_source', {}).get('user_id') for hit in final_hits]
 
-    fetch_start = perf_counter()
-    welcome_1st_docs: Dict[str, Dict[str, Any]] = {}
-    welcome_2nd_docs: Dict[str, Dict[str, Any]] = {}
-
-    if final_user_ids:
-        if async_client:
-            welcome_1st_docs = await data_fetcher.multi_get_documents_async(
-                index_name="s_welcome_1st",
-                doc_ids=final_user_ids,
-                batch_size=200,
-                source_fields=["metadata", "user_id", "qa_pairs"],
-            )
-            welcome_2nd_docs = await data_fetcher.multi_get_documents_async(
-                index_name="s_welcome_2nd",
-                doc_ids=final_user_ids,
-                batch_size=200,
-                source_fields=["metadata", "user_id", "qa_pairs"],
-            )
-        else:
-            response = sync_client.mget(index="s_welcome_1st", body={"ids": final_user_ids}, _source=["metadata", "user_id", "qa_pairs"])
-            for doc in response.get('docs', []):
-                if doc.get('found'):
-                    welcome_1st_docs[doc['_id']] = doc['_source']
-            response = sync_client.mget(index="s_welcome_2nd", body={"ids": final_user_ids}, _source=["metadata", "user_id", "qa_pairs"])
-            for doc in response.get('docs', []):
-                if doc.get('found'):
-                    welcome_2nd_docs[doc['_id']] = doc['_source']
-    timings['two_phase_fetch_demographics_ms'] = (perf_counter() - fetch_start) * 1000
+    # ⭐ survey_responses_merged만 사용하므로 welcome_1st/welcome_2nd 조회 제거
+    timings['two_phase_fetch_demographics_ms'] = 0.0
 
     results: List[SearchResult] = []
     lazy_join_start = perf_counter()
@@ -5451,9 +4286,8 @@ async def run_two_phase_demographic_search(
     for doc in final_hits:
         source = doc.get('_source', {}) or {}
         user_id = source.get('user_id') or hit.get('_id', '')
-        metadata_2nd = source.get('metadata', {}) if isinstance(source, dict) else {}
-        welcome_1st_doc = welcome_1st_docs.get(user_id, {})
-        metadata_1st = welcome_1st_doc.get('metadata', {}) if isinstance(welcome_1st_doc, dict) else {}
+        # ⭐ survey_responses_merged만 사용하므로 source의 metadata에서 직접 가져오기
+        source_metadata = source.get('metadata', {}) if isinstance(source, dict) else {}
 
         behavioral_values = behavior_values_map.get(user_id, {}) if user_id else {}
         behavioral_info: Dict[str, Any] = {}
@@ -5461,14 +4295,18 @@ async def run_two_phase_demographic_search(
             behavioral_info["smoker"] = behavioral_values.get("smoker")
         if behavioral_values.get("has_vehicle") is not None:
             behavioral_info["has_vehicle"] = behavioral_values.get("has_vehicle")
+        if behavioral_values.get("drinker") is not None:
+            behavioral_info["drinker"] = behavioral_values.get("drinker")
 
         demographic_info: Dict[str, Any] = {}
-        if metadata_1st:
-            demographic_info["age_group"] = metadata_1st.get("age_group")
-            demographic_info["gender"] = metadata_1st.get("gender")
-            demographic_info["birth_year"] = metadata_1st.get("birth_year")
-        if metadata_2nd:
-            demographic_info['occupation'] = metadata_2nd.get('occupation')
+        if source_metadata:
+            demographic_info["age_group"] = source_metadata.get("age_group")
+            demographic_info["gender"] = source_metadata.get("gender")
+            demographic_info["birth_year"] = source_metadata.get("birth_year")
+            demographic_info["region"] = source_metadata.get("region")
+            demographic_info['occupation'] = source_metadata.get('occupation')
+            demographic_info["marital_status"] = source_metadata.get("marital_status")
+            demographic_info["sub_region"] = source_metadata.get("sub_region")
 
         if 'occupation' not in demographic_info or not demographic_info['occupation']:
             qa_pairs_for_occ = source.get('qa_pairs', []) if isinstance(source, dict) else []
@@ -5479,6 +4317,30 @@ async def run_two_phase_demographic_search(
                     if '직업' in q_text or 'occupation' in q_text.lower() or '직무' in q_text:
                         if answer:
                             demographic_info['occupation'] = answer
+                        break
+
+        # marital_status를 qa_pairs에서 찾기
+        if 'marital_status' not in demographic_info or not demographic_info['marital_status']:
+            qa_pairs_list = source.get('qa_pairs', []) if isinstance(source, dict) else []
+            for qa in qa_pairs_list:
+                if isinstance(qa, dict):
+                    q_text = qa.get('q_text', '')
+                    answer = str(qa.get('answer', qa.get('answer_text', '')))
+                    if '결혼' in q_text or '혼인' in q_text:
+                        if answer:
+                            demographic_info['marital_status'] = answer
+                        break
+
+        # sub_region을 qa_pairs에서 찾기
+        if 'sub_region' not in demographic_info or not demographic_info['sub_region']:
+            qa_pairs_list = source.get('qa_pairs', []) if isinstance(source, dict) else []
+            for qa in qa_pairs_list:
+                if isinstance(qa, dict):
+                    q_text = qa.get('q_text', '')
+                    answer = str(qa.get('answer', qa.get('answer_text', '')))
+                    if '구' in q_text or '군' in q_text or '세부지역' in q_text or '어느 구' in q_text:
+                        if answer:
+                            demographic_info['sub_region'] = answer
                         break
 
         matched_qa = []

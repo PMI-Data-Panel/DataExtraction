@@ -108,6 +108,7 @@ class DemographicType(str, Enum):
     AGE = "age"
     GENDER = "gender"
     REGION = "region"
+    SUB_REGION = "sub_region"  # ⭐ 세부 지역 (구/군 등)
     OCCUPATION = "occupation"
     JOB_FUNCTION = "job_function"
     EDUCATION = "education"
@@ -255,13 +256,20 @@ class DemographicEntity(BaseEntity):
             }
         }
 
-    def to_opensearch_filter(self, *, metadata_only: bool = False, include_qa_fallback: bool = True) -> Dict:
+    def to_opensearch_filter(self, *, metadata_only: bool = False, include_qa_fallback: bool = True, include_inner_hits: bool = False) -> Dict:
         """OpenSearch 필터로 변환 (Metadata 우선, qa_pairs fallback)
-        
+
         인덱스별 구조:
         - welcome_1st: 성별, 출생정보(연령) → metadata 필드
         - welcome_2nd: 직업 → metadata 필드
         - 나머지 설문조사: qa_pairs에서 찾기
+
+        Args:
+            metadata_only: metadata 필드만 사용 (qa_pairs fallback 비활성화)
+            include_qa_fallback: qa_pairs fallback 포함 여부
+            include_inner_hits: nested 쿼리에 inner_hits 포함 여부 (기본값: False)
+                               ⚠️ 여러 demographics 필터를 bool must로 결합할 때는
+                               반드시 False여야 함 (중복 inner_hits 에러 방지)
 
         Returns:
             {
@@ -318,6 +326,13 @@ class DemographicEntity(BaseEntity):
                 "qa_questions": [
                     "지역",
                     "거주지", "주소", "region"
+                ]
+            },
+            DemographicType.SUB_REGION: {
+                "field": "metadata.sub_region.keyword",
+                "qa_questions": [
+                    "구",
+                    "군", "시", "세부지역", "어느 구"
                 ]
             },
             DemographicType.EDUCATION: {
@@ -411,7 +426,7 @@ class DemographicEntity(BaseEntity):
 
         qa_filter = None
         if include_qa_fallback:
-            qa_filter = {
+            nested_query = {
                 "nested": {
                     "path": "qa_pairs",
                     "query": {
@@ -429,15 +444,21 @@ class DemographicEntity(BaseEntity):
                                 self._build_answer_match_query()
                             ]
                         }
-                    },
-                    "inner_hits": {
-                        "size": 3,
-                        "_source": {
-                            "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
-                        }
                     }
                 }
             }
+
+            # ⚠️ inner_hits는 명시적으로 요청된 경우에만 추가
+            # 여러 demographics 필터를 bool must로 결합할 때는 중복 에러 방지를 위해 제외
+            if include_inner_hits:
+                nested_query["nested"]["inner_hits"] = {
+                    "size": 3,
+                    "_source": {
+                        "includes": ["qa_pairs.q_text", "qa_pairs.answer_text", "qa_pairs.answer"]
+                    }
+                }
+
+            qa_filter = nested_query
 
         filters = [f for f in [metadata_filter, qa_filter] if f]
 
