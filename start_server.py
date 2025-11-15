@@ -69,8 +69,8 @@ def main():
             sys.executable, "-m", "uvicorn",
             "main:app",
             "--host", "0.0.0.0",
-            "--port", str(port),
-            "--reload"
+            "--port", str(port)
+            # reload 옵션 제거: 파일 변경 감지 비활성화
         ])
     except KeyboardInterrupt:
         logger.info("\n\n서버를 종료합니다...")

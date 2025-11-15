@@ -37,7 +37,7 @@ class DemographicExtractor:
         "학생": {"value": "student", "synonyms": {"학생", "대학생", "고등학생", "중/고등학생", "대학생/대학원생"}},
         "자영업": {"value": "self_employed", "synonyms": {"자영업", "소상공인"}},
         "전문직": {"value": "professional", "synonyms": {"전문직", "의사", "변호사", "회계사", "간호사", "엔지니어", "프로그래머"}},
-        "서비스직": {"value": "service", "synonyms": {"서비스직", "서비스업"}},
+        "서비스직": {"value": "service", "synonyms": {"서비스직", "서비스업", "미용", "통신", "안내", "요식업", "요식"}},
         "판매직": {"value": "sales", "synonyms": {"판매직", "영업"}},
         "생산직": {"value": "manufacturing", "synonyms": {"생산직", "블루칼라", "생산/노무직"}},
         "공무원": {"value": "public_servant", "synonyms": {"공무원", "공직자", "공무", "공직"}},
@@ -100,6 +100,112 @@ class DemographicExtractor:
         "인터넷통신": {"value": "internet_telecom", "synonyms": {"인터넷", "통신", "인터넷•통신"}},
         "방송언론": {"value": "media", "synonyms": {"방송", "언론", "방송•언론"}},
         "게임": {"value": "game", "synonyms": {"게임"}},
+    }
+
+    REGION_MAP = {
+        # 17개 시도 (정규화된 약칭을 value로 사용)
+        "서울": {
+            "value": "서울",
+            "synonyms": {
+                "서울", "서울시", "서울특별시", "서울특별시", "서울 도심", "서울 지역"
+            }
+        },
+        "부산": {
+            "value": "부산",
+            "synonyms": {
+                "부산", "부산시", "부산광역시", "부산 지역"
+            }
+        },
+        "인천": {
+            "value": "인천",
+            "synonyms": {
+                "인천", "인천시", "인천광역시", "인천 지역"
+            }
+        },
+        "대구": {
+            "value": "대구",
+            "synonyms": {
+                "대구", "대구시", "대구광역시", "대구 지역"
+            }
+        },
+        "광주": {
+            "value": "광주",
+            "synonyms": {
+                "광주", "광주시", "광주광역시", "광주 지역"
+            }
+        },
+        "대전": {
+            "value": "대전",
+            "synonyms": {
+                "대전", "대전시", "대전광역시", "대전 지역"
+            }
+        },
+        "울산": {
+            "value": "울산",
+            "synonyms": {
+                "울산", "울산시", "울산광역시", "울산 지역"
+            }
+        },
+        "세종": {
+            "value": "세종",
+            "synonyms": {
+                "세종", "세종시", "세종특별자치시", "세종 지역"
+            }
+        },
+        "경기": {
+            "value": "경기",
+            "synonyms": {
+                "경기", "경기도", "경기 지역", "경기도 지역"
+            }
+        },
+        "강원": {
+            "value": "강원",
+            "synonyms": {
+                "강원", "강원도", "강원특별자치도", "강원 지역"
+            }
+        },
+        "충북": {
+            "value": "충북",
+            "synonyms": {
+                "충북", "충청북도", "충북 지역"
+            }
+        },
+        "충남": {
+            "value": "충남",
+            "synonyms": {
+                "충남", "충청남도", "충남 지역"
+            }
+        },
+        "전북": {
+            "value": "전북",
+            "synonyms": {
+                "전북", "전라북도", "전북 지역"
+            }
+        },
+        "전남": {
+            "value": "전남",
+            "synonyms": {
+                "전남", "전라남도", "전남 지역"
+            }
+        },
+        "경북": {
+            "value": "경북",
+            "synonyms": {
+                "경북", "경상북도", "경북 지역"
+            }
+        },
+        "경남": {
+            "value": "경남",
+            "synonyms": {
+                "경남", "경상남도", "경남 지역"
+            }
+        },
+        "제주": {
+            "value": "제주",
+            "synonyms": {
+                "제주", "제주도", "제주특별자치도", "제주 지역", "제주시", "서귀포시"
+            }
+        },
     }
 
     def extract(self, query: str) -> ExtractedEntities:
@@ -192,22 +298,24 @@ class DemographicExtractor:
                 )
             )
 
-        # Income detection
+        # Income detection (범위 조건 지원)
         income_found = self._match_income(text)
         if income_found is not None:
-            canon, value, synonyms = income_found
-            demographics.append(
-                DemographicEntity(
-                    entity_type=EntityType.DEMOGRAPHIC,
-                    name="소득",
-                    canonical_form="income",
-                    demographic_type=DemographicType.INCOME,
-                    value=value,
-                    raw_value=canon,
-                    synonyms=set(synonyms),
-                    confidence=1.0,
+            matched_ranges, synonyms = income_found
+            # ⭐ "200만원 이상" 같은 범위 조건은 여러 구간을 매칭할 수 있음
+            for canon, value in matched_ranges:
+                demographics.append(
+                    DemographicEntity(
+                        entity_type=EntityType.DEMOGRAPHIC,
+                        name="소득",
+                        canonical_form="income",
+                        demographic_type=DemographicType.INCOME,
+                        value=value,
+                        raw_value=canon,
+                        synonyms=set(synonyms),
+                        confidence=1.0,
+                    )
                 )
-            )
 
         # Family size detection
         family_found = self._match_family_size(text)
@@ -239,6 +347,40 @@ class DemographicExtractor:
                     value=value,
                     raw_value=canon,
                     synonyms=set(synonyms),
+                    confidence=1.0,
+                )
+            )
+
+        # Region detection
+        region_found = self._match_region(text)
+        if region_found is not None:
+            canon, value, synonyms = region_found
+            demographics.append(
+                DemographicEntity(
+                    entity_type=EntityType.DEMOGRAPHIC,
+                    name="지역",
+                    canonical_form="region",
+                    demographic_type=DemographicType.REGION,
+                    value=value,
+                    raw_value=canon,
+                    synonyms=set(synonyms),
+                    confidence=1.0,
+                )
+            )
+
+        # ⭐ Sub-region detection (구/군/시 단위)
+        sub_region_found = self._match_sub_region(text)
+        if sub_region_found is not None:
+            sub_region_value = sub_region_found
+            demographics.append(
+                DemographicEntity(
+                    entity_type=EntityType.DEMOGRAPHIC,
+                    name="세부지역",
+                    canonical_form="sub_region",
+                    demographic_type=DemographicType.SUB_REGION,
+                    value=sub_region_value,
+                    raw_value=sub_region_value,
+                    synonyms=set(),
                     confidence=1.0,
                 )
             )
@@ -290,7 +432,8 @@ class DemographicExtractor:
             for syn in info["synonyms"]:
                 # 단어 경계를 고려한 정규식 패턴
                 # 조사 허용: "학생인", "학생이", "학생을" 등
-                pattern = r'(^|\s)' + re.escape(syn) + r'(\s|인|이|을|를|은|는|의|에|에서|와|과|$)'
+                # ⭐ "쪽", "계열", "관련" 등 추가
+                pattern = r'(^|\s)' + re.escape(syn) + r'(\s|인|이|을|를|은|는|의|에|에서|와|과|쪽|계열|관련|분야|계통|$)'
                 if re.search(pattern, text):
                     return canon, info["value"], info["synonyms"]
         return None
@@ -314,7 +457,15 @@ class DemographicExtractor:
         except Exception:
             return default_size
 
-    def extract_with_size(self, query: str, default_size: int = 10, max_size: int = 1000):
+    def extract_with_size(self, query: str, default_size: int = 1000, max_size: int = 5000):
+        """
+        쿼리에서 demographics와 요청 size 추출
+
+        Args:
+            query: 검색 쿼리
+            default_size: 수량 미지정 시 기본값 (기본 1000 - 전체 결과 확인 가능하도록)
+            max_size: 최대 허용 size (기본 5000)
+        """
         entities = self.extract(query)
         size = self.parse_requested_size(query, default_size=default_size, max_size=max_size)
         return entities, size
@@ -337,11 +488,58 @@ class DemographicExtractor:
         return None
 
     def _match_income(self, text: str):
-        """소득 매칭"""
+        """소득 매칭 (범위 조건 지원)"""
+        import re
+
+        # ⭐ 범위 조건 패턴: "200만원 이상", "300만원 이하" 등
+        range_pattern = r'(\d+)\s*만원\s*(이상|이하|초과|미만)'
+        range_match = re.search(range_pattern, text)
+
+        if range_match:
+            amount = int(range_match.group(1))
+            condition = range_match.group(2)
+
+            # 각 구간의 범위 정의 (하한값 기준)
+            income_ranges = [
+                ("100만원미만", 0, "under_100"),
+                ("100~199만원", 100, "100_199"),
+                ("200~299만원", 200, "200_299"),
+                ("300~399만원", 300, "300_399"),
+                ("400~499만원", 400, "400_499"),
+                ("500만원이상", 500, "over_500"),
+            ]
+
+            matched_ranges = []
+            for canon, lower_bound, value in income_ranges:
+                if condition == "이상":
+                    if lower_bound >= amount:
+                        matched_ranges.append((canon, value))
+                elif condition == "이하":
+                    if lower_bound < amount or lower_bound == 0:  # 100만원미만 포함
+                        matched_ranges.append((canon, value))
+                elif condition == "초과":
+                    if lower_bound > amount:
+                        matched_ranges.append((canon, value))
+                elif condition == "미만":
+                    if lower_bound < amount:
+                        matched_ranges.append((canon, value))
+
+            # ⭐ 복수 구간 반환 (리스트로 반환)
+            if matched_ranges:
+                # 모든 매칭된 구간의 synonyms 결합
+                all_synonyms = set()
+                for canon, _ in matched_ranges:
+                    all_synonyms.update(self.INCOME_MAP[canon]["synonyms"])
+
+                # 첫 번째 매칭 구간을 대표로 반환하되, synonyms는 모두 포함
+                return matched_ranges, all_synonyms
+
+        # ⭐ 정확한 구간 매칭 (기존 로직)
         for canon, info in self.INCOME_MAP.items():
             for syn in info["synonyms"]:
                 if syn in text:
-                    return canon, info["value"], info["synonyms"]
+                    return [(canon, info["value"])], info["synonyms"]
+
         return None
 
     def _match_family_size(self, text: str):
@@ -359,6 +557,106 @@ class DemographicExtractor:
                 # 직무는 여러 단어 조합 가능 (예: "경영•인사•총무•사무")
                 if syn in text:
                     return canon, info["value"], info["synonyms"]
+        return None
+
+    def _normalize_region_text(self, text: str) -> str:
+        """지역 텍스트 정규화
+        - "서울특별시" → "서울"
+        - "경기도" → "경기"
+        - "인천광역시" → "인천"
+        - "충청북도" → "충북"
+        - "제주특별자치도" → "제주"
+        """
+        # 공백 제거
+        normalized = text.strip()
+        
+        # 시/도/특별시/광역시/특별자치시/특별자치도 제거
+        normalized = re.sub(r'(특별자치시|광역시|특별시|특별자치도|도|시)\s*$', '', normalized)
+        
+        # 약칭 변환 (전체 이름 → 약칭)
+        full_to_short = {
+            "서울특별시": "서울",
+            "부산광역시": "부산",
+            "인천광역시": "인천",
+            "대구광역시": "대구",
+            "광주광역시": "광주",
+            "대전광역시": "대전",
+            "울산광역시": "울산",
+            "세종특별자치시": "세종",
+            "경기도": "경기",
+            "강원특별자치도": "강원",
+            "강원도": "강원",
+            "충청북도": "충북",
+            "충청남도": "충남",
+            "전라북도": "전북",
+            "전라남도": "전남",
+            "경상북도": "경북",
+            "경상남도": "경남",
+            "제주특별자치도": "제주",
+            "제주도": "제주",
+        }
+        
+        for full, short in full_to_short.items():
+            if full in normalized:
+                normalized = normalized.replace(full, short)
+        
+        return normalized.strip()
+
+    def _match_region(self, text: str):
+        """지역 매칭 (정규화 포함)
+        
+        정규화 처리:
+        - "서울특별시" → "서울"
+        - "경기도" → "경기"
+        - "인천광역시" → "인천"
+        - "충청북도" → "충북"
+        등
+        
+        매칭 패턴:
+        - "인천 거주자", "서울 지역", "경기도 사람" 등 다양한 표현 지원
+        - 단어 경계와 조사를 고려한 매칭
+        """
+        # 텍스트 정규화
+        normalized_text = self._normalize_region_text(text)
+        
+        # REGION_MAP에서 매칭 시도 (긴 매칭 우선)
+        # synonyms를 길이 순으로 정렬하여 더 긴 매칭을 우선시
+        matches = []
+        for canon, info in self.REGION_MAP.items():
+            for syn in info["synonyms"]:
+                # 정규화된 동의어도 확인
+                normalized_syn = self._normalize_region_text(syn)
+                
+                # 단어 경계를 고려한 정규식 패턴
+                # "인천 거주자", "서울 지역", "경기도 사람" 등 다양한 표현 지원
+                pattern = r'(^|\s)' + re.escape(syn) + r'(\s|지역|거주|사람|인|이|을|를|은|는|의|에|에서|와|과|$|시|도)'
+                if re.search(pattern, text, re.IGNORECASE):
+                    matches.append((len(syn), canon, info))
+                    break
+                
+                # 정규화된 텍스트에서도 매칭 시도
+                if normalized_syn in normalized_text or syn in normalized_text:
+                    matches.append((len(syn), canon, info))
+                    break
+        
+        if matches:
+            # 가장 긴 매칭을 우선 선택 (예: "서울특별시"가 "서울"보다 우선)
+            matches.sort(key=lambda x: x[0], reverse=True)
+            _, canon, info = matches[0]
+            return canon, info["value"], info["synonyms"]
+
+        return None
+
+    def _match_sub_region(self, text: str):
+        """세부 지역 매칭 (구/군/시 단위)"""
+        # "연수구", "남동구", "강남구" 등의 패턴 찾기
+        # 2-5글자 + (구|군|시) 패턴
+        import re
+        pattern = r'([가-힣]{2,5})(구|군|시)(?:\s|지역|거주|사람|인|이|을|를|은|는|의|에|에서|와|과|$)'
+        match = re.search(pattern, text)
+        if match:
+            sub_region = match.group(1) + match.group(2)  # "연수" + "구" = "연수구"
+            return sub_region
         return None
 
 

@@ -182,16 +182,36 @@ class OpenSearchHybridQueryBuilder:
             size
         )
 
+        # ⭐ None 쿼리 제거: hybrid 쿼리의 queries 배열에 null이 들어가면 안 됨
+        valid_queries = []
+        if keyword_query is not None:
+            valid_queries.append(keyword_query)
+        if vector_query is not None:
+            valid_queries.append(vector_query)
+
+        # 유효한 쿼리가 없으면 match_all 반환
+        if not valid_queries:
+            logger.warning("⚠️ 유효한 쿼리가 없어 match_all을 반환합니다.")
+            return {
+                "query": {"match_all": {}},
+                "size": size
+            }
+
+        # 쿼리가 하나만 있으면 hybrid 없이 직접 반환
+        if len(valid_queries) == 1:
+            logger.info("⚠️ 쿼리가 하나만 있어 hybrid 없이 직접 반환합니다.")
+            return {
+                "query": valid_queries[0],
+                "size": size
+            }
+
         # RRF 결합 (OpenSearch 2.10+)
         if hasattr(self.config, 'OPENSEARCH_VERSION') and self.config.OPENSEARCH_VERSION >= 2.10:
             # 내장 RRF 사용
             query = {
                 "query": {
                     "hybrid": {
-                        "queries": [
-                            keyword_query,
-                            vector_query
-                        ]
+                        "queries": valid_queries
                     }
                 },
                 "size": size,
@@ -205,8 +225,8 @@ class OpenSearchHybridQueryBuilder:
         else:
             # Fallback: 가중 평균 방식
             query = self._build_weighted_hybrid(
-                keyword_query,
-                vector_query,
+                valid_queries[0],  # keyword_query
+                valid_queries[1] if len(valid_queries) > 1 else None,  # vector_query
                 alpha,
                 size
             )
@@ -358,45 +378,61 @@ class OpenSearchHybridQueryBuilder:
         """벡터 검색 쿼리 (qa_pairs에서 검색)"""
 
         # 참고: qa_pairs에 answer_vector가 없으면 벡터 검색 불가
-        # 현재는 키워드 검색으로 fallback
+        # None을 반환하여 키워드 검색만 사용하도록 함
         logger.warning("벡터 검색은 qa_pairs에 answer_vector 필드가 필요합니다. 키워드 검색만 사용합니다.")
 
-        # 임시로 키워드 검색 반환
-        return self._build_keyword_search(
-            {"must": [], "should": [], "must_not": []},
-            demographic_filters
-        )
+        # ⭐ None 반환: hybrid 쿼리에서 자동으로 키워드 검색만 사용됨
+        return None
 
     def _build_weighted_hybrid(
         self,
         keyword_query: Dict,
-        vector_query: Dict,
+        vector_query: Optional[Dict],
         alpha: float,
         size: int
     ) -> Dict:
         """가중 평균 방식 하이브리드 (Fallback)"""
 
-        # alpha = 0: 키워드만, alpha = 1: 벡터만
-        keyword_weight = 1.0 - alpha
-        vector_weight = alpha
+        # ⭐ None 쿼리 제거
+        should_clauses = []
+        
+        if keyword_query is not None:
+            keyword_weight = 1.0 - alpha
+            should_clauses.append({
+                "constant_score": {
+                    "filter": keyword_query,
+                    "boost": keyword_weight
+                }
+            })
+        
+        if vector_query is not None:
+            vector_weight = alpha
+            should_clauses.append({
+                "constant_score": {
+                    "filter": vector_query,
+                    "boost": vector_weight
+                }
+            })
+
+        # 유효한 쿼리가 없으면 match_all 반환
+        if not should_clauses:
+            logger.warning("⚠️ 유효한 쿼리가 없어 match_all을 반환합니다.")
+            return {
+                "query": {"match_all": {}},
+                "size": size
+            }
+
+        # 쿼리가 하나만 있으면 should 없이 직접 반환
+        if len(should_clauses) == 1:
+            return {
+                "query": should_clauses[0]["constant_score"]["filter"],
+                "size": size
+            }
 
         query = {
             "query": {
                 "bool": {
-                    "should": [
-                        {
-                            "constant_score": {
-                                "filter": keyword_query,
-                                "boost": keyword_weight
-                            }
-                        },
-                        {
-                            "constant_score": {
-                                "filter": vector_query,
-                                "boost": vector_weight
-                            }
-                        }
-                    ]
+                    "should": should_clauses
                 }
             },
             "size": size
