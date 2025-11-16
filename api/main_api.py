@@ -4,6 +4,7 @@ import logging
 import torch
 from typing import Optional
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from opensearchpy import OpenSearch, AsyncOpenSearch
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
@@ -48,6 +49,15 @@ def create_app() -> FastAPI:
             title="RAG Query Analyzer API",
             description="OpenSearch 기반 설문조사 데이터 색인 및 검색 API",
             version="4.0.0 (Refactored)"
+        )
+
+        # CORS 미들웨어 추가
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],  # 모든 오리진 허용 (프로덕션에서는 특정 도메인만 지정 권장)
+            allow_credentials=True,
+            allow_methods=["*"],  # 모든 HTTP 메서드 허용
+            allow_headers=["*"],  # 모든 헤더 허용
         )
 
         # OpenSearch 클라이언트 초기화
