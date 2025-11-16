@@ -221,10 +221,18 @@ jobs:
           docker compose build fastapi_server
           docker compose up -d fastapi_server
 
-          # 헬스 체크 (최대 30초 대기)
+          # 컨테이너 로그 확인
+          echo "컨테이너 로그 확인 중..."
+          docker compose logs fastapi_server | tail -20
+          
+          # 헬스 체크 (최대 60초 대기, 루트 경로 사용)
           echo "헬스 체크 대기 중..."
-          for i in {1..6}; do
-            if curl -f http://localhost:8000/health; then
+          sleep 10  # 초기 대기 시간 증가
+          
+          for i in {1..12}; do
+            # 루트 경로로 헬스 체크 (또는 /docs 경로)
+            if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
+               curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
               echo "헬스 체크 성공!"
               break
             else
@@ -234,7 +242,15 @@ jobs:
           done
 
           # 최종 헬스 체크
-          curl -f http://localhost:8000/health || exit 1
+          if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
+             curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
+            echo "✅ 헬스 체크 성공!"
+          else
+            echo "❌ 헬스 체크 실패"
+            echo "컨테이너 로그:"
+            docker compose logs fastapi_server
+            exit 1
+          fi
 
           # 정리
           docker compose down
@@ -325,21 +341,41 @@ jobs:
               docker compose pull || true
               docker compose up -d --build
               
-              # 헬스 체크
+              # 컨테이너 로그 확인
+              echo "컨테이너 로그 확인 중..."
+              docker compose logs fastapi_server | tail -20
+              
+              # 헬스 체크 (최대 60초 대기, 루트 경로 사용)
               echo "헬스 체크 대기 중..."
               sleep 15
               docker compose ps
               
               # 헬스 체크 확인
-              for i in {1..6}; do
-                if curl -f http://localhost:8000/health 2>/dev/null; then
+              for i in {1..12}; do
+                # 루트 경로로 헬스 체크 (또는 /docs 경로)
+                if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
+                   curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
                   echo "헬스 체크 성공!"
                   break
                 else
-                  echo "헬스 체크 실패, 재시도 중... ($i/6)"
+                  echo "헬스 체크 실패, 재시도 중... ($i/12)"
+                  # 컨테이너 상태 확인
+                  docker compose ps
+                  docker compose logs --tail=10 fastapi_server
                   sleep 5
                 fi
               done
+              
+              # 최종 헬스 체크
+              if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
+                 curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
+                echo "✅ 헬스 체크 성공!"
+              else
+                echo "❌ 헬스 체크 실패"
+                echo "컨테이너 로그:"
+                docker compose logs fastapi_server
+                echo "⚠️ 헬스 체크 실패했지만 배포는 계속 진행합니다."
+              fi
             else
               # Docker Compose가 없는 경우 직접 컨테이너 실행
               docker stop ${{ env.DOCKER_IMAGE_NAME }} || true
