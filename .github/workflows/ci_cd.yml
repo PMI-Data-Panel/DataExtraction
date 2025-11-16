@@ -214,12 +214,12 @@ jobs:
       - name: Test Docker image
         run: |
           # Redis 서비스 시작
-          docker-compose up -d redis_cache
+          docker compose up -d redis_cache
           sleep 5
 
           # FastAPI 서비스 빌드 및 시작
-          docker-compose build fastapi_server
-          docker-compose up -d fastapi_server
+          docker compose build fastapi_server
+          docker compose up -d fastapi_server
 
           # 헬스 체크 (최대 30초 대기)
           echo "헬스 체크 대기 중..."
@@ -237,7 +237,7 @@ jobs:
           curl -f http://localhost:8000/health || exit 1
 
           # 정리
-          docker-compose down
+          docker compose down
 
   # SSH를 통한 배포
   deploy:
@@ -313,22 +313,22 @@ jobs:
             docker pull ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.DOCKER_IMAGE_NAME }}:latest || {
               echo "이미지 pull 실패, 로컬 빌드 시도..."
               git pull origin main || true
-              docker-compose build --no-cache || docker build -t ${{ env.DOCKER_IMAGE_NAME }}:latest .
+              docker compose build --no-cache || docker build -t ${{ env.DOCKER_IMAGE_NAME }}:latest .
             }
             
             echo "=== Docker Compose로 서비스 시작 ==="
             if [ -f docker-compose.yml ]; then
               # 기존 컨테이너 중지 및 제거
-              docker-compose down || true
+              docker compose down || true
               
               # 새 이미지로 서비스 시작
-              docker-compose pull || true
-              docker-compose up -d --build
+              docker compose pull || true
+              docker compose up -d --build
               
               # 헬스 체크
               echo "헬스 체크 대기 중..."
               sleep 15
-              docker-compose ps
+              docker compose ps
               
               # 헬스 체크 확인
               for i in {1..6}; do
