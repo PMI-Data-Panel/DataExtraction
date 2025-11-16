@@ -56,9 +56,11 @@ def create_app() -> FastAPI:
         # 따라서 명시적으로 허용할 오리진을 지정해야 함
         allowed_origins = [
             "http://localhost:5173",
+            "http://localhost:5174",  # Vite 개발 서버 (다른 포트)
             "http://localhost:3000",
             "http://localhost:8080",
             "http://127.0.0.1:5173",
+            "http://127.0.0.1:5174",  # Vite 개발 서버 (다른 포트)
             "http://127.0.0.1:3000",
             "http://127.0.0.1:8080",
         ]
