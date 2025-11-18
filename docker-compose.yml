@@ -123,7 +123,32 @@ services:
     networks:
       - rag_net
 
-  # 3. Prometheus 메트릭 수집 서비스
+  # 3. Node Exporter (시스템 메트릭 수집: CPU, RAM, Disk 등)
+  node_exporter:
+    container_name: node_exporter
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    restart: unless-stopped
+    networks:
+      - rag_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9100/metrics || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # 4. Prometheus 메트릭 수집 서비스
   prometheus:
     container_name: prometheus
     image: prom/prometheus:latest
@@ -149,7 +174,7 @@ services:
       retries: 3
       start_period: 10s
 
-  # 4. Grafana 모니터링 대시보드 서비스
+  # 5. Grafana 모니터링 대시보드 서비스
   grafana:
     container_name: grafana
     image: grafana/grafana:latest
