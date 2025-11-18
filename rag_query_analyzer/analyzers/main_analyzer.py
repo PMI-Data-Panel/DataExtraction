@@ -164,12 +164,20 @@ class AdvancedRAGQueryAnalyzer:
             try:
                 logger.info(f"🔍 {name} 분석기 시도 중...")
                 analysis = analyzer.analyze(query, context)
-                
+
                 # 성공적인 분석인지 확인
-                if analysis.confidence >= 0.3 and analysis.must_terms:
-                    logger.info(f"✅ {name} 분석기 성공")
+                # ⭐ must_terms가 비어있어도 demographics나 behavioral_conditions가 있으면 성공
+                has_useful_content = (
+                    analysis.must_terms or
+                    (hasattr(analysis, 'demographic_entities') and analysis.demographic_entities) or
+                    (hasattr(analysis, 'behavioral_conditions') and analysis.behavioral_conditions)
+                )
+                if analysis.confidence >= 0.3 and has_useful_content:
+                    logger.info(f"✅ {name} 분석기 성공 (must_terms={len(analysis.must_terms) if analysis.must_terms else 0}, demographics={len(analysis.demographic_entities) if hasattr(analysis, 'demographic_entities') and analysis.demographic_entities else 0}, behavioral={bool(getattr(analysis, 'behavioral_conditions', {}))})")
                     return analysis
-                    
+                else:
+                    logger.info(f"⚠️ {name} 분석기 결과 부족 (confidence={analysis.confidence:.2f}, has_content={has_useful_content})")
+
             except Exception as e:
                 logger.warning(f"{name} 분석기 실패: {e}")
                 continue
@@ -387,6 +395,14 @@ class AdvancedRAGQueryAnalyzer:
         if not analysis:
             return analysis
 
+        # ⭐ 디버깅: Claude 분석 결과 확인
+        logger.warning(f"[정규화 전] must_terms={analysis.must_terms}")
+        logger.warning(f"[정규화 전] demographic_entities={len(analysis.demographic_entities) if analysis.demographic_entities else 0}개")
+        logger.warning(f"[정규화 전] behavioral_conditions={analysis.behavioral_conditions}")
+        if analysis.demographic_entities:
+            for entity in analysis.demographic_entities:
+                logger.warning(f"  - {entity.demographic_type.value}: {entity.value}")
+
         # Rule 기반 불용어/행동 키워드
         rule_analyzer = getattr(self, "rule_analyzer", None) or RuleBasedAnalyzer()
         meta_lower = {kw.lower() for kw in rule_analyzer.meta_keywords}
@@ -430,9 +446,19 @@ class AdvancedRAGQueryAnalyzer:
             sanitized_should.append(term)
 
         # Demographics 추출 및 제거
-        demographics = demographic_extractor.extract(query)
+        # ⭐ Claude가 이미 추출한 demographic_entities가 있으면 사용, 없으면 DemographicExtractor 사용
+        if analysis.demographic_entities:
+            # Claude가 추출한 demographics 사용
+            demographics_list = analysis.demographic_entities
+            logger.info(f"✅ Claude가 추출한 demographics 사용: {len(demographics_list)}개")
+        else:
+            # 폴백: DemographicExtractor 사용
+            demographics = demographic_extractor.extract(query)
+            demographics_list = demographics.demographics
+            logger.info(f"⚠️ Claude demographics 없음 → DemographicExtractor 사용: {len(demographics_list)}개")
+
         demographic_tokens: Set[str] = set()
-        for entity in demographics.demographics:
+        for entity in demographics_list:
             demographic_tokens.add(entity.raw_value.lower())
             demographic_tokens.add(entity.value.lower())
             for syn in entity.synonyms:
@@ -494,11 +520,13 @@ class AdvancedRAGQueryAnalyzer:
         analysis.must_terms = _dedupe(sanitized_must)
         analysis.should_terms = _dedupe(sanitized_should)
 
-        # Demographics 정보 저장 (이제 정식 필드이므로 type: ignore 불필요)
-        analysis.demographic_entities = demographics.demographics
+        # Demographics 정보 저장 (Claude 결과를 유지하거나 DemographicExtractor 결과 저장)
+        # ⭐ Claude가 이미 추출한 경우 유지, 아니면 DemographicExtractor 결과 저장
+        if not analysis.demographic_entities:
+            analysis.demographic_entities = demographics_list
         analysis.removed_demographic_terms = removed_demographic_terms
 
-        logger.info(f"🔍 Demographics 추출 완료: {len(demographics.demographics)}개")
+        logger.info(f"🔍 Demographics 최종 저장: {len(analysis.demographic_entities)}개")
         if removed_demographic_terms:
             logger.info(f"   ❌ 제거된 Demographics 키워드: {removed_demographic_terms}")
 
