@@ -196,8 +196,13 @@ async def get_user_info_statistics(
                                     "should": [
                                         {"term": {"qa_pairs.q_text.keyword": "가족수"}},
                                         {"term": {"qa_pairs.q_text.keyword": "가구원수"}},
-                                        {"wildcard": {"qa_pairs.q_text.keyword": "*가족*"}},
-                                        {"wildcard": {"qa_pairs.q_text.keyword": "*가구*"}}
+                                        {"term": {"qa_pairs.q_text.keyword": "가구원 수"}},
+                                        {"wildcard": {"qa_pairs.q_text.keyword": "*가족 수*"}},
+                                        {"wildcard": {"qa_pairs.q_text.keyword": "*가족수*"}}
+                                    ],
+                                    "must_not": [
+                                        {"wildcard": {"qa_pairs.q_text.keyword": "*소득*"}},
+                                        {"wildcard": {"qa_pairs.q_text.keyword": "*수입*"}}
                                     ]
                                 }
                             },
@@ -246,45 +251,49 @@ async def get_user_info_statistics(
 
         # 성별 분포 처리
         gender_buckets = aggs["gender_dist"]["buckets"]
-        gender_map = {"M": "남성", "F": "여성", "미분류": "미분류"}
+        gender_total = sum(bucket["doc_count"] for bucket in gender_buckets)
+        gender_map = {"M": "남성", "F": "여성", "남성": "남성", "여성": "여성", "미정": "미정"}
         gender_distribution = [
             ChartDataPoint(
                 label=gender_map.get(bucket["key"], bucket["key"]),
                 value=bucket["doc_count"],
-                percentage=calculate_percentage(bucket["doc_count"], total_docs)
+                percentage=calculate_percentage(bucket["doc_count"], gender_total if gender_total > 0 else total_docs)
             )
             for bucket in gender_buckets
         ]
 
         # 나이대 분포 처리
         age_buckets = aggs["age_group_dist"]["buckets"]
+        age_total = sum(bucket["doc_count"] for bucket in age_buckets)
         age_distribution = [
             ChartDataPoint(
                 label=bucket["key"],
                 value=bucket["doc_count"],
-                percentage=calculate_percentage(bucket["doc_count"], total_docs)
+                percentage=calculate_percentage(bucket["doc_count"], age_total if age_total > 0 else total_docs)
             )
             for bucket in age_buckets
         ]
 
         # 지역 분포 처리
         region_buckets = aggs["region_dist"]["buckets"]
+        region_total = sum(bucket["doc_count"] for bucket in region_buckets)
         region_distribution = [
             ChartDataPoint(
                 label=bucket["key"],
                 value=bucket["doc_count"],
-                percentage=calculate_percentage(bucket["doc_count"], total_docs)
+                percentage=calculate_percentage(bucket["doc_count"], region_total if region_total > 0 else total_docs)
             )
             for bucket in region_buckets
         ]
 
         # 직업 분포 처리
         occupation_buckets = aggs["occupation_dist"]["buckets"]
+        occupation_total = sum(bucket["doc_count"] for bucket in occupation_buckets)
         occupation_distribution = [
             ChartDataPoint(
                 label=bucket["key"],
                 value=bucket["doc_count"],
-                percentage=calculate_percentage(bucket["doc_count"], total_docs)
+                percentage=calculate_percentage(bucket["doc_count"], occupation_total if occupation_total > 0 else total_docs)
             )
             for bucket in occupation_buckets
         ]
@@ -397,15 +406,23 @@ async def get_user_info_statistics(
 
         # 가족수 분포 처리
         family_buckets = aggs["qa_nested"]["family_filter"]["family_answers"]["buckets"]
-        family_total = sum(bucket["doc_count"] for bucket in family_buckets)
-        
+
+        # ⚠️ 소득 관련 답변 필터링 (만약 섞여있다면)
+        # "5명 이상"은 유지하고, "월 XXX만원 이상"만 제거
+        family_buckets_filtered = [
+            bucket for bucket in family_buckets
+            if not any(keyword in bucket["key"] for keyword in ["월 ", "만원", "~"])
+        ]
+
+        family_total = sum(bucket["doc_count"] for bucket in family_buckets_filtered)
+
         family_size_distribution = [
             ChartDataPoint(
                 label=bucket["key"],
                 value=bucket["doc_count"],
                 percentage=calculate_percentage(bucket["doc_count"], family_total) if family_total > 0 else 0.0
             )
-            for bucket in family_buckets
+            for bucket in family_buckets_filtered
         ]
 
         # 월평균 개인소득 분포 처리

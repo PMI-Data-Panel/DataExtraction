@@ -26,6 +26,28 @@ logger = logging.getLogger(__name__)
 # propagate만 True로 설정하여 루트 로거로 전파되도록 함
 logger.propagate = True
 
+
+def _mask_user_ids_in_query(query: Dict[str, Any]) -> Dict[str, Any]:
+    """쿼리에서 user_id 리스트를 마스킹하여 로깅용 복사본 생성"""
+    import copy
+    masked = copy.deepcopy(query)
+    
+    def mask_recursive(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in ("_id", "user_id") and isinstance(value, list):
+                    # user_id 리스트를 개수만 표시하도록 마스킹
+                    obj[key] = f"[{len(value)} user_ids masked]"
+                elif isinstance(value, (dict, list)):
+                    mask_recursive(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, (dict, list)):
+                    mask_recursive(item)
+    
+    mask_recursive(masked)
+    return masked
+
 router = APIRouter(
     prefix="/search",
     tags=["Search"]
@@ -483,21 +505,25 @@ def calculate_rrf_score_adaptive(
     has_filters: bool,
     use_vector_search: bool,
 ) -> Tuple[List[Dict[str, Any]], int, str]:
-    """쿼리 특성에 따라 RRF k 값을 조정"""
+    """쿼리 특성에 따라 RRF k 값과 alpha 가중치를 조정"""
     k = 60
-    reason = "균형 유지 (k=60)"
+    alpha = 0.6  # ⭐⭐⭐ 벡터 검색 가중치: 60% (keyword는 40%)
+    reason = "균형 유지 (k=60, alpha=0.6 → vector 60%)"
 
     if has_filters:
         k = 40
-        reason = "필터 적용 → 정확도 중시 (k=40)"
+        alpha = 0.6  # 필터가 있어도 벡터 검색 중시
+        reason = "필터 적용 → 벡터 중심 (k=40, alpha=0.6 → vector 60%)"
     elif use_vector_search and query_intent and query_intent.lower() in {"semantic", "semantic_search"}:
         k = 80
-        reason = f"의도={query_intent} → 벡터 가중 (k=80)"
+        alpha = 0.7  # 시맨틱 검색이면 벡터 가중치 더 높임
+        reason = f"의도={query_intent} → 벡터 강화 (k=80, alpha=0.7 → vector 70%)"
 
     combined = calculate_rrf_score(
         keyword_results=keyword_results,
         vector_results=vector_results,
         k=k,
+        alpha=alpha,
     )
     return combined, k, reason
 
@@ -653,6 +679,7 @@ def _build_cached_response(
 
     return SearchResponse(
         query=request.query,
+        session_id=getattr(request, "session_id", None),
         total_hits=total_hits,
         max_score=max_score,
         results=page_results,
@@ -1162,7 +1189,8 @@ class SearchResult(BaseModel):
     """검색 결과 항목"""
     user_id: str
     score: float
-    timestamp: Optional[str] = None
+    timestamp: Optional[str] = Field(default=None, description="인덱싱 시간")
+    survey_datetime: Optional[str] = Field(default=None, description="설문조사 일시 (metadata.survey_datetime)")
     demographic_info: Optional[Dict[str, Any]] = Field(default=None, description="인구통계 정보 (survey_responses_merged에서 조회)")
     behavioral_info: Optional[Dict[str, Any]] = Field(default=None, description="행동/습관 정보 (예: 흡연 여부, 차량 보유 여부)")
     qa_pairs: Optional[List[Dict[str, Any]]] = None
@@ -1176,6 +1204,10 @@ class SearchResponse(BaseModel):
     total_hits: int
     max_score: Optional[float]
     results: List[SearchResult]
+    session_id: Optional[str] = Field(
+        default=None,
+        description="요청에 사용된 세션 ID (자동 생성/전달된 값)",
+    )
     query_analysis: Optional[Dict[str, Any]] = None
     took_ms: int
     page: int = Field(default=1, description="현재 페이지 번호")
@@ -1277,6 +1309,751 @@ DRINKER_POSITIVE_KEYWORDS = {
     "술 마심", "술 마셔", "술마심", "술마셔", "음주함", "음주 경험 있음", "음주경험 있음",
     "가끔 마심", "자주 마심", "주말에 마심"
 }
+
+# ============================================================================
+# ⭐ 설문 질문 기반 Behavioral 키워드 정의 (실제 설문 데이터 기반)
+# ============================================================================
+
+# 1. OTT 서비스 이용
+OTT_QUESTION_KEYWORDS = {
+    "OTT", "ott", "OTT 서비스", "이용 중인 OTT", "현재 이용 중인 OTT",
+    "동영상 스트리밍 앱", "동영상 스트리밍", "영상 스트리밍", "스트리밍 앱",
+    "가장 많이 사용하는 앱"
+}
+OTT_POSITIVE_KEYWORDS = {
+    "1개", "2개", "3개", "4개", "4개 이상",
+    "동영상 스트리밍 앱", "동영상 스트리밍",
+    "넷플릭스", "디즈니", "쿠팡플레이", "웨이브", "티빙", "왓챠", "유튜브"
+}
+OTT_NEGATIVE_KEYWORDS = {
+    "이용하지 않는다", "이용하지않는다", "이용 안함", "이용안함"
+}
+
+# 2. 반려동물 보유
+PET_QUESTION_KEYWORDS = {
+    "반려동물", "반려견", "반려묘", "애완동물", "펫", "pet"
+}
+PET_POSITIVE_KEYWORDS = {
+    "반려동물을 키우는 중이다", "반려동물을 키워본 적이 있다",
+    "키우는 중", "키워본 적", "키우고 있", "키웠"
+}
+PET_NEGATIVE_KEYWORDS = {
+    "반려동물을 키워본 적이 없다", "키워본 적이 없", "키운 적 없"
+}
+
+# 3. AI 서비스 이용
+AI_QUESTION_KEYWORDS = {
+    "AI", "ai", "인공지능", "AI 서비스", "AI 챗봇", "챗봇"
+}
+AI_POSITIVE_KEYWORDS = {
+    "검색", "정보 탐색", "번역", "외국어 학습", "업무 보조", "문서 작성",
+    "이미지 생성", "디자인", "학습", "공부", "콘텐츠 제작",
+    "ChatGPT", "Gemini", "Copilot", "HyperCLOVER", "Claude", "딥시크"
+}
+AI_NEGATIVE_KEYWORDS = {
+    "AI 서베스를 사용해본 적 없다", "사용해 본 적 없음",
+    "사용해본 적 없", "사용 안해", "사용하지 않"
+}
+
+# 4. 운동/체력관리
+EXERCISE_QUESTION_KEYWORDS = {
+    "체력 관리", "체력관리", "운동", "활동", "피트니스", "헬스"
+}
+EXERCISE_POSITIVE_KEYWORDS = {
+    "달리기", "걷기", "홈트레이닝", "등산", "헬스", "자전거",
+    "요가", "필라테스", "스포츠", "축구", "배드민턴", "수영"
+}
+EXERCISE_NEGATIVE_KEYWORDS = {
+    "체력관리를 위해 하고 있는 활동이 없다", "활동이 없", "하지 않"
+}
+
+# 5. 빠른 배송 이용
+FAST_DELIVERY_QUESTION_KEYWORDS = {
+    "빠른 배송", "당일 배송", "새벽 배송", "직진 배송", "로켓배송"
+}
+FAST_DELIVERY_POSITIVE_KEYWORDS = {
+    "신선식품", "과일", "채소", "육류", "생활용품", "생필품",
+    "위생용품", "패션", "뷰티", "전자기기", "가전제품"
+}
+FAST_DELIVERY_NEGATIVE_KEYWORDS = {
+    "빠른 배송 서비스를 이용해 본 적 없다", "이용해 본 적 없", "이용 안해"
+}
+
+# 6. 전통시장 방문
+TRADITIONAL_MARKET_QUESTION_KEYWORDS = {
+    "전통시장", "재래시장", "시장 방문"
+}
+TRADITIONAL_MARKET_POSITIVE_KEYWORDS = {
+    "일주일에", "한달에", "2주에", "3개월에", "6개월에", "1년에", "회 이상"
+}
+TRADITIONAL_MARKET_NEGATIVE_KEYWORDS = {
+    "전혀 방문하지 않음", "방문하지 않", "안 가"
+}
+
+# 7. 스트레스 요인
+STRESS_QUESTION_KEYWORDS = {
+    "스트레스", "스트레스 요인", "스트레스를 받는", "고민", "걱정"
+}
+STRESS_POSITIVE_KEYWORDS = {
+    "직장", "업무", "학업", "성적", "취업", "진로", "경제적", "재정적", "금전적",
+    "외모", "건강", "질병", "인간관계", "가족", "부모", "자녀", "연애", "결혼"
+}
+STRESS_NEGATIVE_KEYWORDS = {
+    "스트레스 없음", "스트레스를 받지 않음", "해당 없음"
+}
+
+# 8. 여행 의향 (실제 질문: "여러분은 올해 해외여행을 간다면 어디로 가고 싶나요?")
+TRAVEL_QUESTION_KEYWORDS = {
+    "해외여행", "여행", "어디로 가고 싶", "가고 싶나요"
+}
+TRAVEL_POSITIVE_KEYWORDS = {
+    "유럽", "동남아", "일본", "중국", "미국", "캐나다", "일본/중국", "미국/캐나다"
+}
+TRAVEL_NEGATIVE_KEYWORDS = {
+    "해외여행을 가고싶지 않다", "가고싶지 않다", "가고 싶지 않"
+}
+
+# 9. 배달음식 이용
+FOOD_DELIVERY_QUESTION_KEYWORDS = {
+    "야식", "배달", "배달음식", "음식 배달", "배달 앱", "배달 서비스",
+    "배민", "요기요", "쿠팡이츠", "배달의민족", "배달비", "먹을 때"
+}
+FOOD_DELIVERY_POSITIVE_KEYWORDS = {
+    "배달 주문해서 먹는다", "배달 주문", "배달 시켜", "배달비",
+    "한식", "중식", "일식", "양식", "치킨", "피자", "분식",
+    "쇼핑/배달 앱", "배달의민족", "쿠팡"
+}
+FOOD_DELIVERY_NEGATIVE_KEYWORDS = {
+    "야식을 거의 먹지 않는다", "배달음식을 시키지 않음", "이용하지 않음",
+    "안 시킴", "거의 먹지 않는다", "먹지 않는다"
+}
+
+# 10. 커피/카페 이용
+COFFEE_QUESTION_KEYWORDS = {
+    "커피", "카페", "커피숍", "카페 방문", "카페인"
+}
+COFFEE_POSITIVE_KEYWORDS = {
+    "아메리카노", "라떼", "에스프레소", "카푸치노", "카페라떼",
+    "스타벅스", "이디야", "투썸", "메가커피", "빽다방",
+    "하루에", "일주일에", "자주", "매일"
+}
+COFFEE_NEGATIVE_KEYWORDS = {
+    "커피를 마시지 않음", "카페를 가지 않음", "안 마심"
+}
+
+# 11. 구독 서비스 이용
+SUBSCRIPTION_QUESTION_KEYWORDS = {
+    "구독", "구독 서비스", "정기 구독", "멤버십"
+}
+SUBSCRIPTION_POSITIVE_KEYWORDS = {
+    "OTT", "음악", "뉴스", "잡지", "도서", "밀키트", "화장품", "생필품",
+    "넷플릭스", "유튜브", "멜론", "지니", "왓챠"
+}
+SUBSCRIPTION_NEGATIVE_KEYWORDS = {
+    "구독 서비스를 이용하지 않음", "구독 안함", "해당 없음"
+}
+
+# 12. 소셜미디어 이용 (실제 질문: "가장 많이 사용하는 앱은 무엇인가요?")
+SOCIAL_MEDIA_QUESTION_KEYWORDS = {
+    "가장 많이 사용하는 앱", "많이 사용하는 앱", "요즘 가장",
+    "소셜미디어", "SNS", "소셜 네트워크"
+}
+SOCIAL_MEDIA_POSITIVE_KEYWORDS = {
+    "SNS 앱", "SNS 앱 (인스타그램, 페이스북, 틱톡 등)",
+    "인스타그램", "페이스북", "트위터", "틱톡",
+    "카카오스토리", "네이버 밴드"
+}
+SOCIAL_MEDIA_NEGATIVE_KEYWORDS = {
+    "SNS를 사용하지 않음", "소셜미디어 안함", "해당 없음"
+}
+
+# 13. 게임 이용 (실제 질문: "가장 많이 사용하는 앱은 무엇인가요?")
+GAMING_QUESTION_KEYWORDS = {
+    "가장 많이 사용하는 앱", "많이 사용하는 앱", "요즘 가장",
+    "게임", "게이밍", "모바일 게임"
+}
+GAMING_POSITIVE_KEYWORDS = {
+    "게임 앱", "게임앱",
+    "롤", "리그오브레전드", "배틀그라운드", "로스트아크", "메이플",
+    "모바일게임", "PC게임", "콘솔게임"
+}
+GAMING_NEGATIVE_KEYWORDS = {
+    "게임을 하지 않음", "게임 안함", "해당 없음"
+}
+
+# 14. 독서 습관
+READING_QUESTION_KEYWORDS = {
+    "독서", "책", "도서", "읽기", "독서 습관"
+}
+READING_POSITIVE_KEYWORDS = {
+    "소설", "에세이", "자기계발", "경제경영", "인문", "과학",
+    "한달에", "일주일에", "권", "자주"
+}
+READING_NEGATIVE_KEYWORDS = {
+    "책을 읽지 않음", "독서 안함", "거의 안 읽음"
+}
+
+# 15. 영화/드라마 시청
+MOVIE_DRAMA_QUESTION_KEYWORDS = {
+    "영화", "드라마", "시청", "영상", "콘텐츠"
+}
+MOVIE_DRAMA_POSITIVE_KEYWORDS = {
+    "액션", "로맨스", "코미디", "스릴러", "SF", "공포",
+    "한국 드라마", "미드", "일드", "중드", "하루에", "자주"
+}
+MOVIE_DRAMA_NEGATIVE_KEYWORDS = {
+    "영화를 보지 않음", "드라마 안 봄", "거의 안 봄"
+}
+
+# 16. 음악 스트리밍
+MUSIC_STREAMING_QUESTION_KEYWORDS = {
+    "음악", "스트리밍", "음원", "음악 감상"
+}
+MUSIC_STREAMING_POSITIVE_KEYWORDS = {
+    "멜론", "지니", "벅스", "플로", "유튜브뮤직", "스포티파이",
+    "발라드", "댄스", "힙합", "R&B", "록", "인디", "하루에", "자주"
+}
+MUSIC_STREAMING_NEGATIVE_KEYWORDS = {
+    "음악을 듣지 않음", "스트리밍 안함", "해당 없음"
+}
+
+# 17. 온라인 교육
+ONLINE_EDUCATION_QUESTION_KEYWORDS = {
+    "온라인 교육", "인강", "온라인 강의", "이러닝", "온라인 학습"
+}
+ONLINE_EDUCATION_POSITIVE_KEYWORDS = {
+    "어학", "자격증", "취업", "프로그래밍", "디자인", "마케팅",
+    "유데미", "클래스101", "인프런", "패스트캠퍼스"
+}
+ONLINE_EDUCATION_NEGATIVE_KEYWORDS = {
+    "온라인 교육을 받지 않음", "인강 안 들음", "해당 없음"
+}
+
+# 18. 금융 서비스
+FINANCIAL_SERVICE_QUESTION_KEYWORDS = {
+    "금융", "은행", "카드", "대출", "투자", "재테크"
+}
+FINANCIAL_SERVICE_POSITIVE_KEYWORDS = {
+    "신용카드", "체크카드", "적금", "예금", "주식", "펀드", "ETF",
+    "부동산", "가상화폐", "암호화폐", "비트코인"
+}
+FINANCIAL_SERVICE_NEGATIVE_KEYWORDS = {
+    "금융 서비스를 이용하지 않음", "투자 안함", "해당 없음"
+}
+
+# 19. 건강검진
+HEALTH_CHECKUP_QUESTION_KEYWORDS = {
+    "건강검진", "검진", "건강검사", "정기검진"
+}
+HEALTH_CHECKUP_POSITIVE_KEYWORDS = {
+    "1년에", "2년에", "정기적", "매년", "받음", "받은 적"
+}
+HEALTH_CHECKUP_NEGATIVE_KEYWORDS = {
+    "건강검진을 받지 않음", "검진 안함", "받은 적 없음"
+}
+
+# 20. 뷰티/화장품 (실제 질문: "한 달 기준으로 스킨케어 제품에 평균적으로 얼마나 소비하시나요?")
+BEAUTY_QUESTION_KEYWORDS = {
+    "스킨케어", "스킨케어 제품", "화장품", "뷰티", "소비하시나요", "얼마나"
+}
+BEAUTY_POSITIVE_KEYWORDS = {
+    "3만원 미만", "3만원 이상", "5만원 이상", "10만원 이상", "15만원 이상",
+    "만원", "미만", "이상"
+}
+BEAUTY_NEGATIVE_KEYWORDS = {
+    "0원", "소비하지 않", "사용하지 않음", "화장품을 사용하지 않음"
+}
+
+# 21. 패션 쇼핑 (실제 질문: "본인을 위해 소비하는 것 중 가장 기분 좋아지는 소비는 무엇인가요?")
+FASHION_QUESTION_KEYWORDS = {
+    "본인을 위해 소비", "기분 좋아지는 소비", "소비하는 것",
+    "패션", "쇼핑", "의류", "옷"
+}
+FASHION_POSITIVE_KEYWORDS = {
+    "옷/패션관련 제품 구매하기", "옷", "패션", "패션관련",
+    "캐주얼", "스포츠", "정장", "아웃도어", "스트리트",
+    "무신사", "에이블리", "지그재그", "브랜디"
+}
+FASHION_NEGATIVE_KEYWORDS = {
+    "옷을 거의 사지 않음", "패션 쇼핑 안함", "해당 없음"
+}
+
+# 22. 가전제품 관심
+HOME_APPLIANCE_QUESTION_KEYWORDS = {
+    "가전제품", "가전", "전자제품", "스마트 가전"
+}
+HOME_APPLIANCE_POSITIVE_KEYWORDS = {
+    "TV", "냉장고", "세탁기", "에어컨", "청소기", "공기청정기",
+    "로봇청소기", "식기세척기", "건조기", "인덕션"
+}
+HOME_APPLIANCE_NEGATIVE_KEYWORDS = {
+    "가전제품 관심 없음", "구매 계획 없음", "해당 없음"
+}
+
+# 23. 스마트 기기
+SMART_DEVICE_QUESTION_KEYWORDS = {
+    "스마트기기", "스마트폰", "태블릿", "웨어러블", "IoT"
+}
+SMART_DEVICE_POSITIVE_KEYWORDS = {
+    "아이폰", "갤럭시", "아이패드", "갤탭", "애플워치",
+    "스마트워치", "무선이어폰", "에어팟", "버즈"
+}
+SMART_DEVICE_NEGATIVE_KEYWORDS = {
+    "스마트기기 관심 없음", "사용 안함", "해당 없음"
+}
+
+# 24. 환경 보호
+ENVIRONMENT_QUESTION_KEYWORDS = {
+    "환경", "친환경", "환경보호", "지속가능", "에코"
+}
+ENVIRONMENT_POSITIVE_KEYWORDS = {
+    "분리수거", "재활용", "텀블러", "에코백", "비건", "채식",
+    "대중교통", "전기차", "친환경 제품", "관심있음"
+}
+ENVIRONMENT_NEGATIVE_KEYWORDS = {
+    "환경에 관심 없음", "실천 안함", "해당 없음"
+}
+
+# 25. 기부/봉사
+CHARITY_QUESTION_KEYWORDS = {
+    "기부", "봉사", "자선", "나눔", "기부 활동", "봉사 활동"
+}
+CHARITY_POSITIVE_KEYWORDS = {
+    "정기 기부", "일시 기부", "봉사 활동", "자원봉사",
+    "한달에", "1년에", "가끔", "정기적"
+}
+CHARITY_NEGATIVE_KEYWORDS = {
+    "기부하지 않음", "봉사 안함", "해당 없음"
+}
+
+# 26. 자동차 관련
+CAR_INTEREST_QUESTION_KEYWORDS = {
+    "자동차", "차량", "자동차 관심", "차", "카"
+}
+CAR_INTEREST_POSITIVE_KEYWORDS = {
+    "세단", "SUV", "전기차", "수입차", "국산차",
+    "현대", "기아", "제네시스", "BMW", "벤츠", "테슬라",
+    "관심있음", "구매 계획"
+}
+CAR_INTEREST_NEGATIVE_KEYWORDS = {
+    "자동차 관심 없음", "구매 계획 없음", "해당 없음"
+}
+
+# 27. 주거 형태
+HOUSING_QUESTION_KEYWORDS = {
+    "주거", "주택", "거주", "주거 형태", "집"
+}
+HOUSING_POSITIVE_KEYWORDS = {
+    "아파트", "빌라", "오피스텔", "단독주택", "다세대",
+    "자가", "전세", "월세", "보증금"
+}
+HOUSING_NEGATIVE_KEYWORDS = {
+    "해당 없음"
+}
+
+# 28. 보험 가입
+INSURANCE_QUESTION_KEYWORDS = {
+    "보험", "보험 가입", "보장", "보험 상품"
+}
+INSURANCE_POSITIVE_KEYWORDS = {
+    "생명보험", "건강보험", "실손보험", "암보험", "연금보험",
+    "자동차보험", "여행자보험", "가입함", "가입 중"
+}
+INSURANCE_NEGATIVE_KEYWORDS = {
+    "보험 가입 안함", "보험 없음", "해당 없음"
+}
+
+# 29. 신용카드 이용
+CREDIT_CARD_QUESTION_KEYWORDS = {
+    "신용카드", "카드", "결제 수단", "카드 이용"
+}
+CREDIT_CARD_POSITIVE_KEYWORDS = {
+    "신용카드", "체크카드", "삼성카드", "현대카드", "신한카드",
+    "KB카드", "하나카드", "롯데카드", "자주 사용", "주 결제"
+}
+CREDIT_CARD_NEGATIVE_KEYWORDS = {
+    "카드를 사용하지 않음", "현금만 사용", "해당 없음"
+}
+
+# 30. 대중교통 이용
+PUBLIC_TRANSPORT_QUESTION_KEYWORDS = {
+    "대중교통", "지하철", "버스", "교통수단", "통근"
+}
+PUBLIC_TRANSPORT_POSITIVE_KEYWORDS = {
+    "지하철", "버스", "전철", "기차", "택시",
+    "하루에", "매일", "자주", "주로 이용"
+}
+PUBLIC_TRANSPORT_NEGATIVE_KEYWORDS = {
+    "대중교통을 이용하지 않음", "자차 이용", "도보"
+}
+
+# 31. 택배/배송 이용
+PARCEL_DELIVERY_QUESTION_KEYWORDS = {
+    "택배", "배송", "온라인 쇼핑", "인터넷 쇼핑"
+}
+PARCEL_DELIVERY_POSITIVE_KEYWORDS = {
+    "쿠팡", "11번가", "지마켓", "옥션", "네이버쇼핑", "알리",
+    "일주일에", "한달에", "자주", "자주 이용"
+}
+PARCEL_DELIVERY_NEGATIVE_KEYWORDS = {
+    "온라인 쇼핑을 하지 않음", "택배 안 시킴", "해당 없음"
+}
+
+# 32. 외식 빈도 (실제 질문: "여러분은 외부 식당에서 혼자 식사하는 빈도는 어느 정도인가요?")
+DINING_OUT_QUESTION_KEYWORDS = {
+    "외부 식당", "외식", "식사", "혼자 식사", "빈도"
+}
+DINING_OUT_POSITIVE_KEYWORDS = {
+    "월 1~2회 정도", "주 1회 정도", "주 2~3회 정도", "거의 매일",
+    "월", "주", "회 정도", "매일"
+}
+DINING_OUT_NEGATIVE_KEYWORDS = {
+    "거의 하지 않거나 한 번도 해본 적 없다", "거의 하지 않", "한 번도 해본 적 없",
+    "외식하지 않음", "거의 안함"
+}
+
+# 33. 술자리 빈도
+DRINKING_GATHERING_QUESTION_KEYWORDS = {
+    "술자리", "음주", "회식", "술", "음주 빈도"
+}
+DRINKING_GATHERING_POSITIVE_KEYWORDS = {
+    "일주일에", "한달에", "자주", "가끔", "회 이상"
+}
+DRINKING_GATHERING_NEGATIVE_KEYWORDS = {
+    "술자리 없음", "술 안 마심", "참석 안함"
+}
+
+# 34. 야근 빈도
+OVERTIME_QUESTION_KEYWORDS = {
+    "야근", "초과 근무", "연장 근무", "야근 빈도"
+}
+OVERTIME_POSITIVE_KEYWORDS = {
+    "일주일에", "한달에", "자주", "매일", "가끔"
+}
+OVERTIME_NEGATIVE_KEYWORDS = {
+    "야근 없음", "야근 안함", "해당 없음"
+}
+
+# 35. 재택근무
+REMOTE_WORK_QUESTION_KEYWORDS = {
+    "재택근무", "원격근무", "재택", "WFH", "홈오피스"
+}
+REMOTE_WORK_POSITIVE_KEYWORDS = {
+    "전체 재택", "부분 재택", "하이브리드", "주 1회", "주 2회",
+    "일주일에", "자주", "가능"
+}
+REMOTE_WORK_NEGATIVE_KEYWORDS = {
+    "재택근무 없음", "전체 출근", "불가능"
+}
+
+# ⭐ 범용 Behavioral 키워드 매핑 (확장 가능)
+BEHAVIORAL_KEYWORD_MAP = {
+    'smoker': {
+        'question_keywords': SMOKER_QUESTION_KEYWORDS,
+        'positive_keywords': SMOKER_POSITIVE_KEYWORDS,
+        'negative_keywords': SMOKER_NEGATIVE_KEYWORDS
+    },
+    'has_vehicle': {
+        'question_keywords': VEHICLE_QUESTION_KEYWORDS,
+        'positive_keywords': BEHAVIOR_YES_TOKENS,
+        'negative_keywords': BEHAVIOR_NO_TOKENS
+    },
+    'drinker': {
+        'question_keywords': ALCOHOL_QUESTION_KEYWORDS,
+        'positive_keywords': DRINKER_POSITIVE_KEYWORDS,
+        'negative_keywords': NON_DRINKER_KEYWORDS
+    },
+    'ott_user': {
+        'question_keywords': OTT_QUESTION_KEYWORDS,
+        'positive_keywords': OTT_POSITIVE_KEYWORDS,
+        'negative_keywords': OTT_NEGATIVE_KEYWORDS
+    },
+    'has_pet': {
+        'question_keywords': PET_QUESTION_KEYWORDS,
+        'positive_keywords': PET_POSITIVE_KEYWORDS,
+        'negative_keywords': PET_NEGATIVE_KEYWORDS
+    },
+    'ai_user': {
+        'question_keywords': AI_QUESTION_KEYWORDS,
+        'positive_keywords': AI_POSITIVE_KEYWORDS,
+        'negative_keywords': AI_NEGATIVE_KEYWORDS
+    },
+    'exercises': {
+        'question_keywords': EXERCISE_QUESTION_KEYWORDS,
+        'positive_keywords': EXERCISE_POSITIVE_KEYWORDS,
+        'negative_keywords': EXERCISE_NEGATIVE_KEYWORDS
+    },
+    'uses_fast_delivery': {
+        'question_keywords': FAST_DELIVERY_QUESTION_KEYWORDS,
+        'positive_keywords': FAST_DELIVERY_POSITIVE_KEYWORDS,
+        'negative_keywords': FAST_DELIVERY_NEGATIVE_KEYWORDS
+    },
+    'visits_traditional_market': {
+        'question_keywords': TRADITIONAL_MARKET_QUESTION_KEYWORDS,
+        'positive_keywords': TRADITIONAL_MARKET_POSITIVE_KEYWORDS,
+        'negative_keywords': TRADITIONAL_MARKET_NEGATIVE_KEYWORDS
+    },
+    'has_stress': {
+        'question_keywords': STRESS_QUESTION_KEYWORDS,
+        'positive_keywords': STRESS_POSITIVE_KEYWORDS,
+        'negative_keywords': STRESS_NEGATIVE_KEYWORDS
+    },
+    'travels': {
+        'question_keywords': TRAVEL_QUESTION_KEYWORDS,
+        'positive_keywords': TRAVEL_POSITIVE_KEYWORDS,
+        'negative_keywords': TRAVEL_NEGATIVE_KEYWORDS
+    },
+    'uses_food_delivery': {
+        'question_keywords': FOOD_DELIVERY_QUESTION_KEYWORDS,
+        'positive_keywords': FOOD_DELIVERY_POSITIVE_KEYWORDS,
+        'negative_keywords': FOOD_DELIVERY_NEGATIVE_KEYWORDS
+    },
+    'drinks_coffee': {
+        'question_keywords': COFFEE_QUESTION_KEYWORDS,
+        'positive_keywords': COFFEE_POSITIVE_KEYWORDS,
+        'negative_keywords': COFFEE_NEGATIVE_KEYWORDS
+    },
+    'has_subscription': {
+        'question_keywords': SUBSCRIPTION_QUESTION_KEYWORDS,
+        'positive_keywords': SUBSCRIPTION_POSITIVE_KEYWORDS,
+        'negative_keywords': SUBSCRIPTION_NEGATIVE_KEYWORDS
+    },
+    'uses_social_media': {
+        'question_keywords': SOCIAL_MEDIA_QUESTION_KEYWORDS,
+        'positive_keywords': SOCIAL_MEDIA_POSITIVE_KEYWORDS,
+        'negative_keywords': SOCIAL_MEDIA_NEGATIVE_KEYWORDS
+    },
+    'plays_games': {
+        'question_keywords': GAMING_QUESTION_KEYWORDS,
+        'positive_keywords': GAMING_POSITIVE_KEYWORDS,
+        'negative_keywords': GAMING_NEGATIVE_KEYWORDS
+    },
+    'reads_books': {
+        'question_keywords': READING_QUESTION_KEYWORDS,
+        'positive_keywords': READING_POSITIVE_KEYWORDS,
+        'negative_keywords': READING_NEGATIVE_KEYWORDS
+    },
+    'watches_movies_dramas': {
+        'question_keywords': MOVIE_DRAMA_QUESTION_KEYWORDS,
+        'positive_keywords': MOVIE_DRAMA_POSITIVE_KEYWORDS,
+        'negative_keywords': MOVIE_DRAMA_NEGATIVE_KEYWORDS
+    },
+    'streams_music': {
+        'question_keywords': MUSIC_STREAMING_QUESTION_KEYWORDS,
+        'positive_keywords': MUSIC_STREAMING_POSITIVE_KEYWORDS,
+        'negative_keywords': MUSIC_STREAMING_NEGATIVE_KEYWORDS
+    },
+    'takes_online_courses': {
+        'question_keywords': ONLINE_EDUCATION_QUESTION_KEYWORDS,
+        'positive_keywords': ONLINE_EDUCATION_POSITIVE_KEYWORDS,
+        'negative_keywords': ONLINE_EDUCATION_NEGATIVE_KEYWORDS
+    },
+    'uses_financial_services': {
+        'question_keywords': FINANCIAL_SERVICE_QUESTION_KEYWORDS,
+        'positive_keywords': FINANCIAL_SERVICE_POSITIVE_KEYWORDS,
+        'negative_keywords': FINANCIAL_SERVICE_NEGATIVE_KEYWORDS
+    },
+    'gets_health_checkups': {
+        'question_keywords': HEALTH_CHECKUP_QUESTION_KEYWORDS,
+        'positive_keywords': HEALTH_CHECKUP_POSITIVE_KEYWORDS,
+        'negative_keywords': HEALTH_CHECKUP_NEGATIVE_KEYWORDS
+    },
+    'uses_beauty_products': {
+        'question_keywords': BEAUTY_QUESTION_KEYWORDS,
+        'positive_keywords': BEAUTY_POSITIVE_KEYWORDS,
+        'negative_keywords': BEAUTY_NEGATIVE_KEYWORDS
+    },
+    'shops_fashion': {
+        'question_keywords': FASHION_QUESTION_KEYWORDS,
+        'positive_keywords': FASHION_POSITIVE_KEYWORDS,
+        'negative_keywords': FASHION_NEGATIVE_KEYWORDS
+    },
+    'interested_in_home_appliances': {
+        'question_keywords': HOME_APPLIANCE_QUESTION_KEYWORDS,
+        'positive_keywords': HOME_APPLIANCE_POSITIVE_KEYWORDS,
+        'negative_keywords': HOME_APPLIANCE_NEGATIVE_KEYWORDS
+    },
+    'uses_smart_devices': {
+        'question_keywords': SMART_DEVICE_QUESTION_KEYWORDS,
+        'positive_keywords': SMART_DEVICE_POSITIVE_KEYWORDS,
+        'negative_keywords': SMART_DEVICE_NEGATIVE_KEYWORDS
+    },
+    'cares_about_environment': {
+        'question_keywords': ENVIRONMENT_QUESTION_KEYWORDS,
+        'positive_keywords': ENVIRONMENT_POSITIVE_KEYWORDS,
+        'negative_keywords': ENVIRONMENT_NEGATIVE_KEYWORDS
+    },
+    'does_charity': {
+        'question_keywords': CHARITY_QUESTION_KEYWORDS,
+        'positive_keywords': CHARITY_POSITIVE_KEYWORDS,
+        'negative_keywords': CHARITY_NEGATIVE_KEYWORDS
+    },
+    'interested_in_cars': {
+        'question_keywords': CAR_INTEREST_QUESTION_KEYWORDS,
+        'positive_keywords': CAR_INTEREST_POSITIVE_KEYWORDS,
+        'negative_keywords': CAR_INTEREST_NEGATIVE_KEYWORDS
+    },
+    'housing_type': {
+        'question_keywords': HOUSING_QUESTION_KEYWORDS,
+        'positive_keywords': HOUSING_POSITIVE_KEYWORDS,
+        'negative_keywords': HOUSING_NEGATIVE_KEYWORDS
+    },
+    'has_insurance': {
+        'question_keywords': INSURANCE_QUESTION_KEYWORDS,
+        'positive_keywords': INSURANCE_POSITIVE_KEYWORDS,
+        'negative_keywords': INSURANCE_NEGATIVE_KEYWORDS
+    },
+    'uses_credit_card': {
+        'question_keywords': CREDIT_CARD_QUESTION_KEYWORDS,
+        'positive_keywords': CREDIT_CARD_POSITIVE_KEYWORDS,
+        'negative_keywords': CREDIT_CARD_NEGATIVE_KEYWORDS
+    },
+    'uses_public_transport': {
+        'question_keywords': PUBLIC_TRANSPORT_QUESTION_KEYWORDS,
+        'positive_keywords': PUBLIC_TRANSPORT_POSITIVE_KEYWORDS,
+        'negative_keywords': PUBLIC_TRANSPORT_NEGATIVE_KEYWORDS
+    },
+    'uses_parcel_delivery': {
+        'question_keywords': PARCEL_DELIVERY_QUESTION_KEYWORDS,
+        'positive_keywords': PARCEL_DELIVERY_POSITIVE_KEYWORDS,
+        'negative_keywords': PARCEL_DELIVERY_NEGATIVE_KEYWORDS
+    },
+    'dines_out': {
+        'question_keywords': DINING_OUT_QUESTION_KEYWORDS,
+        'positive_keywords': DINING_OUT_POSITIVE_KEYWORDS,
+        'negative_keywords': DINING_OUT_NEGATIVE_KEYWORDS
+    },
+    'attends_drinking_gatherings': {
+        'question_keywords': DRINKING_GATHERING_QUESTION_KEYWORDS,
+        'positive_keywords': DRINKING_GATHERING_POSITIVE_KEYWORDS,
+        'negative_keywords': DRINKING_GATHERING_NEGATIVE_KEYWORDS
+    },
+    'works_overtime': {
+        'question_keywords': OVERTIME_QUESTION_KEYWORDS,
+        'positive_keywords': OVERTIME_POSITIVE_KEYWORDS,
+        'negative_keywords': OVERTIME_NEGATIVE_KEYWORDS
+    },
+    'works_remotely': {
+        'question_keywords': REMOTE_WORK_QUESTION_KEYWORDS,
+        'positive_keywords': REMOTE_WORK_POSITIVE_KEYWORDS,
+        'negative_keywords': REMOTE_WORK_NEGATIVE_KEYWORDS
+    }
+}
+
+
+def extract_behavior_from_qa_pairs(
+    qa_pairs: List[Dict[str, Any]],
+    behavior_key: str,
+    debug: bool = False
+) -> Optional[bool]:
+    """qa_pairs에서 특정 behavioral 조건을 추출 (범용)
+
+    Args:
+        qa_pairs: QA 쌍 리스트
+        behavior_key: behavioral 조건 키 (예: 'ott_user', 'smoker')
+        debug: 디버깅 로그 출력 여부
+
+    Returns:
+        True: 긍정 (예: OTT 이용함)
+        False: 부정 (예: OTT 이용 안함)
+        None: 정보 없음
+    """
+    keyword_config = BEHAVIORAL_KEYWORD_MAP.get(behavior_key)
+    if not keyword_config:
+        if debug:
+            logger.warning(f"[Behavioral] {behavior_key}는 BEHAVIORAL_KEYWORD_MAP에 없음")
+        return None
+
+    question_keywords = keyword_config['question_keywords']
+    positive_keywords = keyword_config['positive_keywords']
+    negative_keywords = keyword_config['negative_keywords']
+
+    # ⭐ OTT 특수 처리: 답변 중심 매칭 (질문 관계없이)
+    # "동영상 스트리밍 앱"처럼 명확한 답변이 있으면 바로 True 반환
+    if behavior_key == 'ott_user':
+        ANSWER_ONLY_POSITIVE = {"동영상 스트리밍 앱", "동영상스트리밍앱"}
+        ANSWER_ONLY_NEGATIVE = {"이용하지 않는다", "이용하지않는다"}
+
+        for qa in qa_pairs:
+            if not isinstance(qa, dict):
+                continue
+
+            answer = qa.get("answer") or qa.get("answer_text")
+            if not answer:
+                continue
+
+            answer_text = str(answer).lower()
+            answer_compact = answer_text.replace(" ", "")
+
+            # 부정 답변 우선 체크
+            for neg_kw in ANSWER_ONLY_NEGATIVE:
+                if neg_kw.replace(" ", "").lower() in answer_compact:
+                    if debug:
+                        logger.warning(f"[Behavioral] {behavior_key} = False (답변 키워드 '{neg_kw}' 발견)")
+                    return False
+
+            # 긍정 답변 체크
+            for pos_kw in ANSWER_ONLY_POSITIVE:
+                if pos_kw.replace(" ", "").lower() in answer_compact:
+                    if debug:
+                        logger.warning(f"[Behavioral] {behavior_key} = True (답변 키워드 '{pos_kw}' 발견)")
+                    return True
+
+    # ⭐ 기존 로직: 질문 키워드 매칭 → 답변 확인
+    matched_questions = []
+    for qa in qa_pairs:
+        if not isinstance(qa, dict):
+            continue
+
+        q_text = str(qa.get("q_text", "")).lower()
+
+        # 질문에 관련 키워드가 있는지 확인
+        matched_kw = None
+        for kw in question_keywords:
+            if kw.lower() in q_text:
+                matched_kw = kw
+                break
+
+        if not matched_kw:
+            continue
+
+        matched_questions.append(q_text)
+
+        # 답변 가져오기
+        answer = qa.get("answer") or qa.get("answer_text")
+        if not answer:
+            if debug:
+                logger.warning(f"[Behavioral] {behavior_key} 질문 발견했으나 답변 없음: q={q_text}")
+            continue
+
+        answer_text = str(answer).lower()
+        answer_compact = answer_text.replace(" ", "")
+
+        if debug:
+            logger.warning(f"[Behavioral] {behavior_key} 검사중: q={q_text[:30]}, a={answer_text[:50]}")
+
+        # 부정 키워드 체크 (우선순위 높음)
+        for neg_kw in negative_keywords:
+            neg_kw_lower = str(neg_kw).lower()
+            neg_kw_compact = neg_kw_lower.replace(" ", "")
+            if neg_kw_lower in answer_text or neg_kw_compact in answer_compact:
+                if debug:
+                    logger.warning(f"[Behavioral] {behavior_key} = False (부정 키워드 '{neg_kw}' 발견)")
+                return False
+
+        # 긍정 키워드 체크
+        for pos_kw in positive_keywords:
+            pos_kw_lower = str(pos_kw).lower()
+            pos_kw_compact = pos_kw_lower.replace(" ", "")
+            if pos_kw_lower in answer_text or pos_kw_compact in answer_compact:
+                if debug:
+                    logger.warning(f"[Behavioral] {behavior_key} = True (긍정 키워드 '{pos_kw}' 발견)")
+                return True
+
+    if debug and matched_questions:
+        logger.warning(f"[Behavioral] {behavior_key} 관련 질문 {len(matched_questions)}개 발견했으나 매칭 실패")
+
+    return None
 
 
 def extract_behavioral_conditions_from_query(query: str) -> Dict[str, bool]:
@@ -1830,6 +2607,19 @@ async def search_natural_language(
         # 1) 추출: filters + size
         extractor = DemographicExtractor()
         extracted_entities, requested_size = extractor.extract_with_size(request.query)
+
+        # ⭐ Claude의 demographics를 extracted_entities에 병합
+        if hasattr(analysis, 'demographic_entities') and analysis.demographic_entities:
+            logger.warning(f"[MERGE] Claude demographics: {len(analysis.demographic_entities)}개")
+            logger.warning(f"[MERGE] DemographicExtractor demographics: {len(extracted_entities.demographics)}개")
+
+            # Claude의 demographics를 우선 사용 (더 정확함)
+            extracted_entities.demographics = list(analysis.demographic_entities)
+
+            logger.warning(f"[MERGE] 병합 후: {len(extracted_entities.demographics)}개")
+            for demo in extracted_entities.demographics:
+                logger.warning(f"  - {demo.demographic_type.value}: {demo.value}")
+
         filters: List[Dict[str, Any]] = []
 
         # Demographics 필터
@@ -1967,11 +2757,12 @@ async def search_natural_language(
 
         logger.info("🔍 필터 상태 체크:")
         logger.info(f"  - age_gender_filters: {len(age_gender_filters)}개")
-        logger.info(f"  - occupation_filters: {len(occupation_filters)}개")
-        logger.info(f"  - other_filters: {len(other_filters)}개")
-        logger.info(f"  - filters_os (합계): {len(filters_os)}개")
+        logger.debug(f"  - occupation_filters: {len(occupation_filters)}개")
+        logger.debug(f"  - other_filters: {len(other_filters)}개")
+        logger.debug(f"  - filters_os (합계): {len(filters_os)}개")
         if occupation_filters:
-            logger.info(f"  - occupation_filters 샘플: {json.dumps(occupation_filters[0] if occupation_filters else {}, ensure_ascii=False)[:500]}")
+            masked_occ_filter = _mask_user_ids_in_query(occupation_filters[0] if occupation_filters else {})
+            logger.debug(f"  - occupation_filters 샘플: {json.dumps(masked_occ_filter, ensure_ascii=False)[:500]}")
 
         two_phase_applicable = bool(age_gender_filters and occupation_filters)
         two_phase_response: Optional[SearchResponse] = None
@@ -2044,9 +2835,10 @@ async def search_natural_language(
             size=size,
         )
 
-        # 🔍 Base Query 로깅
-        logger.info(f"🔍 [BASE QUERY] 생성 완료")
-        logger.info(json.dumps(base_query, ensure_ascii=False, indent=2))
+        # 🔍 Base Query 로깅 (user_id 마스킹) - DEBUG 레벨로 변경
+        logger.debug(f"🔍 [BASE QUERY] 생성 완료")
+        masked_base_query = _mask_user_ids_in_query(base_query)
+        logger.debug(json.dumps(masked_base_query, ensure_ascii=False, indent=2))
 
         # 3) 필터 적용 전략: 필터는 must로, 키워드는 should로 완화
         # - 필터(30대, 사무직)는 반드시 매칭되어야 함
@@ -2256,45 +3048,38 @@ async def search_natural_language(
                         }
                     })
             
-            # ⭐ 기존 쿼리와 필터 결합 (must로 결합: 모든 필터를 만족해야 함)
-            # survey_responses_merged: 모든 인구통계 정보 포함
-            # 각 인덱스에서 정보를 가져와야 하므로 must로 결합
+            # ⭐⭐⭐ 필터를 OpenSearch 쿼리에서 제거 (Python post-processing으로 이동)
+            # 이유: 비구조화된 설문 데이터는 벡터 검색으로만 찾을 수 있음
+            # Demographics/Behavioral 필터는 RRF 후 Python에서 적용 (3506-3518번 줄)
+            logger.info(f"✅ Demographics 필터를 Python post-processing으로 이동 ({len(should_filters)}개 필터)")
+            logger.info(f"   → OpenSearch는 키워드 검색만 수행, Qdrant는 벡터 검색 수행")
+            logger.info(f"   → RRF 후 Python에서 필터 적용하여 정확도 유지")
+
+            # 키워드 쿼리만 사용 (필터 제거)
             if existing_query is None or existing_query == {"match_all": {}} or existing_query == {"match_none": {}}:
-                # 키워드 쿼리가 없거나 match_all/match_none인 경우: 필터를 must로 사용
-                final_query['query'] = {
-                    'bool': {
-                        'must': should_filters  # 모든 필터를 만족해야 함
-                    }
-                }
-                logger.info(f"✅ 필터를 must로 적용 (모든 필터 만족 필요): {len(should_filters)}개 필터")
-            elif isinstance(existing_query, dict) and existing_query.get('bool'):
-                # 기존 bool 쿼리에 필터를 must로 추가
-                if 'must' not in existing_query['bool']:
-                    existing_query['bool']['must'] = []
-                existing_query['bool']['must'].extend(should_filters)
-                final_query['query'] = existing_query
-                logger.info(f"✅ 필터를 must로 추가 (모든 필터 만족 필요): {len(should_filters)}개 필터")
+                # 키워드가 없으면 match_all
+                final_query['query'] = {"match_all": {}}
+                logger.info(f"   → 키워드 없음: match_all 사용")
             else:
-                # 기존 쿼리를 bool로 감싸기 (must로 결합)
-                final_query['query'] = {
-                    'bool': {
-                        'must': [existing_query] + should_filters
-                    }
-                }
-                logger.info(f"✅ 필터를 must로 추가 (모든 필터 만족 필요): {len(should_filters)}개 필터")
+                # 키워드 쿼리만 사용
+                final_query['query'] = existing_query
+                logger.info(f"   → 키워드 쿼리만 적용")
         
         if 'size' not in final_query:
             final_query['size'] = size
 
         if filters_os:
-            logger.info(f"🔍 적용된 필터 ({len(filters_os)}개):")
+            logger.debug(f"🔍 적용된 필터 ({len(filters_os)}개):")
             for i, f in enumerate(filters_os, 1):
-                logger.info(f"  필터 {i}: {json.dumps(f, ensure_ascii=False, indent=2)}")
-            logger.info(f"🔍 최종 쿼리 구조:")
-            logger.info(f"  {json.dumps(final_query, ensure_ascii=False, indent=2)}")
+                masked_filter = _mask_user_ids_in_query(f)
+                logger.debug(f"  필터 {i}: {json.dumps(masked_filter, ensure_ascii=False, indent=2)}")
+            logger.debug(f"🔍 최종 쿼리 구조:")
+            masked_final_query = _mask_user_ids_in_query(final_query)
+            logger.debug(f"  {json.dumps(masked_final_query, ensure_ascii=False, indent=2)}")
         else:
-            logger.info(f"🔍 최종 쿼리 구조 (필터 없음):")
-            logger.info(f"  {json.dumps(final_query, ensure_ascii=False, indent=2)}")
+            logger.debug(f"🔍 최종 쿼리 구조 (필터 없음):")
+            masked_final_query = _mask_user_ids_in_query(final_query)
+            logger.debug(f"  {json.dumps(masked_final_query, ensure_ascii=False, indent=2)}")
 
         # ⭐ Qdrant top-N 제한: 필터 유무에 따라 분기
         has_filters = bool(filters_os or occupation_filters)
@@ -2304,19 +3089,17 @@ async def search_natural_language(
         threshold_reason: str = ""
         has_behavioral = bool(getattr(analysis, "behavioral_conditions", None))
 
-        # ⭐ 검색 크기 설정: behavioral 필터가 있으면 더 많은 결과 필요
-        # ⭐ 최소값을 10으로 설정 (테스트/디버깅용)
+        # ⭐⭐⭐ 검색 크기 증가: Python post-filtering을 위해 충분한 후보 확보
+        # Demographics/Behavioral 필터를 OpenSearch 쿼리에서 제거했으므로 더 많은 후보 필요
         if has_filters or has_behavioral:
-            if has_behavioral:
-                qdrant_limit = min(max(size * 5, 500), 5000)
-                search_size = min(max(size * 10, 10), 10000)  # 최소값 1000 → 10
-            else:
-                qdrant_limit = min(max(size * 3, 300), 5000)
-                search_size = min(max(size * 5, 10), 10000)  # 최소값 500 → 10
-            logger.info(f"🔍 필터 적용: OpenSearch size={search_size}, Qdrant limit={qdrant_limit} (behavioral={has_behavioral})")
+            # Behavioral/Demographics 필터가 있으면 더 많은 후보 필요
+            qdrant_limit = min(max(size * 10, 1000), 5000)   # 기본 1000개
+            search_size = min(max(size * 20, 1000), 10000)   # 기본 1000개
+            logger.info(f"🔍 필터 있음 (Python post-processing): OpenSearch size={search_size}, Qdrant limit={qdrant_limit}")
         else:
-            qdrant_limit = min(max(size, 60), 5000)
-            search_size = min(max(size * 2, 10), 10000)  # 최소값 80 → 10
+            # 필터가 없어도 벡터 검색을 위해 충분한 후보 확보
+            qdrant_limit = min(max(size * 5, 500), 5000)     # 기본 500개
+            search_size = min(max(size * 10, 500), 10000)    # 기본 500개
             logger.info(f"🔍 필터 없음: OpenSearch size={search_size}, Qdrant limit={qdrant_limit}")
 
         # 4) 실행: 하이브리드 (OpenSearch + 선택적 Qdrant) with RRF
@@ -2343,9 +3126,10 @@ async def search_natural_language(
                 logger.warning("  ⚠️ 쿼리가 비어 있어 match_all로 대체합니다")
                 query_body['query'] = {"match_all": {}}
 
-            # 🔍 OpenSearch 쿼리 로깅 (디버깅용)
-            logger.info(f"🔍 OpenSearch 쿼리:")
-            logger.info(json.dumps(query_body, ensure_ascii=False, indent=2))
+            # 🔍 OpenSearch 쿼리 로깅 (디버깅용) - DEBUG 레벨로 축소, user_id 마스킹
+            logger.debug(f"🔍 OpenSearch 쿼리:")
+            masked_query_body = _mask_user_ids_in_query(query_body)
+            logger.debug(json.dumps(masked_query_body, ensure_ascii=False, indent=2))
 
             os_response = data_fetcher.search_opensearch(
                 index_name=request.index_name,
@@ -2357,12 +3141,13 @@ async def search_natural_language(
             keyword_results = os_response['hits']['hits']
             logger.info(f"  ✅ OpenSearch: {len(keyword_results)}건")
             
-            # Qdrant 벡터 검색
+            # ⭐⭐⭐ Qdrant 벡터 검색 (survey_responses_merged 통합 컬렉션)
             if request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
                 qdrant_client = router.qdrant_client
                 try:
-                    # survey_responses_merged 컬렉션만 검색
+                    # ⭐ survey_responses_merged 통합 컬렉션 사용
                     collection_name = request.index_name  # survey_responses_merged
+                    logger.info(f"  🔍 Qdrant 컬렉션: {collection_name} (통합 컬렉션)")
                     try:
                         r = qdrant_client.search(
                             collection_name=collection_name,
@@ -2377,35 +3162,93 @@ async def search_natural_language(
                                 '_source': item.payload,
                                 '_index': collection_name,
                             })
-                        logger.info(f"  ✅ Qdrant: {len(vector_results)}건")
+                        logger.info(f"  ✅ Qdrant ({collection_name}): {len(vector_results)}건")
                     except Exception as e:
-                        logger.debug(f"  ⚠️ Qdrant 컬렉션 '{collection_name}' 검색 실패: {e}")
+                        logger.warning(f"  ⚠️ Qdrant 컬렉션 '{collection_name}' 검색 실패: {e}")
                 except Exception as e:
-                    logger.debug(f"  ⚠️ Qdrant 검색 실패: {e}")
+                    logger.warning(f"  ⚠️ Qdrant 검색 실패: {e}")
         except Exception as e:
             logger.warning(f"  ⚠️ 인덱스 검색 실패: {e}")
         
         # user_id 및 _id -> 원본 문서 매핑 생성
         user_doc_map = {}
         id_doc_map = {}
-        
-        # 검색 결과 매핑
+
+        # ⭐ OpenSearch 키워드 결과 매핑
         for hit in keyword_results:
             source = hit.get('_source', {})
             user_id = source.get('user_id')
             doc_id = hit.get('_id')
-            
+
             doc_info = {
                 'source': source,
                 'inner_hits': hit.get('inner_hits', {}),
                 'highlight': hit.get('highlight'),
                 'index': hit.get('_index', 'unknown')
             }
-            
+
             if user_id:
                 user_doc_map[user_id] = doc_info
             if doc_id:
                 id_doc_map[doc_id] = doc_info
+
+        # ⭐⭐⭐ Qdrant 벡터 결과에서 user_id 수집 및 metadata 보강
+        # Qdrant payload에는 metadata가 없으므로 OpenSearch에서 전체 문서 조회 필요
+        if vector_results:
+            qdrant_user_ids = set()
+            for doc in vector_results:
+                payload = doc.get('_source', {})
+                user_id = payload.get('user_id')
+                if user_id and user_id not in user_doc_map:
+                    qdrant_user_ids.add(user_id)
+
+            if qdrant_user_ids:
+                logger.info(f"  🔍 Qdrant 결과 중 metadata 없는 user_id: {len(qdrant_user_ids)}개")
+                logger.info(f"     → OpenSearch에서 전체 문서 조회 중...")
+
+                try:
+                    # OpenSearch에서 user_id로 전체 문서 조회
+                    # user_id는 keyword 타입이므로 terms 쿼리 사용
+                    user_id_list = list(qdrant_user_ids)
+                    bulk_query = {
+                        "query": {
+                            "terms": {
+                                "user_id": user_id_list
+                            }
+                        },
+                        "size": len(qdrant_user_ids),
+                        "_source": ["user_id", "metadata", "qa_pairs", "timestamp"]
+                    }
+
+                    # 🔍 Bulk 쿼리 로깅 (user_id 리스트 마스킹)
+                    logger.debug(f"     Bulk query: terms user_id (count={len(user_id_list)})")
+
+                    bulk_response = data_fetcher.search_opensearch(
+                        index_name=request.index_name,
+                        query=bulk_query,
+                        size=len(qdrant_user_ids),
+                        source_filter=None,
+                        request_timeout=DEFAULT_OS_TIMEOUT,
+                    )
+
+                    fetched_count = 0
+                    for hit in bulk_response['hits']['hits']:
+                        source = hit.get('_source', {})
+                        user_id = source.get('user_id')
+                        if user_id:
+                            doc_info = {
+                                'source': source,
+                                'inner_hits': {},
+                                'highlight': None,
+                                'index': hit.get('_index', 'unknown')
+                            }
+                            user_doc_map[user_id] = doc_info
+                            fetched_count += 1
+
+                    logger.info(f"     ✅ {fetched_count}개 user 문서 조회 완료 (metadata 포함)")
+                except Exception as e:
+                    logger.warning(f"     ⚠️ Bulk 조회 실패: {e}")
+                    logger.warning(f"     → Qdrant 결과 중 일부는 metadata 없이 필터링됨")
 
         # ⭐ RRF 결합
         logger.info(f"\n{'='*60}")
@@ -2511,9 +3354,19 @@ async def search_natural_language(
                 logger.info(f"    {i}. doc_id={doc.get('_id', 'N/A')}, index={doc_index}, RRF={rrf_score:.6f}, "
                           f"keyword_rank={rrf_details.get('keyword_rank')}, vector_rank={rrf_details.get('vector_rank')}")
         
+        # ⭐ 디버깅: 루프 전 extracted_entities.demographics 확인
+        logger.warning(f"[EXTRACTED ENTITIES] demographics count: {len(extracted_entities.demographics)}")
+        for demo in extracted_entities.demographics:
+            logger.warning(f"  - {demo.demographic_type.value}: {demo.value}")
+
         demographic_filters: Dict[DemographicType, List["DemographicEntity"]] = defaultdict(list)
         for demo in extracted_entities.demographics:
             demographic_filters[demo.demographic_type].append(demo)
+
+        # ⭐ 디버깅: demographic_filters 내용 확인
+        logger.warning(f"[DEMO FILTERS] demographic_filters keys: {[k.value for k in demographic_filters.keys()]}")
+        for demo_type, demo_list in demographic_filters.items():
+            logger.warning(f"  [{demo_type.value}]: {[d.value for d in demo_list]}")
 
         filtered_rrf_results: List[Dict[str, Any]] = rrf_results
         total_hits = len(rrf_results)
@@ -2587,16 +3440,18 @@ async def search_natural_language(
             return normalized_expected
 
         def values_match(values: Set[str], expected: Set[str]) -> bool:
+            """값 매칭 검증 (정확한 매칭만 허용)"""
             if not values or not expected:
                 return False
+
+            # ⭐ 정확한 매칭만 허용 (부분 문자열 매칭 제거)
+            # "남성" in "여성" 같은 오매칭 방지
             for val in values:
                 if not val:
                     continue
-                for exp in expected:
-                    if not exp:
-                        continue
-                    if val == exp or val in exp or exp in val:
-                        return True
+                # 정규화된 값끼리 정확히 비교
+                if val in expected:
+                    return True
             return False
 
         def expand_gender_aliases(values: Set[str]) -> None:
@@ -2707,11 +3562,11 @@ async def search_natural_language(
                         DemographicType.AGE: False,
                         DemographicType.OCCUPATION: False,
                     }
-                    behavior_values: Dict[str, Optional[bool]] = {
-                        "smoker": None,
-                        "has_vehicle": None,
-                        "drinker": None,  # ⭐ 음주 여부 추가
-                    }
+                    # ⭐ 동적 behavior_values 생성 (Claude가 추출한 조건 기반)
+                    behavior_values: Dict[str, Optional[bool]] = {}
+                    if analysis.behavioral_conditions:
+                        for key in analysis.behavioral_conditions.keys():
+                            behavior_values[key] = None
 
                     def record_behavior(key: str, value: Optional[bool]) -> None:
                         if value is None:
@@ -2903,49 +3758,19 @@ async def search_natural_language(
                                         doc_values[DemographicType.GENDER].update(normalized_answers)
                                         metadata_presence[DemographicType.GENDER] = True
 
-                                if behavior_values.get("smoker") is None and q_text_raw and any(keyword in q_text_raw for keyword in SMOKER_QUESTION_KEYWORDS):
-                                    for ans in answers:
-                                        smoker_decision = parse_smoker_answer(ans)
-                                        if smoker_decision is not None:
-                                            record_behavior("smoker", smoker_decision)
-                                            if smoker_decision is False:
-                                                break
-                                    if behavior_values.get("smoker") is None:
-                                        for ans in normalized_answers:
-                                            smoker_decision = parse_smoker_answer(ans)
-                                            if smoker_decision is not None:
-                                                record_behavior("smoker", smoker_decision)
-                                                break
-
-                                if behavior_values.get("has_vehicle") is None and q_text_raw and any(keyword in q_text_raw for keyword in VEHICLE_QUESTION_KEYWORDS):
-                                    # 🔍 디버깅: 실제 차량 답변 로그
-                                    normalized_answers_sample = list(normalized_answers)[:3]
-
-                                    for ans in normalized_answers:
-                                        vehicle_decision = parse_yes_no(ans)
-
-                                        if vehicle_decision is not None:
-                                            record_behavior("has_vehicle", vehicle_decision)
-                                            break
-
-                                # ⭐ 음주 여부 추출
-                                if behavior_values.get("drinker") is None and q_text_raw and any(keyword in q_text_raw for keyword in ALCOHOL_QUESTION_KEYWORDS):
-                                    for ans in answers:
-                                        drinker_decision = parse_drinker_answer(ans)
-                                        if drinker_decision is not None:
-                                            record_behavior("drinker", drinker_decision)
-                                            if drinker_decision is False:
-                                                break
-                                    if behavior_values.get("drinker") is None:
-                                        for ans in normalized_answers:
-                                            drinker_decision = parse_drinker_answer(ans)
-                                            if drinker_decision is not None:
-                                                record_behavior("drinker", drinker_decision)
-                                                break
+                        # ⭐ 범용 behavioral 추출 (동적 - Claude가 요구한 조건만 추출)
+                        if analysis.behavioral_conditions:
+                            qa_pairs_list = source.get("qa_pairs", []) or []
+                            for behavior_key in behavior_values.keys():
+                                if behavior_values.get(behavior_key) is None:
+                                    extracted_value = extract_behavior_from_qa_pairs(qa_pairs_list, behavior_key, debug=False)
+                                    if extracted_value is not None:
+                                        behavior_values[behavior_key] = extracted_value
 
                     return doc_values, metadata_presence, behavior_values
 
                 filtered_list = []
+                debug_counter = 0  # ⭐ 디버깅 카운터
                 source_not_found_count = 0
                 gender_filter_failed = 0
                 age_filter_failed = 0
@@ -2962,12 +3787,26 @@ async def search_natural_language(
                 behavior_filter_failed = 0
                 behavior_metadata_missing = 0
 
+                # ⭐ 디버깅: user_doc_map 커버리지 확인
+                user_doc_map_hit = 0
+                user_doc_map_miss = 0
+
                 for doc in rrf_results:
                     user_id = doc_user_map.get(id(doc))
                     if not user_id:
                         continue
 
-                    source = user_rrf_map.get(user_id, [{}])[0].get('_source', {})
+                    # ⭐⭐⭐ user_doc_map을 우선 사용 (OpenSearch에서 조회한 전체 문서, metadata 포함)
+                    # user_rrf_map은 RRF 결합된 문서로 Qdrant 결과는 metadata 없음
+                    doc_info = user_doc_map.get(user_id)
+                    if doc_info:
+                        source = doc_info.get('source', {})
+                        user_doc_map_hit += 1
+                    else:
+                        # Fallback: user_doc_map에 없으면 user_rrf_map 사용
+                        source = user_rrf_map.get(user_id, [{}])[0].get('_source', {})
+                        user_doc_map_miss += 1
+
                     if not isinstance(source, dict):
                         source = {}
 
@@ -2978,6 +3817,13 @@ async def search_natural_language(
                     doc_values, metadata_presence, behavior_values = collect_doc_values(user_id, source, metadata, {})
                     behavior_values_map[user_id] = dict(behavior_values)
 
+                    # ⭐ 디버깅: 처음 3개 문서의 behavioral 값 로깅
+                    if debug_counter < 3 and analysis.behavioral_conditions:
+                        logger.warning(f"[DEBUG #{debug_counter+1}] user_id={user_id}")
+                        logger.warning(f"  behavior_values={behavior_values}")
+                        logger.warning(f"  expected={analysis.behavioral_conditions}")
+                        debug_counter += 1
+
                     gender_pass = True
                     age_pass = True
                     occupation_pass = True
@@ -2987,6 +3833,12 @@ async def search_natural_language(
 
                     if DemographicType.GENDER in filters_to_validate:
                         expected = set()
+                        # ⭐ 디버깅: demographic_filters 확인
+                        if len(filtered_list) == 0:  # 첫 번째 문서 처리 시
+                            logger.warning(f"     [DEBUG] Gender filters count: {len(demographic_filters[DemographicType.GENDER])}")
+                            for idx, demo in enumerate(demographic_filters[DemographicType.GENDER]):
+                                logger.warning(f"       Filter #{idx + 1}: value={demo.value}, raw_value={demo.raw_value}")
+
                         for demo in demographic_filters[DemographicType.GENDER]:
                             expected.update(build_expected_values(demo))
 
@@ -3015,6 +3867,11 @@ async def search_natural_language(
                             expand_gender_aliases(doc_values[DemographicType.GENDER])
                             gender_pass = values_match(doc_values[DemographicType.GENDER], expected)
 
+                        # ⭐ 디버깅: 처음 3개 실패 케이스 로깅
+                        if not gender_pass and gender_filter_failed < 3:
+                            actual_values = gender_from_metadata if metadata_presence[DemographicType.GENDER] else doc_values[DemographicType.GENDER]
+                            logger.warning(f"     [성별 필터 실패 #{gender_filter_failed + 1}] user_id={user_id}, expected={expected}, actual={actual_values}, metadata={metadata.get('gender')}")
+
                         if not gender_pass:
                             gender_filter_failed += 1
 
@@ -3022,7 +3879,19 @@ async def search_natural_language(
                         expected = set()
                         for demo in demographic_filters[DemographicType.AGE]:
                             expected.update(build_expected_values(demo))
+
+                        # ⭐ 디버깅: 처음 3개 문서의 age 필터 검증 과정 로깅
+                        if debug_counter < 3:
+                            logger.warning(f"[AGE DEBUG #{debug_counter+1}] user_id={user_id}")
+                            logger.warning(f"  expected_ages={expected}")
+                            logger.warning(f"  actual_age={doc_values[DemographicType.AGE]}")
+                            logger.warning(f"  demographic_filters[AGE]={demographic_filters[DemographicType.AGE]}")
+
                         age_pass = values_match(doc_values[DemographicType.AGE], expected)
+
+                        if debug_counter < 3:
+                            logger.warning(f"  age_pass={age_pass}")
+
                         if not age_pass:
                             age_filter_failed += 1
 
@@ -3162,6 +4031,10 @@ async def search_natural_language(
                     behavior_pass = True
                     if analysis.behavioral_conditions:
                         for condition_key, expected_value in analysis.behavioral_conditions.items():
+                            # ⭐ expected_value=None은 "이 조건을 체크하지 않음"을 의미 → 스킵
+                            if expected_value is None:
+                                continue
+
                             actual_value = behavior_values.get(condition_key)
                             if actual_value is None:
                                 behavior_metadata_missing += 1
@@ -3173,7 +4046,15 @@ async def search_natural_language(
                                 break
 
                     # ⭐ 모든 demographic 필터 검증 (REGION, MARITAL_STATUS, SUB_REGION 포함)
-                    if gender_pass and age_pass and occupation_pass and region_pass and marital_status_pass and sub_region_pass and behavior_pass:
+                    all_pass = gender_pass and age_pass and occupation_pass and region_pass and marital_status_pass and sub_region_pass and behavior_pass
+
+                    # ⭐ 디버깅: 처음 5개 통과/실패 케이스 샘플
+                    if len(filtered_list) < 5 or (not all_pass and len(filtered_list) < 335):
+                        if len(filtered_list) < 3:  # 처음 3개 통과 케이스
+                            if all_pass:
+                                logger.info(f"     [필터 통과 #{len(filtered_list) + 1}] user_id={user_id}, gender={metadata.get('gender')}, age_group={metadata.get('age_group')}, gender_pass={gender_pass}, age_pass={age_pass}")
+
+                    if all_pass:
                         filtered_list.append(doc)
 
                 filter_duration_ms = (perf_counter() - filter_start) * 1000
@@ -3182,6 +4063,8 @@ async def search_natural_language(
                 total_hits = len(filtered_rrf_results)
 
                 logger.info(f"  - 소스 누락 문서: {source_not_found_count}건")
+                logger.info(f"  ⭐ user_doc_map 적중: {user_doc_map_hit}건 (metadata 있음)")
+                logger.info(f"  ⭐ user_doc_map 미스: {user_doc_map_miss}건 (metadata 없을 수 있음)")
                 if DemographicType.GENDER in filters_to_validate:
                     logger.info(f"  - 성별 metadata 없음: {gender_metadata_missing}건")
                     logger.info(f"  - 성별 필터 미충족: {gender_filter_failed}건")
@@ -3224,10 +4107,11 @@ async def search_natural_language(
                     DemographicType.AGE: False,
                     DemographicType.OCCUPATION: False,
                 }
-                behavior_values: Dict[str, Optional[bool]] = {
-                    "smoker": None,
-                    "has_vehicle": None,
-                }
+                # ⭐ 동적 behavior_values 생성 (Claude가 추출한 조건 기반)
+                behavior_values: Dict[str, Optional[bool]] = {}
+                if analysis.behavioral_conditions:
+                    for key in analysis.behavioral_conditions.keys():
+                        behavior_values[key] = None
 
                 def record_behavior(key: str, value: Optional[bool]) -> None:
                     if value is None:
@@ -3359,6 +4243,15 @@ async def search_natural_language(
                                 normalized_answer = normalize_value(answer_text)
                                 if normalized_answer:
                                     doc_values[DemographicType.OCCUPATION].add(normalized_answer)
+
+                # ⭐ 범용 behavioral 추출 (동적 - Claude가 요구한 조건만 추출)
+                if analysis.behavioral_conditions:
+                    qa_pairs_list = source.get("qa_pairs", []) or []
+                    for behavior_key in behavior_values.keys():
+                        if behavior_values.get(behavior_key) is None:
+                            extracted_value = extract_behavior_from_qa_pairs(qa_pairs_list, behavior_key)
+                            if extracted_value is not None:
+                                behavior_values[behavior_key] = extracted_value
 
                 # Normalize
                 for demo_type, values in doc_values.items():
@@ -3502,6 +4395,10 @@ async def search_natural_language(
                 behavior_pass = True
                 if analysis.behavioral_conditions:
                     for condition_key, expected_value in analysis.behavioral_conditions.items():
+                        # ⭐ expected_value=None은 "이 조건을 체크하지 않음"을 의미 → 스킵
+                        if expected_value is None:
+                            continue
+
                         actual_value = behavior_values.get(condition_key)
                         if actual_value is None:
                             behavior_metadata_missing += 1
@@ -3610,6 +4507,7 @@ async def search_natural_language(
                 demographic_info["occupation"] = source_metadata.get("occupation")
                 demographic_info["marital_status"] = source_metadata.get("marital_status")
                 demographic_info["sub_region"] = source_metadata.get("sub_region")
+                demographic_info["panel"] = source_metadata.get("panel")
 
             occupation_expected = set()
             for demo in demographic_filters.get(DemographicType.OCCUPATION, []):
@@ -3702,11 +4600,21 @@ async def search_natural_language(
                 limit=10
             )
 
+            # survey_datetime 추출 (metadata에서)
+            survey_datetime = None
+            if source_metadata and isinstance(source_metadata, dict):
+                survey_datetime = source_metadata.get("survey_datetime")
+            elif isinstance(source, dict):
+                metadata = source.get("metadata", {})
+                if isinstance(metadata, dict):
+                    survey_datetime = metadata.get("survey_datetime")
+
             results.append(
                 SearchResult(
                     user_id=user_id,
                     score=doc.get("_score", 0.0),
                     timestamp=source.get("timestamp") if isinstance(source, dict) else None,
+                    survey_datetime=survey_datetime,
                     demographic_info=demographic_info if demographic_info else None,
                     behavioral_info=behavioral_info if behavioral_info else None,
                     qa_pairs=qa_pairs_display[:5],
@@ -3796,6 +4704,7 @@ async def search_natural_language(
 
         response = SearchResponse(
             query=request.query,
+            session_id=getattr(request, "session_id", None),
             total_hits=total_hits,
             max_score=max_score,
             results=page_results,
@@ -4135,6 +5044,7 @@ async def run_two_phase_demographic_search(
             logger.info(f"  - {key}: {timings[key]:.2f}")
         return SearchResponse(
             query=request.query,
+            session_id=getattr(request, "session_id", None),
             total_hits=0,
             max_score=0.0,
             results=[],
@@ -4178,6 +5088,7 @@ async def run_two_phase_demographic_search(
             logger.info(f"  - {key}: {timings[key]:.2f}")
         return SearchResponse(
             query=request.query,
+            session_id=getattr(request, "session_id", None),
             total_hits=0,
             max_score=0.0,
             results=[],
@@ -4257,6 +5168,7 @@ async def run_two_phase_demographic_search(
             logger.info(f"  - {key}: {timings[key]:.2f}")
         return SearchResponse(
             query=request.query,
+            session_id=getattr(request, "session_id", None),
             total_hits=0,
             max_score=0.0,
             results=[],
@@ -4307,6 +5219,7 @@ async def run_two_phase_demographic_search(
             demographic_info['occupation'] = source_metadata.get('occupation')
             demographic_info["marital_status"] = source_metadata.get("marital_status")
             demographic_info["sub_region"] = source_metadata.get("sub_region")
+            demographic_info["panel"] = source_metadata.get("panel")
 
         if 'occupation' not in demographic_info or not demographic_info['occupation']:
             qa_pairs_for_occ = source.get('qa_pairs', []) if isinstance(source, dict) else []
@@ -4352,11 +5265,21 @@ async def run_two_phase_demographic_search(
                 qa_data['highlights'] = inner_hit['highlight']
             matched_qa.append(qa_data)
 
+        # survey_datetime 추출 (metadata에서)
+        survey_datetime = None
+        if source_metadata and isinstance(source_metadata, dict):
+            survey_datetime = source_metadata.get("survey_datetime")
+        elif isinstance(source, dict):
+            metadata = source.get("metadata", {})
+            if isinstance(metadata, dict):
+                survey_datetime = metadata.get("survey_datetime")
+
         results.append(
             SearchResult(
                 user_id=user_id,
                 score=hit.get('_score', 0.0),
                 timestamp=source.get('timestamp') if isinstance(source, dict) else None,
+                survey_datetime=survey_datetime,
                 demographic_info=demographic_info if demographic_info else None,
                 behavioral_info=behavioral_info if behavioral_info else None,
                 qa_pairs=source.get('qa_pairs', [])[:5] if isinstance(source, dict) else [],

@@ -472,19 +472,22 @@ class OpenSearchHybridQueryBuilder:
 def calculate_rrf_score(
     keyword_results: List[Dict],
     vector_results: List[Dict],
-    k: int = 60
+    k: int = 60,
+    alpha: float = 0.6
 ) -> List[Dict]:
     """
     수동 RRF 점수 계산 (OpenSearch 2.10 미만용)
-    
+
     ⭐ Rank 정규화 적용: 결과 개수에 관계없이 일관된 점수 계산
-    RRF 공식: score = Σ (1 / (k + normalized_rank))
+    RRF 공식: score = Σ (weight * (1 / (k + normalized_rank)))
     normalized_rank = (rank / total_results) * 100
 
     Args:
         keyword_results: 키워드 검색 결과 리스트
         vector_results: 벡터 검색 결과 리스트
         k: RRF 상수 (기본값 60)
+        alpha: 벡터 검색 가중치 (기본값 0.6, keyword는 1-alpha)
+               alpha=0.6 → vector 60%, keyword 40%
 
     Returns:
         RRF 점수로 정렬된 결과 리스트
@@ -493,19 +496,24 @@ def calculate_rrf_score(
     # 문서별 점수 누적
     doc_scores = {}
 
+    # ⭐⭐⭐ 가중치 계산: alpha=0.6 → vector 60%, keyword 40%
+    keyword_weight = 1.0 - alpha
+    vector_weight = alpha
+
     # 키워드 결과 개수 (정규화용)
     keyword_total = len(keyword_results) if keyword_results else 1
-    
+
     # 키워드 결과
     for rank, result in enumerate(keyword_results, start=1):
         doc_id = result.get('_id', '')
         if not doc_id:
             # _id가 없으면 다른 방법으로 식별 시도
             doc_id = result.get('id', '') or str(id(result))
-        
+
         # ⭐ 정규화: rank를 0~100 사이로 변환
         normalized_rank = (rank / keyword_total) * 100
-        score = 1.0 / (k + normalized_rank)
+        # ⭐⭐⭐ 가중치 적용: keyword_weight를 곱함
+        score = keyword_weight * (1.0 / (k + normalized_rank))
 
         if doc_id not in doc_scores:
             doc_scores[doc_id] = {
@@ -526,17 +534,18 @@ def calculate_rrf_score(
 
     # 벡터 결과 개수 (정규화용)
     vector_total = len(vector_results) if vector_results else 1
-    
+
     # 벡터 결과
     for rank, result in enumerate(vector_results, start=1):
         doc_id = result.get('_id', '')
         if not doc_id:
             # _id가 없으면 다른 방법으로 식별 시도
             doc_id = result.get('id', '') or str(id(result))
-        
+
         # ⭐ 정규화: rank를 0~100 사이로 변환
         normalized_rank = (rank / vector_total) * 100
-        score = 1.0 / (k + normalized_rank)
+        # ⭐⭐⭐ 가중치 적용: vector_weight를 곱함
+        score = vector_weight * (1.0 / (k + normalized_rank))
 
         if doc_id not in doc_scores:
             doc_scores[doc_id] = {
