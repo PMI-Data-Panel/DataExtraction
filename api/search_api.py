@@ -668,7 +668,6 @@ def _build_cached_response(
         "should_terms": analysis.should_terms,
         "alpha": analysis.alpha,
         "confidence": analysis.confidence,
-        "filters": filters_for_response,
         "size": page_size,
         "timings_ms": timings,
         "behavioral_conditions": payload.get("behavioral_conditions", {}),
@@ -677,7 +676,11 @@ def _build_cached_response(
     if extracted_entities_dict is not None:
         query_analysis["extracted_entities"] = extracted_entities_dict
 
+    # requested_count 추출 (payload에서 가져오거나 None)
+    requested_count = payload.get("requested_count")
+    
     return SearchResponse(
+        requested_count=requested_count,
         query=request.query,
         session_id=getattr(request, "session_id", None),
         total_hits=total_hits,
@@ -1200,6 +1203,10 @@ class SearchResult(BaseModel):
 
 class SearchResponse(BaseModel):
     """검색 응답"""
+    requested_count: Optional[int] = Field(
+        default=None,
+        description="쿼리에서 추출된 요청 인원 수 (예: '직장인 5명' → 5, 인원 제한 없으면 None)"
+    )
     query: str
     total_hits: int
     max_score: Optional[float]
@@ -1436,9 +1443,7 @@ COFFEE_POSITIVE_KEYWORDS = {
     "커피 머신", "커피머신", "에스프레소 머신", "캡슐커피 머신",
     "캡슐커피", "네스프레소", "돌체구스토"
 }
-COFFEE_NEGATIVE_KEYWORDS = {
-    "커피 머신을 보유하지 않음", "커피머신 없음", "보유하지 않음"
-}
+COFFEE_NEGATIVE_KEYWORDS = set()  # 빈 set: negative 키워드 없음
 
 # 11. 구독 서비스 이용 (실제 질문: "할인, 캐시백, 멤버십 등 포인트 적립 혜택")
 SUBSCRIPTION_QUESTION_KEYWORDS = {
@@ -2110,27 +2115,20 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dic
             for q in question_keywords
         ]
 
-        # 답변 매칭 쿼리 생성
-        if value:  # True: positive keywords를 찾고, negative keywords 제외
+        # ⭐ 답변 매칭 쿼리 생성 (positive keywords만 사용, negative 무시)
+        # 이유: negative keywords가 너무 일반적 (예: "해당 없음", "보유하지 않음")
+        if value:  # True: positive keywords만 찾기
             answer_should = [
                 {"match": {"qa_pairs.answer": kw}}
                 for kw in positive_keywords
             ]
-            answer_must_not = [
-                {"match": {"qa_pairs.answer": kw}}
-                for kw in negative_keywords
-            ]
-        else:  # False: negative keywords를 찾고, positive keywords 제외
+        else:  # False: negative keywords만 찾기
             answer_should = [
                 {"match": {"qa_pairs.answer": kw}}
                 for kw in negative_keywords
-            ]
-            answer_must_not = [
-                {"match": {"qa_pairs.answer": kw}}
-                for kw in positive_keywords
             ]
 
-        # OpenSearch nested 필터 생성
+        # OpenSearch nested 필터 생성 (must_not 제거)
         filters.append({
             "nested": {
                 "path": "qa_pairs",
@@ -2146,7 +2144,6 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dic
                             {
                                 "bool": {
                                     "should": answer_should,
-                                    "must_not": answer_must_not,
                                     "minimum_should_match": 1
                                 }
                             }
@@ -2449,6 +2446,7 @@ class NLSearchRequest(BaseModel):
         default="survey_responses_merged",
         description="검색할 인덱스 이름 (기본값: survey_responses_merged; 와일드카드 사용 가능)"
     )
+    size: int = Field(default=10, ge=1, le=5000, description="반환할 결과 개수 (쿼리에서 추출된 인원 수가 없을 때 사용)")
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
     page: int = Field(default=1, ge=1, description="요청할 페이지 번호 (1부터 시작)")
     use_claude_analyzer: Optional[bool] = Field(
@@ -2709,8 +2707,12 @@ async def search_natural_language(
         filters_for_response = list(filters)
         filters_signature = _normalize_filters_for_cache(filters_for_response)
 
-        # ⭐ page_size 제한 완화: 100 → 5000 (전체 결과 확인 가능하도록)
-        page_size = max(1, min(requested_size, 5000))
+        # ⭐ page_size 결정: 쿼리에서 추출된 requested_size가 있으면 우선 사용, 없으면 request.size 사용
+        if requested_size is not None and requested_size > 0:
+            page_size = max(1, min(requested_size, 5000))
+        else:
+            # 쿼리에서 인원 수를 추출하지 못한 경우, request.size 사용 (기본값 10)
+            page_size = max(1, min(getattr(request, "size", 10), 5000))
         page = max(1, request.page)
         requested_window = page_size * page
         cache_client = getattr(router, "redis_client", None)
@@ -3092,16 +3094,60 @@ async def search_natural_language(
             demographic_filters = []
             behavioral_filters = []
 
+            logger.info(f"🔍 필터 분류 시작: should_filters={len(should_filters)}개")
+
             def is_demographic_filter(f):
-                """Demographics 필터인지 확인 (연령, 성별, 직업)"""
-                # 기존 is_age_or_gender_filter() 또는 is_occupation_filter()와 동일하면 demographic
-                return is_age_or_gender_filter(f) or is_occupation_filter(f)
+                """Demographics 필터인지 확인 (연령, 성별, 직업, 지역, 결혼여부)"""
+                # 기존 함수들로 체크
+                if is_age_or_gender_filter(f) or is_occupation_filter(f):
+                    return True
+
+                # ⭐ REGION, MARITAL_STATUS 등 추가 demographics 체크
+                demo_keywords = ['연령', '나이', '성별', '직업', '직무',
+                               '지역', '거주', '주소', 'region', '결혼', '혼인', '배우자']
+
+                # Case 1: 필터에 nested가 직접 있는 경우
+                if 'nested' in f and 'path' in f['nested'] and f['nested']['path'] == 'qa_pairs':
+                    nested_q = f['nested'].get('query', {}).get('bool', {})
+                    must_list = nested_q.get('must', [])
+                    for must_item in must_list:
+                        if 'bool' in must_item and 'should' in must_item['bool']:
+                            for should_item in must_item['bool']['should']:
+                                if 'match' in should_item:
+                                    for match_key, match_val in should_item['match'].items():
+                                        if 'q_text' in match_key:
+                                            if any(kw in str(match_val) for kw in demo_keywords):
+                                                return True
+
+                # Case 2: bool → should 안에 nested가 있는 경우 (REGION 필터 구조)
+                # 예: {"bool": {"should": [{metadata 매칭}, {"nested": {...}}]}}
+                if 'bool' in f and 'should' in f['bool']:
+                    for should_item in f['bool']['should']:
+                        if 'nested' in should_item and 'path' in should_item['nested']:
+                            if should_item['nested']['path'] == 'qa_pairs':
+                                nested_q = should_item['nested'].get('query', {}).get('bool', {})
+                                must_list = nested_q.get('must', [])
+                                for must_item in must_list:
+                                    if 'bool' in must_item and 'should' in must_item['bool']:
+                                        for nested_should in must_item['bool']['should']:
+                                            if 'match' in nested_should:
+                                                for match_key, match_val in nested_should['match'].items():
+                                                    if 'q_text' in match_key:
+                                                        if any(kw in str(match_val) for kw in demo_keywords):
+                                                            return True
+
+                return False
 
             for f in should_filters:
-                if is_demographic_filter(f):
+                is_demo = is_demographic_filter(f)
+                if is_demo:
                     demographic_filters.append(f)
+                    # ⭐ 디버깅: Demographics로 분류된 필터 로그 출력
+                    logger.info(f"   ✅ Demographics로 분류: {json.dumps(f, ensure_ascii=False)[:200]}")
                 else:
                     behavioral_filters.append(f)
+                    # ⭐ 디버깅: Behavioral로 분류된 필터 로그 출력
+                    logger.info(f"   ⚠️ Behavioral로 분류: {json.dumps(f, ensure_ascii=False)[:200]}")
 
             logger.info(f"🔍 필터 분리:")
             logger.info(f"   - Demographics 필터 (Python post-processing): {len(demographic_filters)}개")
@@ -3577,14 +3623,10 @@ async def search_natural_language(
             age_dsl_handled = bool(demographic_filters.get(DemographicType.AGE))
             occupation_dsl_handled = bool(demographic_filters.get(DemographicType.OCCUPATION)) and occupation_filter_handled
 
-            # ⭐ 모든 demographic_filters를 검증 (REGION, MARITAL_STATUS 포함!)
-            # ⭐ 단, OCCUPATION과 JOB_FUNCTION은 OpenSearch에서 qa_pairs로 검색하므로 후처리 검증 스킵
-            filters_to_validate: List[DemographicType] = [
-                f for f in demographic_filters.keys()
-                if f not in {DemographicType.OCCUPATION, DemographicType.JOB_FUNCTION}
-            ]
+            # ⭐ 모든 demographic_filters를 검증 (REGION, MARITAL_STATUS, OCCUPATION 포함!)
+            # OCCUPATION은 demographic_filters로 분류되어 Python post-processing에서 처리됨
+            filters_to_validate: List[DemographicType] = list(demographic_filters.keys())
             logger.info(f"  ✅ 후처리 검증 대상: {[f.value for f in filters_to_validate]}")
-            logger.info(f"  ⚠️ 후처리 검증 제외 (OpenSearch 필터만 사용): {[f.value for f in demographic_filters.keys() if f in {DemographicType.OCCUPATION, DemographicType.JOB_FUNCTION}]}")
 
             for demo in extracted_entities.demographics:
                 cache_key = f"{demo.demographic_type.value}:{demo.raw_value}"
@@ -4773,6 +4815,9 @@ async def search_natural_language(
             use_claude=use_claude,
         )
 
+        # requested_count 설정 (requested_size가 None이 아니면 그 값을, None이면 None)
+        requested_count = requested_size if requested_size is not None else None
+        
         if cache_enabled and cache_key and stored_items:
             cache_payload = {
                 "total_hits": total_hits,
@@ -4783,6 +4828,7 @@ async def search_natural_language(
                 "extracted_entities": extracted_entities.to_dict(),
                 "behavioral_conditions": getattr(analysis, "behavioral_conditions", {}),
                 "use_claude": bool(use_claude),
+                "requested_count": requested_count,
             }
             try:
                 cache_client.setex(
@@ -4793,8 +4839,9 @@ async def search_natural_language(
                 logger.info(f"💾 Redis 검색 캐시 저장: key={cache_key}, ttl={cache_ttl}s")
             except Exception as cache_exc:
                 logger.warning(f"⚠️ Redis 검색 캐시 저장 실패: {cache_exc}")
-
+        
         response = SearchResponse(
+            requested_count=requested_count,
             query=request.query,
             session_id=getattr(request, "session_id", None),
             total_hits=total_hits,
@@ -4806,8 +4853,7 @@ async def search_natural_language(
                 "should_terms": analysis.should_terms,
                 "alpha": analysis.alpha,
                 "confidence": analysis.confidence,
-                "filters": filters_for_response,
-                "size": page_size,
+                "size": len(page_results),  # 실제 반환된 결과 수
                 "timings_ms": timings,
                 "extracted_entities": extracted_entities.to_dict(),
                 "behavioral_conditions": getattr(analysis, "behavioral_conditions", {}),
