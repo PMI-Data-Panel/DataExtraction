@@ -1,0 +1,14 @@
+# Grafana 데이터 소스 자동 설정 (Prometheus)
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: "10s"
+      httpMethod: POST
+

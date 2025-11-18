@@ -123,10 +123,101 @@ services:
     networks:
       - rag_net
 
+  # 3. Node Exporter (시스템 메트릭 수집: CPU, RAM, Disk 등)
+  node_exporter:
+    container_name: node_exporter
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    restart: unless-stopped
+    networks:
+      - rag_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9100/metrics || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # 4. Prometheus 메트릭 수집 서비스
+  prometheus:
+    container_name: prometheus
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    networks:
+      - rag_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # 5. Grafana 모니터링 대시보드 서비스
+  grafana:
+    container_name: grafana
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      # Grafana 기본 설정
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: ""
+      # 서버 설정
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+      GF_SERVER_SERVE_FROM_SUB_PATH: false
+      # 데이터베이스 설정 (SQLite 사용, 프로덕션에서는 PostgreSQL 권장)
+      GF_DATABASE_TYPE: sqlite3
+      # 로그 설정
+      GF_LOG_LEVEL: info
+      # Provisioning 활성화
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+    networks:
+      - rag_net
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
 networks:
   rag_net:
     driver: bridge
 
 volumes:
   redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
     driver: local

@@ -24,3 +24,6 @@
     tqdm==4.66.5
     pydantic>=2.0.0
     anthropic
+    
+    # Monitoring
+    prometheus-fastapi-instrumentator==7.0.0

@@ -315,6 +315,45 @@ jobs:
               exit 1
             }
             
+            echo "=== 최신 코드 pull ==="
+            # 브랜치 이름 추출 (refs/heads/feature/ai -> feature/ai)
+            BRANCH_NAME="${{ github.ref_name }}"
+            # refs/heads/ 접두사 제거 (있는 경우)
+            BRANCH_NAME=${BRANCH_NAME#refs/heads/}
+            echo "배포할 브랜치: $BRANCH_NAME"
+            
+            # 원격 저장소 정보 확인
+            git remote -v || git remote add origin https://github.com/${{ github.repository }}.git || true
+            
+            # 모든 원격 브랜치 가져오기
+            git fetch origin --prune || true
+            
+            # feature/ai 브랜치로 체크아웃 (없으면 생성)
+            if git show-ref --verify --quiet refs/heads/$BRANCH_NAME; then
+              echo "로컬 브랜치 $BRANCH_NAME 존재, 체크아웃..."
+              git checkout $BRANCH_NAME || true
+            else
+              echo "로컬 브랜치 $BRANCH_NAME 없음, 생성 및 체크아웃..."
+              git checkout -b $BRANCH_NAME origin/$BRANCH_NAME || {
+                echo "⚠️ 원격 브랜치 origin/$BRANCH_NAME를 찾을 수 없습니다."
+                exit 1
+              }
+            fi
+            
+            # 최신 코드로 업데이트
+            git reset --hard origin/$BRANCH_NAME || {
+              echo "⚠️ Git reset 실패, pull 시도..."
+              git pull origin $BRANCH_NAME || {
+                echo "❌ Git pull 실패"
+                exit 1
+              }
+            }
+            
+            echo "✅ 코드 업데이트 완료"
+            echo "현재 브랜치: $(git branch --show-current)"
+            echo "최신 커밋:"
+            git log -1 --oneline || true
+            
             echo "=== .env 파일 확인 ==="
             if [ ! -f .env ]; then
               echo "❌ .env 파일이 없습니다. 배포를 중단합니다."
@@ -326,20 +365,24 @@ jobs:
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin || true
             
             echo "=== 최신 Docker 이미지 pull ==="
-            docker pull ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.DOCKER_IMAGE_NAME }}:latest || {
-              echo "이미지 pull 실패, 로컬 빌드 시도..."
-              git pull origin main || true
-              docker compose build --no-cache || docker build -t ${{ env.DOCKER_IMAGE_NAME }}:latest .
+            IMAGE_TAG="${{ env.REGISTRY }}/${{ github.repository }}/${{ env.DOCKER_IMAGE_NAME }}:latest"
+            docker pull ${IMAGE_TAG} || {
+              echo "⚠️ 이미지 pull 실패, 로컬 빌드 시도..."
+              docker compose build --no-cache || docker build -t ${IMAGE_TAG} .
             }
             
             echo "=== Docker Compose로 서비스 시작 ==="
             if [ -f docker-compose.yml ]; then
-              # 기존 컨테이너 중지 및 제거
-              docker compose down || true
+              # 기존 컨테이너 완전히 중지 및 제거
+              docker compose down -v || true
               
-              # 새 이미지로 서비스 시작
+              # 이미지 태그 업데이트 (docker-compose.yml에 image 필드가 있는 경우)
+              # 또는 로컬 빌드 사용
+              
+              # 새 이미지로 서비스 강제 재생성 및 시작
               docker compose pull || true
-              docker compose up -d --build
+              docker compose build --no-cache || true
+              docker compose up -d --force-recreate --build --remove-orphans
               
               # 컨테이너 로그 확인
               echo "컨테이너 로그 확인 중..."
