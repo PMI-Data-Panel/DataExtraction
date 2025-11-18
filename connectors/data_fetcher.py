@@ -54,9 +54,9 @@ class DataFetcher:
             raise ValueError("OpenSearch 클라이언트가 초기화되지 않았습니다")
 
         try:
-            # 쿼리 디버깅
+            # 쿼리 디버깅 (DEBUG 레벨로 축소)
             import json
-            logger.info(f"🔍 OpenSearch 쿼리:\n{json.dumps(query, indent=2, ensure_ascii=False)}")
+            logger.debug(f"🔍 OpenSearch 쿼리:\n{json.dumps(query, indent=2, ensure_ascii=False)}")
 
             # _source 필터링 추가
             search_body = query.copy()
@@ -92,7 +92,7 @@ class DataFetcher:
 
         try:
             import json
-            logger.info(f"🔍 [async] OpenSearch 쿼리:\n{json.dumps(query, indent=2, ensure_ascii=False)}")
+            logger.debug(f"🔍 [async] OpenSearch 쿼리:\n{json.dumps(query, indent=2, ensure_ascii=False)}")
 
             search_body = query.copy()
             if source_filter:

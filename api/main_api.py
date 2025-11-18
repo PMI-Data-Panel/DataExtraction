@@ -18,6 +18,7 @@ from rag_query_analyzer.config import get_config, Config
 from indexer.router import router as indexer_router
 from .search_api import router as search_router
 from .visualization_api import router as visualization_router
+from .search.refine_api import router as refine_router
 
 # --- 로깅 설정 ---
 logging.basicConfig(level=logging.INFO)
@@ -178,6 +179,13 @@ def create_app() -> FastAPI:
         # Visualization 라우터에 의존성 주입
         visualization_router.os_client = os_client
 
+        # Refine 라우터에 의존성 주입 (search_router와 동일한 의존성 공유)
+        refine_router.os_client = os_client
+        refine_router.anthropic_client = anthropic_client
+        refine_router.config = config
+        refine_router.redis_client = redis_client
+        refine_router.conversation_history_prefix = config.CONVERSATION_HISTORY_PREFIX
+
         # 시작 이벤트 등록
         @app.on_event("startup")
         async def startup_event():
@@ -289,6 +297,7 @@ def create_app() -> FastAPI:
         app.include_router(indexer_router)
         app.include_router(search_router)
         app.include_router(visualization_router)
+        app.include_router(refine_router)
 
         return app
 

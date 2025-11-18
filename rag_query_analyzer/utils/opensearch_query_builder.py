@@ -6,6 +6,61 @@ from ..models.query import QueryAnalysis
 logger = logging.getLogger(__name__)
 
 
+def build_dynamic_demographics_filters(demographics) -> List[Dict[str, Any]]:
+    """
+    DemographicEntity 리스트를 OpenSearch 필터로 변환
+    
+    Args:
+        demographics: ExtractedEntities 객체, DemographicEntity 리스트, 또는 dict 형태의 demographics
+        
+    Returns:
+        OpenSearch 필터 리스트
+    """
+    filters = []
+    
+    # ExtractedEntities 객체인 경우
+    if hasattr(demographics, 'demographics'):
+        demographics_list = demographics.demographics
+    # demographics가 dict 형태인 경우 (extracted entities dict)
+    elif isinstance(demographics, dict):
+        demographics_list = demographics.get("demographics", [])
+    elif isinstance(demographics, list):
+        demographics_list = demographics
+    else:
+        return filters
+    
+    for demo in demographics_list:
+        # DemographicEntity 객체인 경우
+        if hasattr(demo, 'to_opensearch_filter'):
+            filter_clause = demo.to_opensearch_filter(
+                metadata_only=False,  # survey_responses_merged는 metadata와 qa_pairs 모두 사용
+                include_qa_fallback=True,  # qa_pairs fallback 활성화
+            )
+            if filter_clause and filter_clause != {"match_all": {}}:
+                filters.append(filter_clause)
+        # dict 형태인 경우
+        elif isinstance(demo, dict):
+            # dict에서 DemographicEntity로 변환 시도
+            try:
+                from ..models.entities import DemographicEntity, DemographicType
+                demo_type = DemographicType(demo.get("demographic_type"))
+                demo_entity = DemographicEntity(
+                    demographic_type=demo_type,
+                    value=demo.get("value")
+                )
+                filter_clause = demo_entity.to_opensearch_filter(
+                    metadata_only=False,
+                    include_qa_fallback=True,
+                )
+                if filter_clause and filter_clause != {"match_all": {}}:
+                    filters.append(filter_clause)
+            except Exception as e:
+                logger.warning(f"Failed to convert dict to DemographicEntity: {e}")
+                continue
+    
+    return filters
+
+
 class OpenSearchHybridQueryBuilder:
     """
     RRF (Reciprocal Rank Fusion) 기반 하이브리드 검색
