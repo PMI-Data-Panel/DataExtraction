@@ -1,0 +1,34 @@
+# Prometheus 설정 파일
+global:
+  scrape_interval: 15s      # 메트릭 수집 간격
+  evaluation_interval: 15s  # 규칙 평가 간격
+  external_labels:
+    cluster: 'dataextraction'
+    environment: 'production'
+
+# 스크랩 설정
+scrape_configs:
+  # FastAPI 애플리케이션 메트릭
+  - job_name: 'fastapi'
+    static_configs:
+      - targets: ['fastapi_server:8000']
+        labels:
+          service: 'dataextraction-api'
+          instance: 'fastapi_server'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # Node Exporter (시스템 메트릭: CPU, RAM, Disk 등)
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['node_exporter:9100']
+        labels:
+          service: 'system'
+          instance: 'server'
+    scrape_interval: 15s
+
+  # Prometheus 자체 메트릭
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
