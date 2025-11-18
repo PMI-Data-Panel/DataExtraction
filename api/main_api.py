@@ -4,6 +4,7 @@ import logging
 import torch
 from typing import Optional
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from opensearchpy import OpenSearch, AsyncOpenSearch
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
@@ -49,6 +50,32 @@ def create_app() -> FastAPI:
             title="RAG Query Analyzer API",
             description="OpenSearch 기반 설문조사 데이터 색인 및 검색 API",
             version="4.0.0 (Refactored)"
+        )
+
+        # CORS 미들웨어 추가
+        # allow_credentials=True일 때는 allow_origins에 와일드카드("*")를 사용할 수 없음
+        # 따라서 명시적으로 허용할 오리진을 지정해야 함
+        allowed_origins = [
+            "http://localhost:5173",
+            "http://localhost:5174",  # Vite 개발 서버 (다른 포트)
+            "http://localhost:3000",
+            "http://localhost:8080",
+            "http://127.0.0.1:5173",
+            "http://127.0.0.1:5174",  # Vite 개발 서버 (다른 포트)
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:8080",
+        ]
+        # 환경변수에서 추가 오리진을 가져올 수 있음
+        extra_origins = os.getenv("CORS_ORIGINS", "").split(",")
+        allowed_origins.extend([origin.strip() for origin in extra_origins if origin.strip()])
+        
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=allowed_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+            allow_headers=["*"],  # 모든 헤더 허용
+            expose_headers=["*"],  # 응답 헤더 노출
         )
 
         # OpenSearch 클라이언트 초기화
