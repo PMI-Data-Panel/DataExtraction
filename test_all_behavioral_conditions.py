@@ -52,7 +52,7 @@ for behavior_key, keyword_config in BEHAVIORAL_KEYWORD_MAP.items():
     # 1. 실제 설문 데이터에서 해당 질문 찾기
     found_questions = []
 
-    for q_keyword in list(question_keywords)[:3]:  # 처음 3개만 테스트
+    for q_keyword in question_keywords:  # ✅ 모든 키워드 테스트
         # wildcard 쿼리로 질문 검색
         query = {
             "size": 0,

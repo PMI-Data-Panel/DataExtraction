@@ -1428,29 +1428,28 @@ FOOD_DELIVERY_NEGATIVE_KEYWORDS = {
     "안 시킴", "거의 먹지 않는다", "먹지 않는다"
 }
 
-# 10. 커피/카페 이용
+# 10. 커피 이용 (실제 질문: "보유가전제품")
 COFFEE_QUESTION_KEYWORDS = {
-    "커피", "카페", "커피숍", "카페 방문", "카페인"
+    "보유가전제품", "가전제품", "보유", "소유"
 }
 COFFEE_POSITIVE_KEYWORDS = {
-    "아메리카노", "라떼", "에스프레소", "카푸치노", "카페라떼",
-    "스타벅스", "이디야", "투썸", "메가커피", "빽다방",
-    "하루에", "일주일에", "자주", "매일"
+    "커피 머신", "커피머신", "에스프레소 머신", "캡슐커피 머신",
+    "캡슐커피", "네스프레소", "돌체구스토"
 }
 COFFEE_NEGATIVE_KEYWORDS = {
-    "커피를 마시지 않음", "카페를 가지 않음", "안 마심"
+    "커피 머신을 보유하지 않음", "커피머신 없음", "보유하지 않음"
 }
 
-# 11. 구독 서비스 이용
+# 11. 구독 서비스 이용 (실제 질문: "할인, 캐시백, 멤버십 등 포인트 적립 혜택")
 SUBSCRIPTION_QUESTION_KEYWORDS = {
-    "구독", "구독 서비스", "정기 구독", "멤버십"
+    "할인", "캐시백", "멤버십", "포인트", "적립", "혜택", "신경 쓰시나요"
 }
 SUBSCRIPTION_POSITIVE_KEYWORDS = {
-    "OTT", "음악", "뉴스", "잡지", "도서", "밀키트", "화장품", "생필품",
-    "넷플릭스", "유튜브", "멜론", "지니", "왓챠"
+    "자주 쓰는 곳만 챙긴다", "매우 꼼꼼하게 챙긴다", "가끔 생각날 때만 챙긴다",
+    "챙긴다", "꼼꼼하게"
 }
 SUBSCRIPTION_NEGATIVE_KEYWORDS = {
-    "구독 서비스를 이용하지 않음", "구독 안함", "해당 없음"
+    "거의 신경쓰지 않는다", "전혀 관심 없다", "신경쓰지 않는다", "관심 없다"
 }
 
 # 12. 소셜미디어 이용 (실제 질문: "가장 많이 사용하는 앱은 무엇인가요?")
@@ -1493,16 +1492,16 @@ READING_NEGATIVE_KEYWORDS = {
     "책을 읽지 않음", "독서 안함", "거의 안 읽음"
 }
 
-# 15. 영화/드라마 시청
+# 15. 영화/드라마 시청 (실제 질문: "가장 많이 사용하는 앱")
 MOVIE_DRAMA_QUESTION_KEYWORDS = {
-    "영화", "드라마", "시청", "영상", "콘텐츠"
+    "가장 많이 사용하는 앱", "많이 사용하는 앱", "요즘 가장"
 }
 MOVIE_DRAMA_POSITIVE_KEYWORDS = {
-    "액션", "로맨스", "코미디", "스릴러", "SF", "공포",
-    "한국 드라마", "미드", "일드", "중드", "하루에", "자주"
+    "동영상 스트리밍 앱", "동영상 스트리밍",
+    "유튜브", "넷플릭스", "Youtube", "Netflix"
 }
 MOVIE_DRAMA_NEGATIVE_KEYWORDS = {
-    "영화를 보지 않음", "드라마 안 봄", "거의 안 봄"
+    "동영상을 보지 않음", "스트리밍 안함", "거의 안 봄"
 }
 
 # 16. 음악 스트리밍
@@ -1529,16 +1528,16 @@ ONLINE_EDUCATION_NEGATIVE_KEYWORDS = {
     "온라인 교육을 받지 않음", "인강 안 들음", "해당 없음"
 }
 
-# 18. 금융 서비스
+# 18. 금융 서비스 (실제 질문: "가장 많이 사용하는 앱")
 FINANCIAL_SERVICE_QUESTION_KEYWORDS = {
-    "금융", "은행", "카드", "대출", "투자", "재테크"
+    "가장 많이 사용하는 앱", "많이 사용하는 앱", "요즘 가장"
 }
 FINANCIAL_SERVICE_POSITIVE_KEYWORDS = {
-    "신용카드", "체크카드", "적금", "예금", "주식", "펀드", "ETF",
-    "부동산", "가상화폐", "암호화폐", "비트코인"
+    "금융 앱", "금융앱", "은행 앱", "은행앱",
+    "토스", "카카오뱅크", "케이뱅크", "뱅킹"
 }
 FINANCIAL_SERVICE_NEGATIVE_KEYWORDS = {
-    "금융 서비스를 이용하지 않음", "투자 안함", "해당 없음"
+    "금융 앱 사용하지 않음", "금융 서비스 미사용", "해당 없음"
 }
 
 # 19. 건강검진
@@ -1590,53 +1589,55 @@ HOME_APPLIANCE_NEGATIVE_KEYWORDS = {
     "가전제품 관심 없음", "구매 계획 없음", "해당 없음"
 }
 
-# 23. 스마트 기기
+# 23. 스마트 기기 (실제 질문: "보유가전제품")
 SMART_DEVICE_QUESTION_KEYWORDS = {
-    "스마트기기", "스마트폰", "태블릿", "웨어러블", "IoT"
+    "보유가전제품", "가전제품", "보유", "소유"
 }
 SMART_DEVICE_POSITIVE_KEYWORDS = {
-    "아이폰", "갤럭시", "아이패드", "갤탭", "애플워치",
-    "스마트워치", "무선이어폰", "에어팟", "버즈"
+    "인공지능 AI 스피커", "AI 스피커", "AI스피커",
+    "로봇청소기", "로봇 청소기",
+    "스마트 워치", "스마트워치", "애플워치", "갤럭시 워치",
+    "식기세척기", "의류 관리기", "스타일러"
 }
 SMART_DEVICE_NEGATIVE_KEYWORDS = {
-    "스마트기기 관심 없음", "사용 안함", "해당 없음"
+    "스마트기기 관심 없음", "사용 안함", "해당 없음", "보유하지 않음"
 }
 
-# 24. 환경 보호
+# 24. 환경 보호 (실제 질문: "스킨케어 제품 구매 고려 요소", "비닐봉투 사용 줄이기")
 ENVIRONMENT_QUESTION_KEYWORDS = {
-    "환경", "친환경", "환경보호", "지속가능", "에코"
+    "스킨케어 제품", "구매할 때", "고려하는 요소",
+    "비닐봉투", "일회용", "줄이기", "노력"
 }
 ENVIRONMENT_POSITIVE_KEYWORDS = {
-    "분리수거", "재활용", "텀블러", "에코백", "비건", "채식",
-    "대중교통", "전기차", "친환경 제품", "관심있음"
+    "친환경", "비건", "친환경/비건 제품 여부",
+    "장바구니", "에코백", "장바구니나 에코백을 챙긴다",
+    "종이봉투", "박스", "비닐 대신 종이봉투나 박스를 활용한다"
 }
 ENVIRONMENT_NEGATIVE_KEYWORDS = {
-    "환경에 관심 없음", "실천 안함", "해당 없음"
+    "환경에 관심 없음", "실천 안함", "해당 없음", "특별히 신경 쓰지 않는다"
 }
 
-# 25. 기부/봉사
+# 25. 기부/봉사 (실제 질문: "버리기 아까운 물건")
 CHARITY_QUESTION_KEYWORDS = {
-    "기부", "봉사", "자선", "나눔", "기부 활동", "봉사 활동"
+    "버리기 아까운", "물건", "버리기 아까운 물건", "어떻게 하시나요"
 }
 CHARITY_POSITIVE_KEYWORDS = {
-    "정기 기부", "일시 기부", "봉사 활동", "자원봉사",
-    "한달에", "1년에", "가끔", "정기적"
+    "기부", "기부한다", "필요한 사람에게 기부"
 }
 CHARITY_NEGATIVE_KEYWORDS = {
-    "기부하지 않음", "봉사 안함", "해당 없음"
+    "버린다", "바로 버린다", "중고로 판매", "업사이클링", "기부하지 않음"
 }
 
-# 26. 자동차 관련
+# 26. 자동차 관련 (실제 질문: "보유차량여부")
 CAR_INTEREST_QUESTION_KEYWORDS = {
-    "자동차", "차량", "자동차 관심", "차", "카"
+    "보유차량여부", "차량", "보유차량", "자동차", "차"
 }
 CAR_INTEREST_POSITIVE_KEYWORDS = {
-    "세단", "SUV", "전기차", "수입차", "국산차",
-    "현대", "기아", "제네시스", "BMW", "벤츠", "테슬라",
-    "관심있음", "구매 계획"
+    "있다", "보유", "소유",
+    "현대", "기아", "제네시스", "BMW", "벤츠", "테슬라", "쌍용"
 }
 CAR_INTEREST_NEGATIVE_KEYWORDS = {
-    "자동차 관심 없음", "구매 계획 없음", "해당 없음"
+    "없다", "보유하지 않음", "해당 없음"
 }
 
 # 27. 주거 형태
@@ -1687,16 +1688,18 @@ PUBLIC_TRANSPORT_NEGATIVE_KEYWORDS = {
     "대중교통을 이용하지 않음", "자차 이용", "도보"
 }
 
-# 31. 택배/배송 이용
+# 31. 택배/배송 이용 (실제 질문: "빠른 배송 서비스를 주로 어떤 제품을 구매할 때 이용하시나요?")
 PARCEL_DELIVERY_QUESTION_KEYWORDS = {
-    "택배", "배송", "온라인 쇼핑", "인터넷 쇼핑"
+    "빠른 배송", "당일", "새벽", "직진 배송", "어떤 제품", "이용하시나요"
 }
 PARCEL_DELIVERY_POSITIVE_KEYWORDS = {
-    "쿠팡", "11번가", "지마켓", "옥션", "네이버쇼핑", "알리",
-    "일주일에", "한달에", "자주", "자주 이용"
+    "신선식품", "과일", "채소", "육류",
+    "생활용품", "생필품", "위생용품",
+    "패션", "뷰티", "패션·뷰티 제품",
+    "전자기기", "가전제품", "전자기기 및 가전제품"
 }
 PARCEL_DELIVERY_NEGATIVE_KEYWORDS = {
-    "온라인 쇼핑을 하지 않음", "택배 안 시킴", "해당 없음"
+    "빠른 배송 서비스를 이용해 본 적 없다", "이용해 본 적 없다", "해당 없음"
 }
 
 # 32. 외식 빈도 (실제 질문: "여러분은 외부 식당에서 혼자 식사하는 빈도는 어느 정도인가요?")
@@ -1828,35 +1831,15 @@ BEHAVIORAL_KEYWORD_MAP = {
         'positive_keywords': GAMING_POSITIVE_KEYWORDS,
         'negative_keywords': GAMING_NEGATIVE_KEYWORDS
     },
-    'reads_books': {
-        'question_keywords': READING_QUESTION_KEYWORDS,
-        'positive_keywords': READING_POSITIVE_KEYWORDS,
-        'negative_keywords': READING_NEGATIVE_KEYWORDS
-    },
     'watches_movies_dramas': {
         'question_keywords': MOVIE_DRAMA_QUESTION_KEYWORDS,
         'positive_keywords': MOVIE_DRAMA_POSITIVE_KEYWORDS,
         'negative_keywords': MOVIE_DRAMA_NEGATIVE_KEYWORDS
     },
-    'streams_music': {
-        'question_keywords': MUSIC_STREAMING_QUESTION_KEYWORDS,
-        'positive_keywords': MUSIC_STREAMING_POSITIVE_KEYWORDS,
-        'negative_keywords': MUSIC_STREAMING_NEGATIVE_KEYWORDS
-    },
-    'takes_online_courses': {
-        'question_keywords': ONLINE_EDUCATION_QUESTION_KEYWORDS,
-        'positive_keywords': ONLINE_EDUCATION_POSITIVE_KEYWORDS,
-        'negative_keywords': ONLINE_EDUCATION_NEGATIVE_KEYWORDS
-    },
     'uses_financial_services': {
         'question_keywords': FINANCIAL_SERVICE_QUESTION_KEYWORDS,
         'positive_keywords': FINANCIAL_SERVICE_POSITIVE_KEYWORDS,
         'negative_keywords': FINANCIAL_SERVICE_NEGATIVE_KEYWORDS
-    },
-    'gets_health_checkups': {
-        'question_keywords': HEALTH_CHECKUP_QUESTION_KEYWORDS,
-        'positive_keywords': HEALTH_CHECKUP_POSITIVE_KEYWORDS,
-        'negative_keywords': HEALTH_CHECKUP_NEGATIVE_KEYWORDS
     },
     'uses_beauty_products': {
         'question_keywords': BEAUTY_QUESTION_KEYWORDS,
@@ -1893,26 +1876,6 @@ BEHAVIORAL_KEYWORD_MAP = {
         'positive_keywords': CAR_INTEREST_POSITIVE_KEYWORDS,
         'negative_keywords': CAR_INTEREST_NEGATIVE_KEYWORDS
     },
-    'housing_type': {
-        'question_keywords': HOUSING_QUESTION_KEYWORDS,
-        'positive_keywords': HOUSING_POSITIVE_KEYWORDS,
-        'negative_keywords': HOUSING_NEGATIVE_KEYWORDS
-    },
-    'has_insurance': {
-        'question_keywords': INSURANCE_QUESTION_KEYWORDS,
-        'positive_keywords': INSURANCE_POSITIVE_KEYWORDS,
-        'negative_keywords': INSURANCE_NEGATIVE_KEYWORDS
-    },
-    'uses_credit_card': {
-        'question_keywords': CREDIT_CARD_QUESTION_KEYWORDS,
-        'positive_keywords': CREDIT_CARD_POSITIVE_KEYWORDS,
-        'negative_keywords': CREDIT_CARD_NEGATIVE_KEYWORDS
-    },
-    'uses_public_transport': {
-        'question_keywords': PUBLIC_TRANSPORT_QUESTION_KEYWORDS,
-        'positive_keywords': PUBLIC_TRANSPORT_POSITIVE_KEYWORDS,
-        'negative_keywords': PUBLIC_TRANSPORT_NEGATIVE_KEYWORDS
-    },
     'uses_parcel_delivery': {
         'question_keywords': PARCEL_DELIVERY_QUESTION_KEYWORDS,
         'positive_keywords': PARCEL_DELIVERY_POSITIVE_KEYWORDS,
@@ -1927,16 +1890,6 @@ BEHAVIORAL_KEYWORD_MAP = {
         'question_keywords': DRINKING_GATHERING_QUESTION_KEYWORDS,
         'positive_keywords': DRINKING_GATHERING_POSITIVE_KEYWORDS,
         'negative_keywords': DRINKING_GATHERING_NEGATIVE_KEYWORDS
-    },
-    'works_overtime': {
-        'question_keywords': OVERTIME_QUESTION_KEYWORDS,
-        'positive_keywords': OVERTIME_POSITIVE_KEYWORDS,
-        'negative_keywords': OVERTIME_NEGATIVE_KEYWORDS
-    },
-    'works_remotely': {
-        'question_keywords': REMOTE_WORK_QUESTION_KEYWORDS,
-        'positive_keywords': REMOTE_WORK_POSITIVE_KEYWORDS,
-        'negative_keywords': REMOTE_WORK_NEGATIVE_KEYWORDS
     }
 }
 
@@ -2109,16 +2062,18 @@ def extract_behavioral_conditions_from_query(query: str) -> Dict[str, bool]:
 
 
 def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dict[str, Any]]:
-    """behavioral_conditions를 OpenSearch nested 필터로 변환
+    """behavioral_conditions를 OpenSearch nested 필터로 변환 (동적 처리)
+
+    ⭐ BEHAVIORAL_KEYWORD_MAP을 사용해서 모든 조건을 자동으로 처리합니다.
 
     Args:
-        behavioral_conditions: {"smoker": True, "has_vehicle": False, ...}
+        behavioral_conditions: {"smoker": True, "has_vehicle": False, "uses_smart_devices": True, ...}
 
     Returns:
         OpenSearch nested 쿼리 리스트
 
     Example:
-        {"smoker": True} →
+        {"uses_smart_devices": True} →
         {
             "nested": {
                 "path": "qa_pairs",
@@ -2133,6 +2088,81 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dic
             }
         }
     """
+    filters = []
+
+    for key, value in behavioral_conditions.items():
+        if value is None:
+            continue
+
+        # ⭐ BEHAVIORAL_KEYWORD_MAP에서 키워드 설정 가져오기
+        if key not in BEHAVIORAL_KEYWORD_MAP:
+            logger.warning(f"⚠️ Behavioral condition '{key}' not found in BEHAVIORAL_KEYWORD_MAP, skipping")
+            continue
+
+        keyword_config = BEHAVIORAL_KEYWORD_MAP[key]
+        question_keywords = keyword_config['question_keywords']
+        positive_keywords = keyword_config['positive_keywords']
+        negative_keywords = keyword_config['negative_keywords']
+
+        # 질문 매칭 쿼리 생성
+        question_should = [
+            {"match": {"qa_pairs.q_text": q}}
+            for q in question_keywords
+        ]
+
+        # 답변 매칭 쿼리 생성
+        if value:  # True: positive keywords를 찾고, negative keywords 제외
+            answer_should = [
+                {"match": {"qa_pairs.answer": kw}}
+                for kw in positive_keywords
+            ]
+            answer_must_not = [
+                {"match": {"qa_pairs.answer": kw}}
+                for kw in negative_keywords
+            ]
+        else:  # False: negative keywords를 찾고, positive keywords 제외
+            answer_should = [
+                {"match": {"qa_pairs.answer": kw}}
+                for kw in negative_keywords
+            ]
+            answer_must_not = [
+                {"match": {"qa_pairs.answer": kw}}
+                for kw in positive_keywords
+            ]
+
+        # OpenSearch nested 필터 생성
+        filters.append({
+            "nested": {
+                "path": "qa_pairs",
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "bool": {
+                                    "should": question_should,
+                                    "minimum_should_match": 1
+                                }
+                            },
+                            {
+                                "bool": {
+                                    "should": answer_should,
+                                    "must_not": answer_must_not,
+                                    "minimum_should_match": 1
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        })
+
+    return filters
+
+
+# ⭐ 아래는 legacy 하드코딩된 조건들 (참고용으로 주석 처리)
+# 이제 위의 동적 처리 로직이 모든 조건을 자동으로 처리합니다.
+"""
+def build_behavioral_filters_OLD_HARDCODED(behavioral_conditions: Dict[str, bool]) -> List[Dict[str, Any]]:
     filters = []
 
     for key, value in behavioral_conditions.items():
@@ -2397,6 +2427,7 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dic
                 })
 
     return filters
+"""
 
 
 @router.get("/", summary="Search API 상태")
@@ -2753,6 +2784,10 @@ async def search_natural_language(
         filters_os = age_gender_filters + occupation_filters + other_filters
         filters = filters_os  # 유지보수: 기존 로직과 호환성을 위해
         has_demographic_filters = bool(filters_for_response)
+        has_behavioral_conditions = bool(
+            analysis.behavioral_conditions and
+            any(v is not None for v in analysis.behavioral_conditions.values())
+        )
         occupation_filter_handled = False
 
         logger.info("🔍 필터 상태 체크:")
@@ -2932,7 +2967,10 @@ async def search_natural_language(
                                 cleaned['bool'][key] = remove_inner_hits(cleaned['bool'][key])
             
             return cleaned
-        
+
+        # ⭐ Behavioral 필터 존재 여부 초기화 (기본값: False)
+        has_behavioral_filters = False
+
         if filters_os:
             # ⭐ inner_hits 제거 (중복 방지)
             cleaned_filters = [remove_inner_hits(f) for f in filters_os]
@@ -3047,23 +3085,73 @@ async def search_natural_language(
                             "minimum_should_match": 1
                         }
                     })
-            
-            # ⭐⭐⭐ 필터를 OpenSearch 쿼리에서 제거 (Python post-processing으로 이동)
-            # 이유: 비구조화된 설문 데이터는 벡터 검색으로만 찾을 수 있음
-            # Demographics/Behavioral 필터는 RRF 후 Python에서 적용 (3506-3518번 줄)
-            logger.info(f"✅ Demographics 필터를 Python post-processing으로 이동 ({len(should_filters)}개 필터)")
-            logger.info(f"   → OpenSearch는 키워드 검색만 수행, Qdrant는 벡터 검색 수행")
-            logger.info(f"   → RRF 후 Python에서 필터 적용하여 정확도 유지")
 
-            # 키워드 쿼리만 사용 (필터 제거)
-            if existing_query is None or existing_query == {"match_all": {}} or existing_query == {"match_none": {}}:
-                # 키워드가 없으면 match_all
-                final_query['query'] = {"match_all": {}}
-                logger.info(f"   → 키워드 없음: match_all 사용")
+            # ⭐⭐⭐ 필터를 두 그룹으로 분리:
+            # 1) Demographics 필터 (연령, 성별, 직업): Python post-processing
+            # 2) Behavioral 필터 (qa_pairs의 다른 질문): OpenSearch 쿼리에 직접 포함
+            demographic_filters = []
+            behavioral_filters = []
+
+            def is_demographic_filter(f):
+                """Demographics 필터인지 확인 (연령, 성별, 직업)"""
+                # 기존 is_age_or_gender_filter() 또는 is_occupation_filter()와 동일하면 demographic
+                return is_age_or_gender_filter(f) or is_occupation_filter(f)
+
+            for f in should_filters:
+                if is_demographic_filter(f):
+                    demographic_filters.append(f)
+                else:
+                    behavioral_filters.append(f)
+
+            logger.info(f"🔍 필터 분리:")
+            logger.info(f"   - Demographics 필터 (Python post-processing): {len(demographic_filters)}개")
+            logger.info(f"   - Behavioral 필터 (OpenSearch 직접 적용): {len(behavioral_filters)}개")
+
+            # ⭐ should_filters를 demographic_filters로 대체 (Python post-processing용)
+            should_filters = demographic_filters
+
+            # ⭐ Behavioral 필터 존재 여부 (Qdrant 비활성화 판단용)
+            has_behavioral_filters = bool(behavioral_filters)
+
+            # ⭐⭐⭐ Demographics 필터만 Python post-processing으로 이동
+            # 이유: 비구조화된 설문 데이터는 벡터 검색으로만 찾을 수 있음
+            logger.info(f"✅ Demographics 필터를 Python post-processing으로 이동 ({len(demographic_filters)}개 필터)")
+            logger.info(f"   → OpenSearch는 키워드 + Behavioral 검색 수행, Qdrant는 벡터 검색 수행")
+            logger.info(f"   → RRF 후 Python에서 Demographics 필터 적용하여 정확도 유지")
+
+            # ⭐⭐⭐ Behavioral 필터는 OpenSearch 쿼리에 직접 포함
+            # 이유: qa_pairs는 OpenSearch에만 있으므로 직접 검색해야 함
+            if behavioral_filters:
+                logger.info(f"✅ Behavioral 필터를 OpenSearch 쿼리에 직접 포함 ({len(behavioral_filters)}개 필터)")
+
+                # 키워드 쿼리와 Behavioral 필터를 결합
+                if existing_query is None or existing_query == {"match_all": {}} or existing_query == {"match_none": {}}:
+                    # 키워드가 없으면 Behavioral 필터만 사용
+                    final_query['query'] = {
+                        'bool': {
+                            'must': behavioral_filters
+                        }
+                    }
+                    logger.info(f"   → 키워드 없음: Behavioral 필터만 사용")
+                else:
+                    # ⭐ Behavioral 필터는 must (필수), 키워드는 should (점수 부스팅)
+                    # 이유: nested 쿼리 간 충돌 방지 + 키워드로 결과 랭킹 개선
+                    final_query['query'] = {
+                        'bool': {
+                            'must': behavioral_filters,
+                            'should': [existing_query],
+                            'minimum_should_match': 0
+                        }
+                    }
+                    logger.info(f"   → Behavioral 필터 (필수) + 키워드 쿼리 (점수 부스팅)")
             else:
-                # 키워드 쿼리만 사용
-                final_query['query'] = existing_query
-                logger.info(f"   → 키워드 쿼리만 적용")
+                # Behavioral 필터가 없으면 키워드 쿼리만 사용
+                if existing_query is None or existing_query == {"match_all": {}} or existing_query == {"match_none": {}}:
+                    final_query['query'] = {"match_all": {}}
+                    logger.info(f"   → 키워드 없음: match_all 사용")
+                else:
+                    final_query['query'] = existing_query
+                    logger.info(f"   → 키워드 쿼리만 적용")
         
         if 'size' not in final_query:
             final_query['size'] = size
@@ -3140,9 +3228,13 @@ async def search_natural_language(
             )
             keyword_results = os_response['hits']['hits']
             logger.info(f"  ✅ OpenSearch: {len(keyword_results)}건")
-            
+
             # ⭐⭐⭐ Qdrant 벡터 검색 (survey_responses_merged 통합 컬렉션)
-            if request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
+            # Behavioral 필터가 있으면 Qdrant 비활성화 (qa_pairs는 OpenSearch에만 있음)
+            if has_behavioral_filters:
+                logger.info(f"  ⚠️ Behavioral 필터 감지 → Qdrant 비활성화 (OpenSearch만 사용)")
+                logger.info(f"     이유: qa_pairs는 OpenSearch에만 있어서 벡터 검색으로 필터링 불가")
+            elif request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
                 qdrant_client = router.qdrant_client
                 try:
                     # ⭐ survey_responses_merged 통합 컬렉션 사용
