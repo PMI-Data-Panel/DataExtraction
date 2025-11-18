@@ -210,6 +210,24 @@ services:
       retries: 3
       start_period: 40s
 
+  # 6. Nginx 리버스 프록시 (HTTPS - 간편 설정)
+  nginx:
+    container_name: nginx
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    restart: unless-stopped
+    networks:
+      - rag_net
+    depends_on:
+      - fastapi_server
+      - grafana
+      - prometheus
+
 networks:
   rag_net:
     driver: bridge

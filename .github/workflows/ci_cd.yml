@@ -371,6 +371,30 @@ jobs:
               docker compose build --no-cache || docker build -t ${IMAGE_TAG} .
             }
             
+            echo "=== SSL 인증서 생성 (없는 경우) ==="
+            if [ ! -f nginx/ssl/nginx-selfsigned.crt ] || [ ! -f nginx/ssl/nginx-selfsigned.key ]; then
+              echo "SSL 인증서가 없습니다. 생성 중..."
+              mkdir -p nginx/ssl
+              # OpenSSL이 설치되어 있는지 확인
+              if command -v openssl &> /dev/null; then
+                openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                  -keyout nginx/ssl/nginx-selfsigned.key \
+                  -out nginx/ssl/nginx-selfsigned.crt \
+                  -subj "/C=KR/ST=Seoul/L=Seoul/O=DataExtraction/CN=localhost"
+                echo "✅ SSL 인증서 생성 완료"
+              else
+                echo "⚠️ OpenSSL이 설치되어 있지 않습니다. Docker 컨테이너로 생성 시도..."
+                docker run --rm -v $(pwd)/nginx/ssl:/ssl alpine/openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                  -keyout /ssl/nginx-selfsigned.key \
+                  -out /ssl/nginx-selfsigned.crt \
+                  -subj "/C=KR/ST=Seoul/L=Seoul/O=DataExtraction/CN=localhost" || {
+                  echo "❌ SSL 인증서 생성 실패. Nginx는 시작되지 않을 수 있습니다."
+                }
+              fi
+            else
+              echo "✅ SSL 인증서 이미 존재"
+            fi
+            
             echo "=== Docker Compose로 서비스 시작 ==="
             if [ -f docker-compose.yml ]; then
               # 기존 컨테이너 완전히 중지 및 제거
@@ -412,12 +436,23 @@ jobs:
               # 최종 헬스 체크
               if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
                  curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
-                echo "✅ 헬스 체크 성공!"
+                echo "✅ HTTP 헬스 체크 성공!"
               else
-                echo "❌ 헬스 체크 실패"
+                echo "❌ HTTP 헬스 체크 실패"
                 echo "컨테이너 로그:"
                 docker compose logs fastapi_server
-                echo "⚠️ 헬스 체크 실패했지만 배포는 계속 진행합니다."
+                echo "⚠️ HTTP 헬스 체크 실패했지만 배포는 계속 진행합니다."
+              fi
+              
+              # HTTPS 헬스 체크 (Nginx가 실행 중인 경우)
+              echo "=== HTTPS 헬스 체크 ==="
+              sleep 5
+              if curl -k -f -s https://localhost/ > /dev/null 2>&1 || \
+                 curl -k -f -s https://localhost/docs > /dev/null 2>&1; then
+                echo "✅ HTTPS 헬스 체크 성공!"
+              else
+                echo "⚠️ HTTPS 헬스 체크 실패 (Nginx가 아직 시작 중일 수 있음)"
+                docker compose logs nginx | tail -20 || true
               fi
             else
               # Docker Compose가 없는 경우 직접 컨테이너 실행
