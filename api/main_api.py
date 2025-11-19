@@ -104,13 +104,24 @@ def create_app() -> FastAPI:
             verify_certs=config.OPENSEARCH_VERIFY_CERTS,
             ssl_assert_hostname=config.OPENSEARCH_SSL_ASSERT_HOSTNAME,
             ssl_show_warn=False,
-            request_timeout=60  # ⭐ 타임아웃 증가: 배치 조회 대응 (30초 → 60초)
+            request_timeout=180  # ⭐ 타임아웃 증가: 대량 데이터 조회 대응 (60초 → 180초, 전체 데이터 약 35000개)
         )
         os_client = OpenSearch(**common_os_kwargs)
         logger.info("OpenSearch client initialized with settings: %s", common_os_kwargs)
         async_os_client = AsyncOpenSearch(**common_os_kwargs)
         logger.info("AsyncOpenSearch client initialized with settings: %s", common_os_kwargs)
         logger.info("[OK] OpenSearch 클라이언트 초기화 완료 (sync/async)")
+        
+        # ⭐ 인덱스 max_result_window 설정 확인 및 업데이트 (전체 데이터 약 35000개 대응)
+        try:
+            from rag_query_analyzer.utils.opensearch_utils import ensure_max_result_window
+            default_index = config.OPENSEARCH_INDEX if hasattr(config, 'OPENSEARCH_INDEX') else "survey_responses_merged"
+            if os_client.indices.exists(index=default_index):
+                ensure_max_result_window(os_client, default_index, max_result_window=50000)
+            else:
+                logger.warning(f"⚠️ 인덱스 {default_index}가 존재하지 않아 max_result_window 설정을 건너뜁니다.")
+        except Exception as e:
+            logger.warning(f"⚠️ max_result_window 설정 중 오류 발생 (계속 진행): {e}")
 
         # Qdrant 클라이언트 초기화
         logger.info("Qdrant 클라이언트 초기화 중...")
@@ -235,6 +246,60 @@ def create_app() -> FastAPI:
                         logger.info("[OK] Async OpenSearch 연결 성공")
                 except Exception as e:
                     logger.warning(f"[WARNING] Async OpenSearch 연결 실패: {e}")
+
+                # ⭐ Panel 데이터 메모리 프리로드 (초고속 검색을 위한 최적화)
+                try:
+                    logger.info("=" * 60)
+                    logger.info("⚡ Panel 데이터 메모리 프리로드 시작...")
+                    logger.info("=" * 60)
+
+                    from connectors.data_fetcher import DataFetcher
+                    from .search_api import panel_cache
+
+                    data_fetcher = DataFetcher(
+                        opensearch_client=os_client,
+                        qdrant_client=qdrant_client,
+                        async_opensearch_client=async_os_client
+                    )
+
+                    await panel_cache.initialize(data_fetcher, index_name="survey_responses_merged")
+
+                    logger.info("=" * 60)
+                    logger.info("✅ Panel 데이터 프리로드 완료!")
+                    logger.info(f"   - 전체 패널: {panel_cache.total_count:,}명")
+                    logger.info(f"   - 로딩 시간: {panel_cache.load_time:.2f}초")
+                    logger.info(f"   - 이후 검색은 0.05-0.2초 이내 응답 예상")
+                    logger.info("=" * 60)
+                except Exception as e:
+                    logger.error(f"❌ Panel 데이터 프리로드 실패: {e}")
+                    logger.warning("   → 기존 Scroll API 방식으로 작동합니다 (느림)")
+
+                # ⭐ RAG Query Analyzer 사전 로딩 (첫 검색 응답 속도 개선)
+                try:
+                    logger.info("=" * 60)
+                    logger.info("🧠 RAG Query Analyzer 모델 사전 로딩 시작...")
+                    logger.info("=" * 60)
+
+                    from rag_query_analyzer.config import get_config
+                    from rag_query_analyzer.analyzers.main_analyzer import AdvancedRAGQueryAnalyzer
+                    from .search_api import router as search_router
+
+                    # Config 초기화
+                    config = get_config()
+                    search_router.config = config
+
+                    # Analyzer 초기화 (모든 모델 로딩)
+                    analyzer = AdvancedRAGQueryAnalyzer(config)
+                    search_router.analyzer = analyzer
+
+                    logger.info("=" * 60)
+                    logger.info("✅ RAG Query Analyzer 모델 사전 로딩 완료!")
+                    logger.info("   - SemanticModel, QueryRewriter, Reranker 등 모두 로드됨")
+                    logger.info("   - 첫 검색 요청부터 빠른 응답 가능")
+                    logger.info("=" * 60)
+                except Exception as e:
+                    logger.error(f"❌ RAG Query Analyzer 사전 로딩 실패: {e}")
+                    logger.warning("   → 첫 검색 요청 시 초기화됩니다 (약간 느림)")
 
                 logger.info("\n사용 가능한 엔드포인트:")
                 logger.info("   - GET  /                          : API 환영 메시지")

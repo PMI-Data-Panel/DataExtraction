@@ -152,6 +152,13 @@ class ClaudeAnalyzer(BaseAnalyzer):
    - 야근: "야근 많은" → works_overtime
    - 재택근무: "재택근무 하는" → works_remotely
 
+   ⭐ 신규 패턴 (설문 데이터 기반):
+   - 할인/포인트: "할인 중요한", "포인트 적립 관심", "멤버십" → cares_about_rewards
+   - 중고거래: "중고로 판매", "당근마켓 사용" → uses_secondhand_market
+   - 미니멀리스트: "미니멀리스트 성향" → lifestyle_minimalist
+   - 개인정보보호: "개인정보 신경쓰는", "프라이버시 중요" → privacy_conscious
+   - 스트레스해소: "운동으로 해소", "영화 보며 해소" → stress_relief_method
+
    예시:
    - "OTT 이용하는" → behavioral_conditions: {{"ott_user": true}}
    - "흡연자" → behavioral_conditions: {{"smoker": true}}
@@ -210,7 +217,13 @@ JSON 형식:
     "interested_in_cars": true|false|null,
     "uses_parcel_delivery": true|false|null,
     "dines_out": true|false|null,
-    "attends_drinking_gatherings": true|false|null
+    "attends_drinking_gatherings": true|false|null,
+    // ⭐ 신규 패턴
+    "cares_about_rewards": true|false|null,
+    "uses_secondhand_market": true|false|null,
+    "lifestyle_minimalist": true|false|null,
+    "privacy_conscious": true|false|null,
+    "stress_relief_method": true|false|null
     // ⭐ null = 이 조건을 체크하지 않음 (쿼리에서 언급 안됨)
     // ⭐ true/false = 명시적으로 체크해야 함
     // ⭐ 제거된 조건 (설문에 없음): reads_books, streams_music, takes_online_courses, gets_health_checkups, housing_type, has_insurance, uses_credit_card, uses_public_transport, works_overtime, works_remotely

@@ -5,6 +5,7 @@
 """
 import json
 import logging
+import re
 from typing import List, Dict, Any, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
@@ -254,6 +255,15 @@ def _call_llm_for_refinement(
             if parts:
                 first = parts[0]
                 content = getattr(first, "text", "") or ""
+        
+        # ⭐ 줄바꿈 문자 처리: \n\n을 공백으로 치환하여 JSON 응답에서 깔끔하게 표시
+        if content:
+            # 연속된 줄바꿈(\n\n, \n\n\n 등)을 하나의 공백으로 치환
+            content = re.sub(r'\n+', ' ', content)
+            # 연속된 공백을 하나로 정리
+            content = re.sub(r'\s+', ' ', content)
+            # 앞뒤 공백 제거
+            content = content.strip()
         
         return {
             "model": model_name,

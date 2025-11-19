@@ -142,7 +142,7 @@ class DataFetcher:
         index_name: str,
         doc_ids: List[str],
         batch_size: Optional[int] = None,
-        request_timeout: int = 60,
+        request_timeout: int = 180,  # 대량 데이터 조회 대응 (전체 데이터 약 35000개)
         source_fields: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """비동기 문서 일괄 조회 (배치) -> raw docs 리스트 반환"""
@@ -334,6 +334,127 @@ class DataFetcher:
 
         except Exception as e:
             logger.error(f"❌ 스크롤 검색 실패: {e}")
+            raise
+
+    async def scroll_search_async(
+        self,
+        index_name: str,
+        query: Dict[str, Any],
+        batch_size: int = 1000,
+        scroll_time: str = "5m",
+        num_slices: int = 4,
+        source_filter: Optional[Dict[str, Any]] = None,
+        request_timeout: int = 300
+    ) -> List[Dict[str, Any]]:
+        """
+        ⭐ 비동기 병렬 Scroll API (Sliced Scroll)
+
+        35000건 전체 데이터를 빠르게 조회하기 위해 병렬 슬라이스 사용
+
+        Args:
+            index_name: 인덱스 이름
+            query: OpenSearch 쿼리 DSL
+            batch_size: 각 슬라이스의 배치 크기 (기본 1000)
+            scroll_time: 스크롤 유지 시간 (기본 5분)
+            num_slices: 병렬 슬라이스 개수 (기본 4)
+            source_filter: _source 필터링
+            request_timeout: 요청 타임아웃 (초)
+
+        Returns:
+            전체 문서 리스트
+        """
+        if not self.os_async_client:
+            raise ValueError("Async OpenSearch 클라이언트가 초기화되지 않았습니다")
+
+        logger.info(f"🔄 Scroll API 시작: {num_slices}개 슬라이스 병렬 처리")
+
+        async def fetch_slice(slice_id: int) -> List[Dict[str, Any]]:
+            """단일 슬라이스 처리"""
+            slice_results = []
+            scroll_id = None
+
+            try:
+                # 슬라이스 쿼리 생성
+                slice_query = query.copy()
+                if source_filter:
+                    slice_query["_source"] = source_filter
+
+                slice_query["slice"] = {
+                    "id": slice_id,
+                    "max": num_slices
+                }
+
+                # 초기 검색
+                response = await self.os_async_client.search(
+                    index=index_name,
+                    body=slice_query,
+                    scroll=scroll_time,
+                    size=batch_size,
+                    request_timeout=request_timeout
+                )
+
+                scroll_id = response.get('_scroll_id')
+                hits = response.get('hits', {}).get('hits', [])
+                total_in_slice = response.get('hits', {}).get('total', {}).get('value', 0)
+
+                logger.debug(f"  📋 Slice {slice_id}/{num_slices}: 총 {total_in_slice}건 예상")
+
+                # 첫 배치 추가
+                slice_results.extend(hits)
+
+                # 나머지 배치 스크롤
+                batch_count = 1
+                while hits:
+                    response = await self.os_async_client.scroll(
+                        scroll_id=scroll_id,
+                        scroll=scroll_time,
+                        request_timeout=request_timeout
+                    )
+
+                    scroll_id = response.get('_scroll_id')
+                    hits = response.get('hits', {}).get('hits', [])
+
+                    if hits:
+                        slice_results.extend(hits)
+                        batch_count += 1
+
+                logger.info(f"  ✅ Slice {slice_id}/{num_slices}: {len(slice_results)}건 수집 ({batch_count}개 배치)")
+
+                # 스크롤 정리
+                if scroll_id:
+                    try:
+                        await self.os_async_client.clear_scroll(scroll_id=scroll_id)
+                    except Exception as e:
+                        logger.warning(f"  ⚠️ Slice {slice_id} 스크롤 정리 실패: {e}")
+
+                return slice_results
+
+            except Exception as e:
+                logger.error(f"  ❌ Slice {slice_id}/{num_slices} 실패: {e}")
+                # 스크롤 정리 시도
+                if scroll_id:
+                    try:
+                        await self.os_async_client.clear_scroll(scroll_id=scroll_id)
+                    except:
+                        pass
+                raise
+
+        try:
+            # 모든 슬라이스를 병렬로 처리
+            tasks = [fetch_slice(i) for i in range(num_slices)]
+            slice_results = await asyncio.gather(*tasks)
+
+            # 결과 합치기
+            all_hits = []
+            for slice_hits in slice_results:
+                all_hits.extend(slice_hits)
+
+            logger.info(f"✅ Scroll API 완료: 총 {len(all_hits)}건 수집 ({num_slices}개 슬라이스)")
+
+            return all_hits
+
+        except Exception as e:
+            logger.error(f"❌ Scroll API 실패: {e}")
             raise
 
     def aggregate_data(

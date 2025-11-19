@@ -4,14 +4,18 @@ import json
 import logging
 import hashlib
 import re
+import gzip
+import pickle
 from collections import defaultdict, OrderedDict
 from time import perf_counter
 from datetime import datetime, timezone
 from uuid import uuid4
 from typing import List, Dict, Any, Optional, Set, Tuple, Literal
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from opensearchpy import OpenSearch
+import pandas as pd
+import numpy as np
 
 # 분석기 및 쿼리 빌더
 from rag_query_analyzer.analyzers.main_analyzer import AdvancedRAGQueryAnalyzer
@@ -48,13 +52,284 @@ def _mask_user_ids_in_query(query: Dict[str, Any]) -> Dict[str, Any]:
     mask_recursive(masked)
     return masked
 
+
+# ============================================================================
+# ⭐ 전역 메모리 캐시: 서버 시작 시 1번만 로드 (메모리 프리로드 최적화)
+# ============================================================================
+
+class PanelDataCache:
+    """Survey panel 데이터를 메모리에 캐싱 - 초고속 검색을 위한 프리로드"""
+
+    def __init__(self):
+        self.df: pd.DataFrame = None  # Pandas DataFrame (벡터화 필터링용)
+        self.user_map: Dict[str, Dict] = {}  # user_id → full document 매핑
+        self.loaded = False
+        self.load_time = None
+        self.total_count = 0
+
+    async def initialize(self, data_fetcher, index_name="survey_responses_merged"):
+        """서버 시작 시 전체 데이터 로드 (1번만 실행)"""
+        if self.loaded:
+            logger.info("✅ Panel data already loaded")
+            return
+
+        start = perf_counter()
+        logger.info("🔄 Loading all panel data into memory... (메모리 프리로드)")
+
+        # ⭐ Scroll API로 전체 데이터 조회 (필요한 필드만)
+        query = {
+            "query": {"match_all": {}},
+            "_source": {
+                "includes": [
+                    "user_id",
+                    "metadata",   # demographics
+                    "qa_pairs",   # occupation, marital, behavioral
+                    "timestamp",
+                    "text"
+                ],
+                "excludes": []
+            }
+        }
+
+        try:
+            all_docs = await data_fetcher.scroll_search_async(
+                index_name=index_name,
+                query=query,
+                batch_size=2000,
+                scroll_time="5m",
+                num_slices=8,  # 병렬 8개 (빠른 로딩)
+                request_timeout=300,
+            )
+
+            # ⭐⭐⭐ Pandas DataFrame으로 변환 + 모든 조건 사전 추출 (초고속!)
+            logger.info("  📊 Occupation/Marital/Behavioral(33개) 사전 추출 중...")
+            extract_start = perf_counter()
+
+            # ⭐ 모든 behavioral 키 (33개)
+            all_behavioral_keys = [
+                'smoker', 'has_vehicle', 'drinker', 'ott_user', 'has_pet', 'ai_user',
+                'exercises', 'uses_fast_delivery', 'visits_traditional_market', 'has_stress',
+                'travels', 'uses_food_delivery', 'drinks_coffee', 'has_subscription',
+                'uses_social_media', 'plays_games', 'watches_movies_dramas', 'uses_financial_services',
+                'uses_beauty_products', 'shops_fashion', 'interested_in_home_appliances', 'uses_smart_devices',
+                'cares_about_environment', 'does_charity', 'interested_in_cars', 'uses_parcel_delivery',
+                'dines_out', 'attends_drinking_gatherings', 'cares_about_rewards', 'uses_secondhand_market',
+                'lifestyle_minimalist', 'privacy_conscious', 'stress_relief_method'
+            ]
+
+            records = []
+            for idx, doc in enumerate(all_docs):
+                if idx % 5000 == 0 and idx > 0:
+                    logger.info(f"    진행: {idx}/{len(all_docs)}...")
+
+                source = doc.get('_source', {})
+                metadata = source.get('metadata', {}) if isinstance(source.get('metadata'), dict) else {}
+                qa_pairs = source.get('qa_pairs', []) if isinstance(source.get('qa_pairs'), list) else []
+
+                # ⭐ Occupation 사전 추출
+                occupation_value = None
+
+                # 🔍 디버그: 첫 3개 문서의 qa_pairs 구조 확인
+                if idx < 3:
+                    logger.info(f"\n🔍 [DEBUG] Document #{idx}: user_id={source.get('user_id')}")
+                    logger.info(f"   - qa_pairs type: {type(qa_pairs)}")
+                    logger.info(f"   - qa_pairs count: {len(qa_pairs)}")
+                    if qa_pairs and len(qa_pairs) > 0:
+                        logger.info(f"   - First QA pair structure: {qa_pairs[0]}")
+                        logger.info(f"   - QA pair keys: {qa_pairs[0].keys() if isinstance(qa_pairs[0], dict) else 'NOT A DICT'}")
+                        # 처음 5개 질문 출력
+                        for i, qa in enumerate(qa_pairs[:5]):
+                            if isinstance(qa, dict):
+                                # ⭐ 수정: 실제 키는 'q_text'
+                                q_text_raw = qa.get("q_text", "") or qa.get("question", "") or qa.get("question_text", "") or ""
+                                logger.info(f"   - Q{i+1}: '{q_text_raw[:100]}'")  # 처음 100자만
+
+                if qa_pairs:
+                    for qa in qa_pairs:
+                        if not isinstance(qa, dict):
+                            continue
+                        # ⭐ 수정: 실제 키는 'q_text'
+                        q_text = str(qa.get("q_text", "") or qa.get("question", "") or qa.get("question_text", "")).lower()
+                        if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
+                            answer = qa.get("answer") or qa.get("answer_text")
+                            if answer:
+                                occupation_value = str(answer).strip()
+                                if idx < 3:
+                                    logger.info(f"   ✅ Found occupation: '{occupation_value}' from q_text: '{q_text[:50]}'")
+                                break
+
+                    # 디버그: 첫 3개 문서에서 occupation 찾지 못한 경우
+                    if idx < 3 and occupation_value is None:
+                        logger.info(f"   ❌ No occupation found in {len(qa_pairs)} QA pairs")
+
+                # ⭐ Marital status 사전 추출
+                marital_value = metadata.get("marital_status")
+                if not marital_value and qa_pairs:
+                    for qa in qa_pairs:
+                        if not isinstance(qa, dict):
+                            continue
+                        # ⭐ 수정: 실제 키는 'q_text'
+                        q_text = str(qa.get("q_text", "") or qa.get("question", "") or qa.get("question_text", "")).lower()
+                        if any(keyword in q_text for keyword in ("결혼", "혼인", "marital")):
+                            answer = qa.get("answer") or qa.get("answer_text")
+                            if answer:
+                                marital_value = str(answer).strip()
+                                break
+
+                # ⭐⭐⭐ 모든 Behavioral 조건 사전 추출 (33개)
+                behavioral_values = {}
+                for behavior_key in all_behavioral_keys:
+                    # extract_behavior_from_qa_pairs 함수 호출 (기존 로직 재사용)
+                    behavioral_values[behavior_key] = extract_behavior_from_qa_pairs(
+                        qa_pairs, behavior_key, debug=False
+                    )
+
+                # DataFrame 레코드 생성
+                record = {
+                    'user_id': source.get('user_id'),
+                    'gender': metadata.get('gender'),
+                    'age_group': metadata.get('age_group'),
+                    'birth_year': metadata.get('birth_year'),
+                    'region': metadata.get('region'),
+                    'sub_region': metadata.get('sub_region'),
+                    'occupation': occupation_value,  # ⭐ 사전 추출!
+                    'marital_status': marital_value,  # ⭐ 사전 추출!
+                    'timestamp': source.get('timestamp'),
+                    # ⭐ 전체 데이터 보관 (필요 시 접근)
+                    '_full_source': source,
+                    '_doc': doc,
+                }
+
+                # ⭐⭐⭐ Behavioral 컬럼 추가 (33개)
+                record.update(behavioral_values)
+
+                records.append(record)
+
+                # user_id → full document 매핑 (빠른 조회용)
+                if source.get('user_id'):
+                    self.user_map[source['user_id']] = doc
+
+            extract_duration = perf_counter() - extract_start
+            logger.info(f"  ✅ Occupation/Marital/Behavioral(33개) 추출 완료: {extract_duration:.2f}초")
+
+            self.df = pd.DataFrame(records)
+            self.total_count = len(self.df)
+            self.loaded = True
+            self.load_time = perf_counter() - start
+
+            memory_mb = self.df.memory_usage(deep=True).sum() / 1024**2
+            logger.info(f"✅ Panel data loaded: {self.total_count}건, {self.load_time:.2f}초")
+            logger.info(f"   메모리 사용: {memory_mb:.2f} MB")
+            logger.info(f"   컬럼: {list(self.df.columns)}")
+
+            # ⭐ Occupation 통계 (디버깅용)
+            occupation_stats = self.df['occupation'].value_counts()
+            logger.info(f"\n📊 Occupation 통계:")
+            logger.info(f"   - Total: {self.total_count}건")
+            logger.info(f"   - None: {self.df['occupation'].isna().sum()}건")
+            logger.info(f"   - 고유값: {occupation_stats.nunique()}개")
+            logger.info(f"   - 상위 20개:")
+            for occ, count in occupation_stats.head(20).items():
+                if occ:
+                    logger.info(f"      * {occ}: {count}건")
+
+            # ⭐ "학생" 관련 occupation
+            student_mask = self.df['occupation'].str.contains('학생', na=False, case=False)
+            student_count = student_mask.sum()
+            logger.info(f"\n   - '학생' 포함: {student_count}건")
+            if student_count > 0:
+                student_occupations = self.df[student_mask]['occupation'].value_counts()
+                for occ, count in student_occupations.items():
+                    logger.info(f"      * {occ}: {count}건")
+
+        except Exception as e:
+            logger.error(f"❌ Panel data 로드 실패: {e}")
+            raise
+
+    def filter_all(
+        self,
+        gender: Optional[str] = None,
+        age_group: Optional[str] = None,
+        region: Optional[str] = None,
+        sub_region: Optional[str] = None,
+        occupation: Optional[str] = None,
+        marital_status: Optional[str] = None,
+        behavioral_conditions: Optional[Dict[str, bool]] = None,
+    ) -> pd.DataFrame:
+        """⚡ Pandas 벡터화 필터링 (초고속 - metadata + occupation + marital + behavioral 전부!)
+
+        Args:
+            gender, age_group, region, sub_region: Demographics 필터
+            occupation: 직업 필터 (부분 매칭)
+            marital_status: 결혼 여부 필터
+            behavioral_conditions: Behavioral 필터 (예: {'smoker': True, 'has_vehicle': False})
+
+        Returns:
+            필터링된 DataFrame
+        """
+        if not self.loaded:
+            raise RuntimeError("Panel data not loaded")
+
+        mask = pd.Series([True] * len(self.df))
+
+        # ⭐ Demographics 필터 (metadata)
+        if gender:
+            mask &= (self.df['gender'] == gender)
+
+        if age_group:
+            mask &= (self.df['age_group'] == age_group)
+
+        if region:
+            mask &= (self.df['region'] == region)
+
+        if sub_region:
+            mask &= (self.df['sub_region'] == sub_region)
+
+        # ⭐ Occupation 필터 (부분 매칭)
+        if occupation:
+            # "영업직" → "영업" 포함 확인
+            keyword = occupation.replace('직', '')
+            if keyword:
+                mask &= self.df['occupation'].notna() & self.df['occupation'].str.contains(
+                    keyword, case=False, na=False, regex=False
+                )
+
+        # ⭐ Marital status 필터
+        if marital_status:
+            mask &= (self.df['marital_status'] == marital_status)
+
+        # ⭐⭐⭐ Behavioral 필터 (33개 조건)
+        if behavioral_conditions:
+            for behavior_key, expected_value in behavioral_conditions.items():
+                if expected_value is None:
+                    continue  # None은 체크 안함
+
+                if behavior_key in self.df.columns:
+                    # True/False 체크 (벡터화!)
+                    mask &= (self.df[behavior_key] == expected_value)
+
+        return self.df[mask]
+
+    def get_user_docs(self, user_ids: List[str]) -> List[Dict]:
+        """user_id 리스트로 전체 문서 가져오기"""
+        return [self.user_map[uid] for uid in user_ids if uid in self.user_map]
+
+    def get_all_user_ids(self) -> List[str]:
+        """모든 user_id 리스트 반환"""
+        return self.df['user_id'].tolist() if self.loaded else []
+
+
+# ⭐ 전역 캐시 인스턴스
+panel_cache = PanelDataCache()
+
+
 router = APIRouter(
     prefix="/search",
     tags=["Search"]
 )
 
 # OpenSearch 요청 타임아웃 (복잡한 쿼리나 대용량 검색을 위해 30초로 설정)
-DEFAULT_OS_TIMEOUT = 30
+DEFAULT_OS_TIMEOUT = 180  # 대량 데이터 조회 대응 (전체 데이터 약 35000개)
 
 # 런타임 공유 객체 (한 번만 초기화 후 재사용)
 router.analyzer = None  # type: ignore[attr-defined]
@@ -1754,6 +2029,79 @@ REMOTE_WORK_NEGATIVE_KEYWORDS = {
     "재택근무 없음", "전체 출근", "불가능"
 }
 
+# ============================================================================
+# ⭐ 신규 Behavioral 패턴 (설문 데이터 기반)
+# ============================================================================
+
+# 36. 할인/포인트 민감도 (실제 질문: "소비 시 고려하는 요인")
+REWARDS_QUESTION_KEYWORDS = {
+    "소비 시 고려하는 요인", "고려하는 요인", "소비", "구매", "선택 기준"
+}
+REWARDS_POSITIVE_KEYWORDS = {
+    "할인", "캐시백", "멤버십", "포인트", "적립", "리워드", "혜택", "쿠폰"
+}
+REWARDS_NEGATIVE_KEYWORDS = {
+    # 다른 선택지에는 있지만 할인/포인트와 무관한 답변
+    "브랜드", "디자인", "품질", "편의성", "추천"
+}
+
+# 37. 중고거래 사용 (실제 질문: "버리기 아까운 물건")
+SECONDHAND_MARKET_QUESTION_KEYWORDS = {
+    "버리기 아까운", "아까운 물건", "물건", "처리", "중고"
+}
+SECONDHAND_MARKET_POSITIVE_KEYWORDS = {
+    "중고로 판매", "중고 판매", "중고거래", "중고", "판매", "당근마켓", "번개장터"
+}
+SECONDHAND_MARKET_NEGATIVE_KEYWORDS = {
+    "버린다", "폐기", "기부", "보관", "선물"
+}
+
+# 38. 미니멀리스트 성향 (실제 질문: "미니멀리스트와 맥시멀리스트")
+MINIMALIST_QUESTION_KEYWORDS = {
+    "미니멀리스트", "맥시멀리스트", "라이프스타일", "생활방식", "성향"
+}
+MINIMALIST_POSITIVE_KEYWORDS = {
+    "미니멀리스트", "미니멀", "심플", "단순", "최소"
+}
+MINIMALIST_NEGATIVE_KEYWORDS = {
+    "맥시멀리스트", "맥시멀", "많은", "다양"
+}
+
+# 39. 개인정보보호 의식 (실제 질문: "개인정보보호")
+PRIVACY_QUESTION_KEYWORDS = {
+    "개인정보", "개인정보보호", "프라이버시", "privacy", "정보보호", "개인 정보"
+}
+PRIVACY_POSITIVE_KEYWORDS = {
+    "매우 중요", "중요", "신경", "보호", "민감"
+}
+PRIVACY_NEGATIVE_KEYWORDS = {
+    "중요하지 않", "신경 안", "별로", "무관심"
+}
+
+# 40. 스트레스 해소 방법 (실제 질문: "스트레스를 해소하는 방법")
+STRESS_RELIEF_QUESTION_KEYWORDS = {
+    "스트레스", "스트레스 해소", "해소", "해소 방법", "스트레스를 해소"
+}
+# 스트레스 해소 방법은 다양하므로 카테고리별로 분류
+STRESS_RELIEF_ACTIVE_KEYWORDS = {
+    "운동", "산책", "등산", "요가", "헬스", "러닝", "조깅", "수영"
+}
+STRESS_RELIEF_ENTERTAINMENT_KEYWORDS = {
+    "영화", "드라마", "게임", "음악", "독서", "책", "유튜브", "넷플릭스"
+}
+STRESS_RELIEF_SOCIAL_KEYWORDS = {
+    "친구", "가족", "대화", "수다", "술", "술자리", "모임"
+}
+STRESS_RELIEF_RELAXATION_KEYWORDS = {
+    "수면", "잠", "휴식", "명상", "힐링", "여행", "온천", "마사지"
+}
+STRESS_RELIEF_SHOPPING_KEYWORDS = {
+    "쇼핑", "소비", "구매", "장보기"
+}
+STRESS_RELIEF_NEGATIVE_KEYWORDS = {
+    "스트레스 없음", "해소 안함", "특별한 방법 없음"
+}
+
 # ⭐ 범용 Behavioral 키워드 매핑 (확장 가능)
 BEHAVIORAL_KEYWORD_MAP = {
     'smoker': {
@@ -1895,6 +2243,39 @@ BEHAVIORAL_KEYWORD_MAP = {
         'question_keywords': DRINKING_GATHERING_QUESTION_KEYWORDS,
         'positive_keywords': DRINKING_GATHERING_POSITIVE_KEYWORDS,
         'negative_keywords': DRINKING_GATHERING_NEGATIVE_KEYWORDS
+    },
+    # ⭐ 신규 Behavioral 패턴 (설문 데이터 분석 기반)
+    'cares_about_rewards': {
+        'question_keywords': REWARDS_QUESTION_KEYWORDS,
+        'positive_keywords': REWARDS_POSITIVE_KEYWORDS,
+        'negative_keywords': REWARDS_NEGATIVE_KEYWORDS
+    },
+    'uses_secondhand_market': {
+        'question_keywords': SECONDHAND_MARKET_QUESTION_KEYWORDS,
+        'positive_keywords': SECONDHAND_MARKET_POSITIVE_KEYWORDS,
+        'negative_keywords': SECONDHAND_MARKET_NEGATIVE_KEYWORDS
+    },
+    'lifestyle_minimalist': {
+        'question_keywords': MINIMALIST_QUESTION_KEYWORDS,
+        'positive_keywords': MINIMALIST_POSITIVE_KEYWORDS,
+        'negative_keywords': MINIMALIST_NEGATIVE_KEYWORDS
+    },
+    'privacy_conscious': {
+        'question_keywords': PRIVACY_QUESTION_KEYWORDS,
+        'positive_keywords': PRIVACY_POSITIVE_KEYWORDS,
+        'negative_keywords': PRIVACY_NEGATIVE_KEYWORDS
+    },
+    'stress_relief_method': {
+        'question_keywords': STRESS_RELIEF_QUESTION_KEYWORDS,
+        # stress_relief_method는 특별 처리 필요 (카테고리별 분류)
+        'positive_keywords': (
+            STRESS_RELIEF_ACTIVE_KEYWORDS |
+            STRESS_RELIEF_ENTERTAINMENT_KEYWORDS |
+            STRESS_RELIEF_SOCIAL_KEYWORDS |
+            STRESS_RELIEF_RELAXATION_KEYWORDS |
+            STRESS_RELIEF_SHOPPING_KEYWORDS
+        ),
+        'negative_keywords': STRESS_RELIEF_NEGATIVE_KEYWORDS
     }
 }
 
@@ -2446,7 +2827,7 @@ class NLSearchRequest(BaseModel):
         default="survey_responses_merged",
         description="검색할 인덱스 이름 (기본값: survey_responses_merged; 와일드카드 사용 가능)"
     )
-    size: int = Field(default=10, ge=1, le=5000, description="반환할 결과 개수 (쿼리에서 추출된 인원 수가 없을 때 사용)")
+    size: int = Field(default=10, ge=1, le=50000, description="반환할 결과 개수 (쿼리에서 추출된 인원 수가 없을 때 사용, 전체 데이터 약 35000개)")
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
     page: int = Field(default=1, ge=1, description="요청할 페이지 번호 (1부터 시작)")
     use_claude_analyzer: Optional[bool] = Field(
@@ -2576,9 +2957,102 @@ def convert_to_simple_response(
         )
 
 
+# ============================================
+# ⭐ 압축 저장/로드 함수 (Redis 캐시 최적화)
+# ============================================
+
+def save_search_cache_compressed(
+    cache_key: str,
+    cache_ttl: int,
+    # ⭐ cache_payload 대신 개별 파라미터로 받기 (백그라운드에서 딕셔너리 생성)
+    total_hits: int,
+    max_score: float,
+    stored_items: List[Dict],
+    page_size: int,
+    filters_for_response: Dict,
+    extracted_entities_dict: Dict,
+    behavioral_conditions: Dict,
+    use_claude: bool,
+    requested_count: int,
+):
+    """압축해서 Redis 저장 (백그라운드 실행)"""
+    try:
+        cache_client = getattr(router, "redis_client", None)
+        if not cache_client:
+            return
+
+        start = perf_counter()
+
+        # ⭐ 백그라운드에서 cache_payload 생성 (메인 스레드 지연 제거!)
+        logger.info(f"🔧 [Background] cache_payload 생성 시작 (items: {len(stored_items)}개)")
+        payload_start = perf_counter()
+
+        cache_payload = {
+            "total_hits": total_hits,
+            "max_score": max_score,
+            "items": stored_items,
+            "page_size": page_size,
+            "filters": filters_for_response,
+            "extracted_entities": extracted_entities_dict,
+            "behavioral_conditions": behavioral_conditions,
+            "use_claude": use_claude,
+            "requested_count": requested_count,
+        }
+
+        payload_duration_ms = (perf_counter() - payload_start) * 1000
+        logger.info(f"✅ [Background] cache_payload 생성 완료 ({payload_duration_ms:.2f}ms)")
+
+        # pickle + gzip (compresslevel=6: 속도와 압축률 균형)
+        serialized = pickle.dumps(cache_payload, protocol=pickle.HIGHEST_PROTOCOL)
+        compressed = gzip.compress(serialized, compresslevel=6)
+
+        cache_client.setex(cache_key, cache_ttl, compressed)
+
+        duration_ms = (perf_counter() - start) * 1000
+        original_size_mb = len(serialized) / 1024**2
+        compressed_size_mb = len(compressed) / 1024**2
+        ratio = (1 - compressed_size_mb / original_size_mb) * 100 if original_size_mb > 0 else 0
+
+        logger.info(
+            f"💾 [Background] Redis 압축 저장: "
+            f"{compressed_size_mb:.2f}MB (원본: {original_size_mb:.2f}MB, 압축률: {ratio:.1f}%), "
+            f"{duration_ms:.2f}ms"
+        )
+
+    except Exception as e:
+        logger.warning(f"⚠️ [Background] Redis 저장 실패: {e}")
+
+
+def load_search_cache_compressed(cache_key: str) -> Optional[Dict[str, Any]]:
+    """압축된 캐시 로드"""
+    try:
+        cache_client = getattr(router, "redis_client", None)
+        if not cache_client:
+            return None
+
+        start = perf_counter()
+
+        compressed = cache_client.get(cache_key)
+        if not compressed:
+            return None
+
+        serialized = gzip.decompress(compressed)
+        payload = pickle.loads(serialized)
+
+        duration_ms = (perf_counter() - start) * 1000
+        logger.info(f"🔁 Redis 압축 캐시 히트: {len(compressed)/1024**2:.2f}MB, {duration_ms:.2f}ms")
+
+        return payload
+
+    except Exception as e:
+        logger.warning(f"⚠️ Redis 압축 로드 실패: {e}")
+        return None
+
+
 @router.post("/nl", response_model=SearchResponse, summary="자연어 쿼리: 자동 추출+검색")
 async def search_natural_language(
     request: NLSearchRequest,
+    background_tasks: BackgroundTasks,  # ⭐ 백그라운드 작업 추가
     os_client: OpenSearch = Depends(lambda: router.os_client),
 ):
     """
@@ -2709,10 +3183,10 @@ async def search_natural_language(
 
         # ⭐ page_size 결정: 쿼리에서 추출된 requested_size가 있으면 우선 사용, 없으면 request.size 사용
         if requested_size is not None and requested_size > 0:
-            page_size = max(1, min(requested_size, 5000))
+            page_size = max(1, min(requested_size, 50000))  # 전체 데이터 약 35000개를 고려하여 증가
         else:
             # 쿼리에서 인원 수를 추출하지 못한 경우, request.size 사용 (기본값 10)
-            page_size = max(1, min(getattr(request, "size", 10), 5000))
+            page_size = max(1, min(getattr(request, "size", 10), 50000))  # 전체 데이터 약 35000개를 고려하여 증가
         page = max(1, request.page)
         requested_window = page_size * page
         cache_client = getattr(router, "redis_client", None)
@@ -2720,11 +3194,13 @@ async def search_natural_language(
         cache_limit = getattr(router, "cache_max_results", requested_window)
         cache_prefix = getattr(router, "cache_prefix", "search:results")
         cache_enabled = bool(cache_client) and cache_ttl > 0
-        min_window_size = 2000
+        # ⭐ window_size: 내부 검색/필터링용 (충분한 후보 확보)
+        # page_size: 사용자에게 반환할 최종 결과 개수
+        min_window_size = 10000  # 전체 데이터 약 35000개를 고려하여 증가 (내부 처리용)
         window_size = max(requested_window, min_window_size)
         if cache_limit and cache_limit > 0:
             window_size = min(window_size, cache_limit)
-        size = window_size
+        size = window_size  # 내부 검색 크기 (응답 크기와 분리)
         cache_key = None
         cache_hit = False
 
@@ -2750,11 +3226,10 @@ async def search_natural_language(
                     filters_signature=filters_signature,
                     behavior_signature=behavior_signature,
                 )
-                cached_raw = cache_client.get(cache_key)
-                if cached_raw:
-                    cache_payload = json.loads(cached_raw)
+                # ⭐ 압축 캐시 로드
+                cache_payload = load_search_cache_compressed(cache_key)
+                if cache_payload:
                     cache_hit = True
-                    logger.info(f"🔁 Redis 검색 캐시 히트: key={cache_key}")
                     extracted_entities_dict = cache_payload.get("extracted_entities")
                     if extracted_entities_dict is None:
                         extracted_entities_dict = extracted_entities.to_dict()
@@ -2777,64 +3252,15 @@ async def search_natural_language(
                 logger.warning(f"⚠️ Redis 검색 캐시 조회 실패: {cache_exc}")
                 cache_key = None
                 cache_enabled = False
-        
-        age_gender_filters = [f for f in filters if is_age_or_gender_filter(f)]
-        occupation_filters = [f for f in filters if is_occupation_filter(f)]
-        other_filters = [f for f in filters if f not in age_gender_filters and f not in occupation_filters]
 
-        # ⭐ occupation_filters도 포함시키기 (이전에는 two-phase search에만 사용됨)
-        filters_os = age_gender_filters + occupation_filters + other_filters
-        filters = filters_os  # 유지보수: 기존 로직과 호환성을 위해
+        # ⭐ 단순화: 필터 분류 없이 모두 사용
         has_demographic_filters = bool(filters_for_response)
         has_behavioral_conditions = bool(
             analysis.behavioral_conditions and
             any(v is not None for v in analysis.behavioral_conditions.values())
         )
-        occupation_filter_handled = False
 
-        logger.info("🔍 필터 상태 체크:")
-        logger.info(f"  - age_gender_filters: {len(age_gender_filters)}개")
-        logger.debug(f"  - occupation_filters: {len(occupation_filters)}개")
-        logger.debug(f"  - other_filters: {len(other_filters)}개")
-        logger.debug(f"  - filters_os (합계): {len(filters_os)}개")
-        if occupation_filters:
-            masked_occ_filter = _mask_user_ids_in_query(occupation_filters[0] if occupation_filters else {})
-            logger.debug(f"  - occupation_filters 샘플: {json.dumps(masked_occ_filter, ensure_ascii=False)[:500]}")
-
-        two_phase_applicable = bool(age_gender_filters and occupation_filters)
-        two_phase_response: Optional[SearchResponse] = None
-        if two_phase_applicable:
-            logger.info("✅ 2단계 검색 조건 충족 – 두 단계 검색 시도")
-
-            try:
-                response = await run_two_phase_demographic_search(
-                    request=request,
-                    analysis=analysis,
-                    extracted_entities=extracted_entities,
-                    filters=filters_for_response,
-                    size=size,
-                    age_gender_filters=age_gender_filters,
-                    occupation_filters=occupation_filters,
-                    data_fetcher=data_fetcher,
-                    timings=timings,
-                    overall_start=overall_start,
-                )
-
-                if response is not None:
-                    two_phase_response = response
-                    logger.info("✅ 2단계 검색 성공! 결과 반환")
-                    logger.info(f"🔵 /search/nl 요청 완료: 결과 {len(response.results)}건, took_ms={response.took_ms}")
-            except Exception as e:
-                logger.warning(f"⚠️ 2단계 검색 중 오류: {e}, 기본 파이프라인으로 진행")
-
-        if two_phase_response is not None:
-            return _finalize_search_response(
-                request=request,
-                response=two_phase_response,
-                analysis=analysis,
-                cache_hit=cache_hit,
-                timings=two_phase_response.query_analysis.get("timings_ms") if two_phase_response.query_analysis else timings,
-            )
+        logger.info(f"🔍 필터 상태: {len(filters)}개 (Demographics + Behavioral)")
 
         # 2) 쿼리 빌드
         # ⭐ 키워드 정제는 analyzer에서 이미 완료되었으므로 그대로 사용
@@ -2973,9 +3399,9 @@ async def search_natural_language(
         # ⭐ Behavioral 필터 존재 여부 초기화 (기본값: False)
         has_behavioral_filters = False
 
-        if filters_os:
+        if filters:
             # ⭐ inner_hits 제거 (중복 방지)
-            cleaned_filters = [remove_inner_hits(f) for f in filters_os]
+            cleaned_filters = [remove_inner_hits(f) for f in filters]
             
             filter_by_type = {}
             for f in cleaned_filters:
@@ -3097,14 +3523,19 @@ async def search_natural_language(
             logger.info(f"🔍 필터 분류 시작: should_filters={len(should_filters)}개")
 
             def is_demographic_filter(f):
-                """Demographics 필터인지 확인 (연령, 성별, 직업, 지역, 결혼여부)"""
-                # 기존 함수들로 체크
-                if is_age_or_gender_filter(f) or is_occupation_filter(f):
-                    return True
+                """Demographics 필터인지 확인 (연령, 성별, 지역, 직업 등 - Python post-processing 가능)
 
-                # ⭐ REGION, MARITAL_STATUS 등 추가 demographics 체크
-                demo_keywords = ['연령', '나이', '성별', '직업', '직무',
-                               '지역', '거주', '주소', 'region', '결혼', '혼인', '배우자']
+                ⭐ OCCUPATION도 포함!
+                - OCCUPATION 필터는 metadata OR qa_pairs 구조로 생성됨
+                - Python post-processing에서 qa_pairs를 확인하여 정확한 필터링 수행
+                - extract_from_qa_pairs_once() 함수가 occupation을 qa_pairs에서 추출함
+                """
+                # ⭐ 모든 Demographics 체크 (OCCUPATION 포함!)
+                # OCCUPATION도 Python post-processing에서 qa_pairs를 확인함
+                demo_keywords = ['연령', '나이', '성별',
+                               '지역', '거주', '주소', 'region',
+                               '결혼', '혼인', '배우자',
+                               '직업', '직무', 'occupation', '직종']  # ⭐ OCCUPATION 키워드 추가!
 
                 # Case 1: 필터에 nested가 직접 있는 경우
                 if 'nested' in f and 'path' in f['nested'] and f['nested']['path'] == 'qa_pairs':
@@ -3202,9 +3633,9 @@ async def search_natural_language(
         if 'size' not in final_query:
             final_query['size'] = size
 
-        if filters_os:
-            logger.debug(f"🔍 적용된 필터 ({len(filters_os)}개):")
-            for i, f in enumerate(filters_os, 1):
+        if filters:
+            logger.debug(f"🔍 적용된 필터 ({len(filters)}개):")
+            for i, f in enumerate(filters, 1):
                 masked_filter = _mask_user_ids_in_query(f)
                 logger.debug(f"  필터 {i}: {json.dumps(masked_filter, ensure_ascii=False, indent=2)}")
             logger.debug(f"🔍 최종 쿼리 구조:")
@@ -3216,7 +3647,7 @@ async def search_natural_language(
             logger.debug(f"  {json.dumps(masked_final_query, ensure_ascii=False, indent=2)}")
 
         # ⭐ Qdrant top-N 제한: 필터 유무에 따라 분기
-        has_filters = bool(filters_os or occupation_filters)
+        has_filters = bool(filters)
         rrf_k_used: Optional[int] = None
         rrf_reason: str = ""
         adaptive_threshold: Optional[float] = None
@@ -3226,14 +3657,15 @@ async def search_natural_language(
         # ⭐⭐⭐ 검색 크기 증가: Python post-filtering을 위해 충분한 후보 확보
         # Demographics/Behavioral 필터를 OpenSearch 쿼리에서 제거했으므로 더 많은 후보 필요
         if has_filters or has_behavioral:
-            # Behavioral/Demographics 필터가 있으면 더 많은 후보 필요
-            qdrant_limit = min(max(size * 10, 1000), 5000)   # 기본 1000개
-            search_size = min(max(size * 20, 1000), 10000)   # 기본 1000개
+            # Behavioral/Demographics 필터가 있으면 전체 데이터 대상으로 검색
+            # ⭐ 전체 데이터: 35000건 → 충분한 결과를 위해 35000건 조회
+            qdrant_limit = min(max(size * 10, 5000), 10000)   # Qdrant는 10000개로 제한 (성능)
+            search_size = min(max(size * 20, 35000), 50000)   # ⭐ 최소 35000건, 최대 50000건
             logger.info(f"🔍 필터 있음 (Python post-processing): OpenSearch size={search_size}, Qdrant limit={qdrant_limit}")
         else:
             # 필터가 없어도 벡터 검색을 위해 충분한 후보 확보
-            qdrant_limit = min(max(size * 5, 500), 5000)     # 기본 500개
-            search_size = min(max(size * 10, 500), 10000)    # 기본 500개
+            qdrant_limit = min(max(size * 5, 500), 50000)     # 기본 500개, 최대 50000개 (전체 데이터 약 35000개)
+            search_size = min(max(size * 10, 500), 50000)    # 기본 500개, 최대 50000개 (전체 데이터 약 35000개)
             logger.info(f"🔍 필터 없음: OpenSearch size={search_size}, Qdrant limit={qdrant_limit}")
 
         # 4) 실행: 하이브리드 (OpenSearch + 선택적 Qdrant) with RRF
@@ -3254,26 +3686,59 @@ async def search_natural_language(
         vector_results: List[Dict[str, Any]] = []
         
         try:
-            # OpenSearch 키워드 검색
+            # ⭐⭐⭐ OpenSearch Scroll API 사용 (전체 데이터 조회)
             query_body = final_query.copy()
             if not isinstance(query_body.get('query'), dict):
                 logger.warning("  ⚠️ 쿼리가 비어 있어 match_all로 대체합니다")
                 query_body['query'] = {"match_all": {}}
 
             # 🔍 OpenSearch 쿼리 로깅 (디버깅용) - DEBUG 레벨로 축소, user_id 마스킹
-            logger.debug(f"🔍 OpenSearch 쿼리:")
+            logger.debug(f"🔍 OpenSearch Scroll 쿼리:")
             masked_query_body = _mask_user_ids_in_query(query_body)
             logger.debug(json.dumps(masked_query_body, ensure_ascii=False, indent=2))
 
-            os_response = data_fetcher.search_opensearch(
-                index_name=request.index_name,
-                query=query_body,
-                size=search_size,
-                source_filter=source_filter,
-                request_timeout=DEFAULT_OS_TIMEOUT,
-            )
-            keyword_results = os_response['hits']['hits']
-            logger.info(f"  ✅ OpenSearch: {len(keyword_results)}건")
+            # ⭐⭐⭐ 메모리 캐시 사용 (초고속!) vs Scroll API (느림)
+            opensearch_start = perf_counter()
+
+            if panel_cache.loaded:
+                # ⭐ 메모리 캐시에서 즉시 조회 (0.01초 이하!)
+                logger.info("  ⚡ 메모리 캐시 사용: panel_cache에서 전체 데이터 조회")
+
+                # 전체 데이터 가져오기 (이미 메모리에 로드됨)
+                all_user_ids = panel_cache.get_all_user_ids()
+
+                # OpenSearch 형식으로 변환 (기존 코드와 호환성 유지)
+                keyword_results = []
+                for user_id in all_user_ids:
+                    doc = panel_cache.user_map.get(user_id)
+                    if doc:
+                        keyword_results.append(doc)
+
+                opensearch_duration_ms = (perf_counter() - opensearch_start) * 1000
+                timings['memory_cache_ms'] = opensearch_duration_ms
+
+                opensearch_total_hits = len(keyword_results)
+                logger.info(f"  ✅ 메모리 캐시: {len(keyword_results)}건 ({opensearch_duration_ms:.2f}ms) 🚀")
+
+            else:
+                # ⭐ Fallback: Scroll API (메모리 캐시 없을 때)
+                logger.warning("  ⚠️ 메모리 캐시 미사용 → Scroll API 사용 (느림)")
+
+                scroll_hits = await data_fetcher.scroll_search_async(
+                    index_name=request.index_name,
+                    query=query_body,
+                    batch_size=1000,
+                    scroll_time="5m",
+                    num_slices=8,  # ⭐ 8개로 증가 (병렬성 향상)
+                    source_filter=source_filter,
+                    request_timeout=300,
+                )
+                opensearch_duration_ms = (perf_counter() - opensearch_start) * 1000
+                timings['opensearch_scroll_ms'] = opensearch_duration_ms
+
+                keyword_results = scroll_hits
+                opensearch_total_hits = len(keyword_results)
+                logger.info(f"  ✅ OpenSearch Scroll: {len(keyword_results)}건 ({opensearch_duration_ms:.2f}ms)")
 
             # ⭐⭐⭐ Qdrant 벡터 검색 (survey_responses_merged 통합 컬렉션)
             # Behavioral 필터가 있으면 Qdrant 비활성화 (qa_pairs는 OpenSearch에만 있음)
@@ -3283,7 +3748,8 @@ async def search_natural_language(
             elif request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
                 qdrant_client = router.qdrant_client
                 try:
-                    # ⭐ survey_responses_merged 통합 컬렉션 사용
+                    # ⭐ survey_responses_merged 통합 컬렉션 사용 - 시간 측정 시작
+                    qdrant_start = perf_counter()
                     collection_name = request.index_name  # survey_responses_merged
                     logger.info(f"  🔍 Qdrant 컬렉션: {collection_name} (통합 컬렉션)")
                     try:
@@ -3300,15 +3766,18 @@ async def search_natural_language(
                                 '_source': item.payload,
                                 '_index': collection_name,
                             })
-                        logger.info(f"  ✅ Qdrant ({collection_name}): {len(vector_results)}건")
+                        qdrant_duration_ms = (perf_counter() - qdrant_start) * 1000
+                        timings['qdrant_search_ms'] = qdrant_duration_ms
+                        logger.info(f"  ✅ Qdrant ({collection_name}): {len(vector_results)}건 ({qdrant_duration_ms:.2f}ms)")
                     except Exception as e:
                         logger.warning(f"  ⚠️ Qdrant 컬렉션 '{collection_name}' 검색 실패: {e}")
                 except Exception as e:
                     logger.warning(f"  ⚠️ Qdrant 검색 실패: {e}")
         except Exception as e:
             logger.warning(f"  ⚠️ 인덱스 검색 실패: {e}")
-        
-        # user_id 및 _id -> 원본 문서 매핑 생성
+
+        # user_id 및 _id -> 원본 문서 매핑 생성 - 시간 측정 시작
+        mapping_start = perf_counter()
         user_doc_map = {}
         id_doc_map = {}
 
@@ -3329,6 +3798,10 @@ async def search_natural_language(
                 user_doc_map[user_id] = doc_info
             if doc_id:
                 id_doc_map[doc_id] = doc_info
+
+        mapping_duration_ms = (perf_counter() - mapping_start) * 1000
+        timings['user_doc_mapping_ms'] = mapping_duration_ms
+        logger.info(f"  ✅ user_doc_map 생성 완료: {len(user_doc_map)}개 ({mapping_duration_ms:.2f}ms)")
 
         # ⭐⭐⭐ Qdrant 벡터 결과에서 user_id 수집 및 metadata 보강
         # Qdrant payload에는 metadata가 없으므로 OpenSearch에서 전체 문서 조회 필요
@@ -3447,6 +3920,24 @@ async def search_natural_language(
                 'sources': sources,
                 }
 
+            # ⭐ RRF 재조합 시점에 OpenSearch metadata merge
+            # best_doc이 Qdrant 문서인 경우 metadata가 없으므로 OpenSearch에서 가져옴
+            if user_id and user_id in user_doc_map:
+                opensearch_doc = user_doc_map[user_id]
+                if opensearch_doc and isinstance(opensearch_doc, dict):
+                    opensearch_source = opensearch_doc.get("source", {})
+                    if isinstance(opensearch_source, dict):
+                        # best_doc의 _source 가져오기
+                        current_source = best_doc.get('_source', {})
+                        if not isinstance(current_source, dict):
+                            current_source = {}
+
+                        # OpenSearch 데이터 우선으로 merge (metadata, qa_pairs 보존)
+                        merged_source = {}
+                        merged_source.update(current_source)        # Qdrant: user_id, text
+                        merged_source.update(opensearch_source)     # OpenSearch: metadata, qa_pairs
+                        best_doc['_source'] = merged_source
+
             final_rrf_results.append(best_doc)
             # best_doc를 첫 번째로 유지하고, 나머지는 참고용으로 보관
             others = [doc for doc in docs if doc is not best_doc_original]
@@ -3468,7 +3959,7 @@ async def search_natural_language(
         candidate_cap = max(
             fetch_size * 20,
             cache_limit if cache_limit else 0,
-            2000
+            40000  # 전체 데이터 약 35000개를 고려하여 증가
         )
         if candidate_cap and len(rrf_results) > candidate_cap:
             logger.info(
@@ -3507,6 +3998,8 @@ async def search_natural_language(
             logger.warning(f"  [{demo_type.value}]: {[d.value for d in demo_list]}")
 
         filtered_rrf_results: List[Dict[str, Any]] = rrf_results
+        # ⭐ total_hits는 나중에 실제 반환된 결과 수로 설정됨 (len(results))
+        # 임시로 rrf_results 길이 사용
         total_hits = len(rrf_results)
 
         occupation_display_map: Dict[str, str] = {}
@@ -3621,7 +4114,7 @@ async def search_natural_language(
             # ⭐ survey_responses_merged만 사용하므로 welcome_1st 관련 로직 제거
             gender_dsl_handled = bool(demographic_filters.get(DemographicType.GENDER))
             age_dsl_handled = bool(demographic_filters.get(DemographicType.AGE))
-            occupation_dsl_handled = bool(demographic_filters.get(DemographicType.OCCUPATION)) and occupation_filter_handled
+            occupation_dsl_handled = bool(demographic_filters.get(DemographicType.OCCUPATION))
 
             # ⭐ 모든 demographic_filters를 검증 (REGION, MARITAL_STATUS, OCCUPATION 포함!)
             # OCCUPATION은 demographic_filters로 분류되어 Python post-processing에서 처리됨
@@ -3674,11 +4167,14 @@ async def search_natural_language(
             
             logger.info(f"  ✅ 수집된 user_id: {len(user_ids_to_fetch)}건")
             # ⭐ survey_responses_merged만 사용하므로 welcome_1st/welcome_2nd 배치 조회 제거
-            
-            if not filters_to_validate:
+
+            # ⭐⭐⭐ Demographics 필터 또는 Behavioral 조건이 있으면 Python post-processing 실행
+            has_behavioral_conditions = bool(analysis.behavioral_conditions and any(v is not None for v in analysis.behavioral_conditions.values()))
+
+            if not filters_to_validate and not has_behavioral_conditions:
                 timings["post_filter_ms"] = (perf_counter() - filter_start) * 1000
                 filtered_rrf_results = rrf_results
-                logger.info("  ✅ Demographic 필터 없음: Python 후처리 생략")
+                logger.info("  ✅ 필터 없음: Python 후처리 생략")
             else:
                 def collect_doc_values(
                     user_id: str,
@@ -3883,7 +4379,18 @@ async def search_natural_language(
 
                                 if q_text and normalized_answers:
                                     if any(keyword in q_text_raw for keyword in ("직업", "직무", "occupation")):
-                                        doc_values[DemographicType.OCCUPATION].update(normalized_answers)
+                                        # ⭐ occupation 정규화: 괄호 이전 부분만 추출
+                                        # 예: "전문직 (의사, 간호사...)" → "전문직"
+                                        cleaned_occupations = set()
+                                        for ans in normalized_answers:
+                                            # 괄호가 있으면 괄호 이전 부분만 사용
+                                            if '(' in ans:
+                                                cleaned = ans.split('(')[0].strip()
+                                                if cleaned:
+                                                    cleaned_occupations.add(cleaned)
+                                            else:
+                                                cleaned_occupations.add(ans)
+                                        doc_values[DemographicType.OCCUPATION].update(cleaned_occupations)
 
                                     if (
                                         not metadata_presence[DemographicType.GENDER]
@@ -3903,325 +4410,389 @@ async def search_natural_language(
 
                     return doc_values, metadata_presence, behavior_values
 
-                filtered_list = []
-                debug_counter = 0  # ⭐ 디버깅 카운터
-                source_not_found_count = 0
-                gender_filter_failed = 0
-                age_filter_failed = 0
-                occupation_filter_failed = 0
-                gender_metadata_missing = 0
-                age_metadata_missing = 0
-                occupation_metadata_missing = 0
-                region_filter_failed = 0  # ⭐ REGION 필터 카운터
-                region_metadata_missing = 0  # ⭐ REGION 메타데이터 누락 카운터
-                marital_status_filter_failed = 0  # ⭐ MARITAL_STATUS 필터 카운터
-                marital_status_metadata_missing = 0  # ⭐ MARITAL_STATUS 메타데이터 누락 카운터
-                sub_region_filter_failed = 0  # ⭐ SUB_REGION 필터 카운터
-                sub_region_metadata_missing = 0  # ⭐ SUB_REGION 메타데이터 누락 카운터
-                behavior_filter_failed = 0
-                behavior_metadata_missing = 0
+                # ⭐⭐⭐ 성능 최적화: QA pairs를 1번만 순회해서 occupation과 marital_status 추출
+                def extract_from_qa_pairs_once(
+                    source: Dict[str, Any],
+                    needs_occupation: bool,
+                    needs_marital: bool,
+                    occupation_expected: Set[str],
+                    marital_expected: Set[str]
+                ) -> Tuple[Optional[str], Optional[str]]:
+                    """QA pairs를 1번만 순회해서 occupation display와 marital_status 추출"""
+                    display_occupation = None
+                    marital_val = None
 
-                # ⭐ 디버깅: user_doc_map 커버리지 확인
-                user_doc_map_hit = 0
-                user_doc_map_miss = 0
+                    qa_sources: List[List[Dict[str, Any]]] = []
+                    if isinstance(source, dict):
+                        qa_sources.append(source.get("qa_pairs", []) or [])
 
-                for doc in rrf_results:
-                    user_id = doc_user_map.get(id(doc))
-                    if not user_id:
-                        continue
+                    for qa_pairs in qa_sources:
+                        for qa in qa_pairs:
+                            if not isinstance(qa, dict):
+                                continue
+                            q_text = str(qa.get("q_text", "")).lower()
 
-                    # ⭐⭐⭐ user_doc_map을 우선 사용 (OpenSearch에서 조회한 전체 문서, metadata 포함)
-                    # user_rrf_map은 RRF 결합된 문서로 Qdrant 결과는 metadata 없음
-                    doc_info = user_doc_map.get(user_id)
-                    if doc_info:
-                        source = doc_info.get('source', {})
-                        user_doc_map_hit += 1
-                    else:
-                        # Fallback: user_doc_map에 없으면 user_rrf_map 사용
-                        source = user_rrf_map.get(user_id, [{}])[0].get('_source', {})
-                        user_doc_map_miss += 1
-
-                    if not isinstance(source, dict):
-                        source = {}
-
-                    # ⭐ survey_responses_merged만 사용하므로 welcome_1st/welcome_2nd 배치 제거
-                    # source에서 직접 metadata 가져오기
-                    metadata = source.get("metadata", {}) if isinstance(source.get("metadata"), dict) else {}
-
-                    doc_values, metadata_presence, behavior_values = collect_doc_values(user_id, source, metadata, {})
-                    behavior_values_map[user_id] = dict(behavior_values)
-
-                    # ⭐ 디버깅: 처음 3개 문서의 behavioral 값 로깅
-                    if debug_counter < 3 and analysis.behavioral_conditions:
-                        logger.warning(f"[DEBUG #{debug_counter+1}] user_id={user_id}")
-                        logger.warning(f"  behavior_values={behavior_values}")
-                        logger.warning(f"  expected={analysis.behavioral_conditions}")
-                        debug_counter += 1
-
-                    gender_pass = True
-                    age_pass = True
-                    occupation_pass = True
-                    region_pass = True  # ⭐ REGION 필터 검증 추가
-                    marital_status_pass = True  # ⭐ MARITAL_STATUS 필터 검증 추가
-                    sub_region_pass = True  # ⭐ SUB_REGION 필터 검증 추가
-
-                    if DemographicType.GENDER in filters_to_validate:
-                        expected = set()
-                        # ⭐ 디버깅: demographic_filters 확인
-                        if len(filtered_list) == 0:  # 첫 번째 문서 처리 시
-                            logger.warning(f"     [DEBUG] Gender filters count: {len(demographic_filters[DemographicType.GENDER])}")
-                            for idx, demo in enumerate(demographic_filters[DemographicType.GENDER]):
-                                logger.warning(f"       Filter #{idx + 1}: value={demo.value}, raw_value={demo.raw_value}")
-
-                        for demo in demographic_filters[DemographicType.GENDER]:
-                            expected.update(build_expected_values(demo))
-
-                        # ⭐ Metadata 우선: metadata가 있으면 metadata만 확인
-                        if metadata_presence[DemographicType.GENDER]:
-                            # metadata로 수집된 값만 사용 (qa_pairs 무시)
-                            # doc_values에서 metadata 소스만 확인하기 위해 다시 수집
-                            gender_from_metadata = set()
-                            for meta_source in [metadata, source.get("metadata", {})]:
-                                if isinstance(meta_source, dict):
-                                    gender_val = meta_source.get("gender") or meta_source.get("gender_code")
-                                    if gender_val:
-                                        normalized_gender = normalize_value(gender_val)
-                                        if normalized_gender:
-                                            gender_from_metadata.add(normalized_gender)
-
-                            if gender_from_metadata:
-                                expand_gender_aliases(gender_from_metadata)
-                                gender_pass = values_match(gender_from_metadata, expected)
-                            else:
-                                # metadata_presence가 True인데 값이 없으면 오류
-                                gender_metadata_missing += 1
-                                gender_pass = False
-                        else:
-                            # metadata 없으면 qa_pairs 사용
-                            expand_gender_aliases(doc_values[DemographicType.GENDER])
-                            gender_pass = values_match(doc_values[DemographicType.GENDER], expected)
-
-                        # ⭐ 디버깅: 처음 3개 실패 케이스 로깅
-                        if not gender_pass and gender_filter_failed < 3:
-                            actual_values = gender_from_metadata if metadata_presence[DemographicType.GENDER] else doc_values[DemographicType.GENDER]
-                            logger.warning(f"     [성별 필터 실패 #{gender_filter_failed + 1}] user_id={user_id}, expected={expected}, actual={actual_values}, metadata={metadata.get('gender')}")
-
-                        if not gender_pass:
-                            gender_filter_failed += 1
-
-                    if gender_pass and DemographicType.AGE in filters_to_validate:
-                        expected = set()
-                        for demo in demographic_filters[DemographicType.AGE]:
-                            expected.update(build_expected_values(demo))
-
-                        # ⭐ 디버깅: 처음 3개 문서의 age 필터 검증 과정 로깅
-                        if debug_counter < 3:
-                            logger.warning(f"[AGE DEBUG #{debug_counter+1}] user_id={user_id}")
-                            logger.warning(f"  expected_ages={expected}")
-                            logger.warning(f"  actual_age={doc_values[DemographicType.AGE]}")
-                            logger.warning(f"  demographic_filters[AGE]={demographic_filters[DemographicType.AGE]}")
-
-                        age_pass = values_match(doc_values[DemographicType.AGE], expected)
-
-                        if debug_counter < 3:
-                            logger.warning(f"  age_pass={age_pass}")
-
-                        if not age_pass:
-                            age_filter_failed += 1
-
-                    if gender_pass and age_pass and DemographicType.OCCUPATION in filters_to_validate:
-                        expected = set()
-                        for demo in demographic_filters[DemographicType.OCCUPATION]:
-                            expected.update(build_expected_values(demo))
-                        if not metadata_presence[DemographicType.OCCUPATION]:
-                            occupation_metadata_missing += 1
-                        occupation_pass = values_match(doc_values[DemographicType.OCCUPATION], expected)
-                        if not occupation_pass:
-                            occupation_filter_failed += 1
-                        else:
-                            display_occupation = None
-                            occupation_candidates = [
-                                metadata.get("occupation") if isinstance(metadata, dict) else None,
-                                metadata.get("job") if isinstance(metadata, dict) else None,
-                                metadata.get("occupation_group") if isinstance(metadata, dict) else None,
-                            ]
-                            for candidate in occupation_candidates:
-                                normalized_candidate = normalize_value(candidate)
-                                if normalized_candidate and values_match({normalized_candidate}, expected):
-                                    display_occupation = str(candidate)
-                                    break
-                            if not display_occupation:
-                                qa_sources: List[List[Dict[str, Any]]] = []
-                                if isinstance(source, dict):
-                                    qa_sources.append(source.get("qa_pairs", []) or [])
-                                # ⭐ survey_responses_merged만 사용하므로 metadata_2nd_full 제거
-                                for qa_pairs in qa_sources:
-                                    for qa in qa_pairs:
-                                        if not isinstance(qa, dict):
-                                            continue
-                                        q_text = str(qa.get("q_text", "")).lower()
-                                        if not any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
-                                            continue
-                                        answer = qa.get("answer")
-                                        if answer is None:
-                                            answer = qa.get("answer_text")
-                                        if answer is None:
-                                            continue
+                            # Occupation 찾기
+                            if needs_occupation and not display_occupation:
+                                if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
+                                    answer = qa.get("answer")
+                                    if answer is None:
+                                        answer = qa.get("answer_text")
+                                    if answer:
                                         candidate_value = str(answer)
                                         normalized_candidate = normalize_value(candidate_value)
-                                        if normalized_candidate and values_match({normalized_candidate}, expected):
+
+                                        # ⭐⭐⭐ 부분 매칭: "영업직" → "영업" 포함 확인
+                                        # 예: "무역•영업•판매•매장관리"에 "영업" 포함
+                                        matched = False
+                                        for expected in occupation_expected:
+                                            # "직" 제거하여 핵심 키워드 추출
+                                            keyword = expected.replace('직', '')
+                                            if keyword and keyword in normalized_candidate:
+                                                matched = True
+                                                break
+
+                                        if matched:
                                             display_occupation = candidate_value
-                                            break
-                                    if display_occupation:
-                                        break
-                            if display_occupation:
-                                occupation_display_map[user_id] = display_occupation
 
-                    # ⭐ REGION 검증
-                    if DemographicType.REGION in filters_to_validate:
-                        expected = set()
-                        for demo in demographic_filters[DemographicType.REGION]:
-                            expected.update(build_expected_values(demo))
-
-                        # metadata에서 region 가져오기
-                        region_val = metadata.get("region") if isinstance(metadata, dict) else None
-                        if region_val:
-                            normalized_region = normalize_value(region_val)
-                            if normalized_region:
-                                region_pass = values_match({normalized_region}, expected)
-                                if not region_pass:
-                                    region_filter_failed += 1
-                            else:
-                                region_pass = False
-                                region_filter_failed += 1
-                        else:
-                            region_metadata_missing += 1
-                            region_pass = False
-
-                    # ⭐ MARITAL_STATUS 검증
-                    if DemographicType.MARITAL_STATUS in filters_to_validate:
-                        expected = set()
-                        for demo in demographic_filters[DemographicType.MARITAL_STATUS]:
-                            expected.update(build_expected_values(demo))
-
-                        # metadata에서 marital_status 가져오기
-                        marital_val = metadata.get("marital_status") if isinstance(metadata, dict) else None
-
-                        if not marital_val:
-                            # qa_pairs에서도 찾아보기
-                            qa_sources: List[List[Dict[str, Any]]] = []
-                            if isinstance(source, dict):
-                                qa_sources.append(source.get("qa_pairs", []) or [])
-
-                            for qa_pairs in qa_sources:
-                                for qa in qa_pairs:
-                                    if not isinstance(qa, dict):
-                                        continue
-                                    q_text = str(qa.get("q_text", "")).lower()
-                                    if not any(keyword in q_text for keyword in ("결혼", "혼인", "marital")):
-                                        continue
+                            # Marital status 찾기
+                            if needs_marital and not marital_val:
+                                if any(keyword in q_text for keyword in ("결혼", "혼인", "marital")):
                                     answer = qa.get("answer") or qa.get("answer_text")
                                     if answer:
                                         marital_val = str(answer)
+
+                            # 둘 다 찾았으면 조기 종료
+                            if (not needs_occupation or display_occupation) and (not needs_marital or marital_val):
+                                break
+
+                        # 둘 다 찾았으면 조기 종료
+                        if (not needs_occupation or display_occupation) and (not needs_marital or marital_val):
+                            break
+
+                    return display_occupation, marital_val
+
+                # ⭐⭐⭐⭐⭐ 메모리 캐시 기반 초고속 필터링! (Stage 1+2 통합)
+                # 변수 초기화 (fallback 경로에서 사용)
+                expected_values_cache = {}
+                stage1_duration_ms = 0
+                stage2_duration_ms = 0
+
+                if panel_cache.loaded:
+                    logger.info(f"\n{'='*60}")
+                    logger.info(f"⚡ 메모리 캐시 기반 통합 필터링 (Stage 1+2 한방!)")
+                    logger.info(f"{'='*60}")
+
+                    filter_start = perf_counter()
+
+                    # ⭐ Demographics 필터 추출
+                    gender_filter = None
+                    age_filter = None
+                    region_filter = None
+                    sub_region_filter = None
+                    occupation_filter = None
+                    marital_filter = None
+
+                    if DemographicType.GENDER in demographic_filters:
+                        values = [d.value for d in demographic_filters[DemographicType.GENDER]]
+                        gender_filter = values[0] if values else None  # 첫번째 값 사용
+
+                    if DemographicType.AGE in demographic_filters:
+                        values = [d.value for d in demographic_filters[DemographicType.AGE]]
+                        age_filter = values[0] if values else None
+
+                    if DemographicType.REGION in demographic_filters:
+                        values = [d.value for d in demographic_filters[DemographicType.REGION]]
+                        region_filter = values[0] if values else None
+
+                    if DemographicType.SUB_REGION in demographic_filters:
+                        values = [d.value for d in demographic_filters[DemographicType.SUB_REGION]]
+                        sub_region_filter = values[0] if values else None
+
+                    if DemographicType.OCCUPATION in demographic_filters:
+                        values = [d.value for d in demographic_filters[DemographicType.OCCUPATION]]
+                        occupation_filter = values[0] if values else None
+
+                    if DemographicType.MARITAL_STATUS in demographic_filters:
+                        values = [d.value for d in demographic_filters[DemographicType.MARITAL_STATUS]]
+                        marital_filter = values[0] if values else None
+
+                    # ⭐⭐⭐ 한방 필터링! (Pandas 벡터화 - 0.1초 이하!)
+                    filtered_df = panel_cache.filter_all(
+                        gender=gender_filter,
+                        age_group=age_filter,
+                        region=region_filter,
+                        sub_region=sub_region_filter,
+                        occupation=occupation_filter,
+                        marital_status=marital_filter,
+                        behavioral_conditions=analysis.behavioral_conditions
+                    )
+
+                    filter_duration_ms = (perf_counter() - filter_start) * 1000
+                    timings["post_filter_ms"] = filter_duration_ms
+
+                    logger.info(f"  ✅ 메모리 캐시 필터링: {panel_cache.total_count}건 → {len(filtered_df)}건 ({filter_duration_ms:.2f}ms) 🚀")
+                    logger.info(f"{'='*60}\n")
+
+                    # ⭐ 필터링된 user_id로 full document 가져오기
+                    filtered_user_ids = filtered_df['user_id'].tolist()
+                    filtered_list = panel_cache.get_user_docs(filtered_user_ids)
+                    filtered_rrf_results = filtered_list
+
+                    logger.info(f"📊 필터링 통계:")
+                    logger.info(f"  - 메모리 캐시 통합 필터링: {filter_duration_ms:.2f}ms")
+                    logger.info(f"  - ✅ 최종 결과: {len(filtered_list)}건")
+
+                else:
+                    # ⭐⭐⭐ Fallback: 기존 Stage 1+2 로직 (메모리 캐시 없을 때)
+                    logger.warning("  ⚠️ 메모리 캐시 미사용 → 기존 Stage 1+2 로직 실행 (느림)")
+
+                    # ⭐⭐⭐ 성능 최적화: build_expected_values를 루프 밖에서 1번만 계산
+                    # 각 demographic 타입별로 expected values 사전 계산
+                    expected_values_cache = {}
+                    for demo_type in filters_to_validate:
+                        if demo_type in demographic_filters:
+                            expected = set()
+                            for demo in demographic_filters[demo_type]:
+                                expected.update(build_expected_values(demo))
+                            expected_values_cache[demo_type] = expected
+                            logger.debug(f"  ✅ {demo_type.value} expected values 사전 계산: {expected}")
+
+                    # ⭐⭐⭐ STAGE 1: Pandas 벡터화 필터링 (metadata만 - 초고속!)
+                    logger.info(f"\n{'='*60}")
+                    logger.info(f"⚡ STAGE 1: Pandas metadata 필터링 시작")
+                    logger.info(f"{'='*60}")
+
+                    stage1_start = perf_counter()
+                    metadata_list = []
+                    doc_id_to_doc = {}
+
+                    debug_sample_count = 0
+                    for doc in rrf_results:
+                        user_id = doc_user_map.get(id(doc))
+                        if not user_id:
+                            continue
+
+                        # ⭐ doc에서 직접 _source 가져오기
+                        source = doc.get('_source', {})
+
+                        if not isinstance(source, dict):
+                            source = {}
+
+                        # 디버깅: 처음 3개 샘플의 _source 구조 확인
+                        if debug_sample_count < 3:
+                            logger.info(f"  [DEBUG {debug_sample_count+1}] user_id={user_id}")
+                            logger.info(f"     doc keys: {list(doc.keys())}")
+                            logger.info(f"     _source keys: {list(source.keys()) if source else 'Empty'}")
+                            logger.info(f"     _source content preview: {str(source)[:200]}...")
+
+                        metadata = source.get("metadata", {}) if isinstance(source.get("metadata"), dict) else {}
+
+                        # 디버깅: 처음 3개 샘플 로깅
+                        if debug_sample_count < 3:
+                            logger.info(f"     metadata keys: {list(metadata.keys()) if metadata else 'None'}")
+                            logger.info(f"     gender: {metadata.get('gender')}, region: {metadata.get('region')}")
+                            debug_sample_count += 1
+
+                        # metadata 정보 저장
+                        metadata_list.append({
+                            'doc_id': id(doc),
+                            'user_id': user_id,
+                            'gender': metadata.get('gender') or metadata.get('gender_code'),
+                            'age_group': metadata.get('age_group') or metadata.get('age'),
+                            'region': metadata.get('region'),
+                            'sub_region': metadata.get('sub_region'),
+                        })
+                        doc_id_to_doc[id(doc)] = (doc, source, metadata)
+
+                    # Pandas DataFrame 생성
+                    df = pd.DataFrame(metadata_list)
+                    logger.info(f"  📊 전체 문서: {len(df)}건")
+
+                    # Pandas 벡터화 필터링 (metadata만)
+                    mask = pd.Series([True] * len(df))
+
+                    # GENDER 필터
+                    if DemographicType.GENDER in filters_to_validate:
+                        expected_genders = expected_values_cache.get(DemographicType.GENDER, set())
+                        # normalize + expand aliases
+                        expanded_expected = set()
+                        for g in expected_genders:
+                            expanded_expected.add(g)
+                            # gender aliases
+                            if g == '남성': expanded_expected.update(['남자', '남', 'male', 'm', 'man', '남성형'])
+                            if g == '여성': expanded_expected.update(['여자', '여', 'female', 'f', 'woman', '여성형'])
+
+                        # DataFrame 값 정규화 및 필터링 (None 제외)
+                        df['gender_normalized'] = df['gender'].apply(lambda x: normalize_value(x) if x else None)
+                        gender_mask = df['gender_normalized'].notna() & df['gender_normalized'].isin(expanded_expected)
+                        mask &= gender_mask
+                        logger.info(f"  ✅ GENDER 필터: {expected_genders} → {mask.sum()}건 통과")
+
+                    # AGE 필터
+                    if DemographicType.AGE in filters_to_validate:
+                        expected_ages = expected_values_cache.get(DemographicType.AGE, set())
+                        df['age_normalized'] = df['age_group'].apply(lambda x: normalize_value(x) if x else None)
+                        age_mask = df['age_normalized'].notna() & df['age_normalized'].isin(expected_ages)
+                        mask &= age_mask
+                        logger.info(f"  ✅ AGE 필터: {expected_ages} → {mask.sum()}건 통과")
+
+                    # REGION 필터
+                    if DemographicType.REGION in filters_to_validate:
+                        expected_regions = expected_values_cache.get(DemographicType.REGION, set())
+                        df['region_normalized'] = df['region'].apply(lambda x: normalize_value(x) if x else None)
+                        region_mask = df['region_normalized'].notna() & df['region_normalized'].isin(expected_regions)
+                        mask &= region_mask
+                        logger.info(f"  ✅ REGION 필터: {expected_regions} → {mask.sum()}건 통과 (region 값 샘플: {df['region'].value_counts().head(5).to_dict()})")
+
+                    # SUB_REGION 필터
+                    if DemographicType.SUB_REGION in filters_to_validate:
+                        expected_sub_regions = expected_values_cache.get(DemographicType.SUB_REGION, set())
+                        df['sub_region_normalized'] = df['sub_region'].apply(lambda x: normalize_value(x) if x else None)
+                        sub_region_mask = df['sub_region_normalized'].notna() & df['sub_region_normalized'].isin(expected_sub_regions)
+                        mask &= sub_region_mask
+                        logger.info(f"  ✅ SUB_REGION 필터: {expected_sub_regions} → {mask.sum()}건 통과")
+
+                    # 필터링된 결과
+                    candidate_df = df[mask]
+                    stage1_duration_ms = (perf_counter() - stage1_start) * 1000
+                    logger.info(f"\n⚡ STAGE 1 완료: {len(df)}건 → {len(candidate_df)}건 ({stage1_duration_ms:.2f}ms)")
+                    logger.info(f"{'='*60}\n")
+
+                    # ⭐⭐⭐ STAGE 2: qa_pairs/behavioral 체크 (필터링된 문서만)
+                    logger.info(f"⚡ STAGE 2: qa_pairs/behavioral 필터링 시작 ({len(candidate_df)}건)")
+
+                    stage2_start = perf_counter()
+                    filtered_list = []
+
+                    # 카운터 초기화
+                    occupation_filter_failed = 0
+                    occupation_metadata_missing = 0
+                    marital_status_filter_failed = 0
+                    marital_status_metadata_missing = 0
+                    behavior_filter_failed = 0
+                    behavior_metadata_missing = 0
+                    debug_counter = 0
+
+                    for _, row in candidate_df.iterrows():
+                        doc, source, metadata = doc_id_to_doc[row['doc_id']]
+                        user_id = row['user_id']
+
+                        # ⭐ collect_doc_values로 qa_pairs와 behavior_values 수집
+                        doc_values, metadata_presence, behavior_values = collect_doc_values(user_id, source, metadata, {})
+                        behavior_values_map[user_id] = dict(behavior_values)
+
+                        # ⭐⭐⭐ QA pairs에서 occupation과 marital_status 1번만 순회 추출
+                        needs_occupation = DemographicType.OCCUPATION in filters_to_validate
+                        needs_marital = DemographicType.MARITAL_STATUS in filters_to_validate
+                        qa_occupation = None
+                        qa_marital = None
+
+                        if needs_occupation or needs_marital:
+                            occupation_expected = expected_values_cache.get(DemographicType.OCCUPATION, set()) if needs_occupation else set()
+                            marital_expected = expected_values_cache.get(DemographicType.MARITAL_STATUS, set()) if needs_marital else set()
+                            qa_occupation, qa_marital = extract_from_qa_pairs_once(source, needs_occupation, needs_marital, occupation_expected, marital_expected)
+
+                        # ⭐ Stage 1에서 이미 gender, age, region, sub_region 필터 통과했으므로
+                        # Stage 2에서는 occupation, marital_status, behavioral만 체크
+
+                        occupation_pass = True
+                        marital_status_pass = True
+                        behavior_pass = True
+
+                        # ⭐⭐⭐ OCCUPATION 필터 (부분 매칭)
+                        if needs_occupation:
+                            expected = expected_values_cache.get(DemographicType.OCCUPATION, set())
+                            actual_occupations = doc_values[DemographicType.OCCUPATION]
+
+                            # ⭐ 부분 매칭: "영업직" → "영업" 포함 확인
+                            occupation_pass = False
+                            for actual in actual_occupations:
+                                for expected_val in expected:
+                                    # "직" 제거하여 핵심 키워드 추출
+                                    keyword = expected_val.replace('직', '')
+                                    if keyword and keyword in actual:
+                                        occupation_pass = True
                                         break
-                                if marital_val:
+                                if occupation_pass:
                                     break
 
-                        if marital_val:
-                            normalized_marital = normalize_value(marital_val)
-                            if normalized_marital:
-                                marital_status_pass = values_match({normalized_marital}, expected)
-                                if not marital_status_pass:
+                            if not occupation_pass:
+                                occupation_filter_failed += 1
+                            else:
+                                # Display occupation 저장
+                                if qa_occupation:
+                                    occupation_display_map[user_id] = qa_occupation
+
+                        # ⭐⭐⭐ MARITAL_STATUS 필터
+                        if needs_marital:
+                            expected = expected_values_cache.get(DemographicType.MARITAL_STATUS, set())
+                            marital_val = metadata.get("marital_status") or qa_marital
+
+                            if marital_val:
+                                normalized_marital = normalize_value(marital_val)
+                                if normalized_marital:
+                                    marital_status_pass = values_match({normalized_marital}, expected)
+                                    if not marital_status_pass:
+                                        marital_status_filter_failed += 1
+                                else:
+                                    marital_status_pass = False
                                     marital_status_filter_failed += 1
                             else:
+                                marital_status_metadata_missing += 1
                                 marital_status_pass = False
-                                marital_status_filter_failed += 1
-                        else:
-                            marital_status_metadata_missing += 1
-                            marital_status_pass = False
 
-                    # ⭐ SUB_REGION 검증
-                    if DemographicType.SUB_REGION in filters_to_validate:
-                        expected = set()
-                        for demo in demographic_filters[DemographicType.SUB_REGION]:
-                            expected.update(build_expected_values(demo))
+                        # ⭐⭐⭐ BEHAVIORAL 필터
+                        if analysis.behavioral_conditions:
+                            for condition_key, expected_value in analysis.behavioral_conditions.items():
+                                if expected_value is None:
+                                    continue
 
-                        # metadata에서 sub_region 가져오기
-                        sub_region_val = metadata.get("sub_region") if isinstance(metadata, dict) else None
-                        if sub_region_val:
-                            normalized_sub_region = normalize_value(sub_region_val)
-                            if normalized_sub_region:
-                                sub_region_pass = values_match({normalized_sub_region}, expected)
-                                if not sub_region_pass:
-                                    sub_region_filter_failed += 1
-                            else:
-                                sub_region_pass = False
-                                sub_region_filter_failed += 1
-                        else:
-                            sub_region_metadata_missing += 1
-                            sub_region_pass = False
+                                actual_value = behavior_values.get(condition_key)
+                                if actual_value is None:
+                                    behavior_metadata_missing += 1
+                                    behavior_pass = False
+                                    break
+                                if actual_value != expected_value:
+                                    behavior_filter_failed += 1
+                                    behavior_pass = False
+                                    break
 
-                    # ⭐ Behavioral 검증: OpenSearch는 후보를 넓게 가져오고, Python에서 정확히 검증
-                    behavior_pass = True
+                        # ⭐ Stage 2 필터 검증 완료
+                        all_pass = occupation_pass and marital_status_pass and behavior_pass
+
+                        if all_pass:
+                            filtered_list.append(doc)
+
+                            # ⭐⭐⭐ Early Termination (제거됨 - 정확한 전체 카운트를 위해)
+                            # if len(filtered_list) >= size * 3:
+                            #     logger.info(f"  ⚡ Early termination: {len(filtered_list)}건 수집 완료")
+                            #     break
+
+                    # Stage 2 완료
+                    stage2_duration_ms = (perf_counter() - stage2_start) * 1000
+                    logger.info(f"\n⚡ STAGE 2 완료: {len(candidate_df)}건 → {len(filtered_list)}건 ({stage2_duration_ms:.2f}ms)")
+                    logger.info(f"{'='*60}\n")
+
+                    # 전체 필터링 시간
+                    total_filter_duration_ms = stage1_duration_ms + stage2_duration_ms
+                    timings["post_filter_ms"] = total_filter_duration_ms
+                    filtered_rrf_results = filtered_list
+
+                    # 통계 로그
+                    logger.info(f"📊 필터링 통계:")
+                    logger.info(f"  - Stage 1 (Pandas metadata): {stage1_duration_ms:.2f}ms")
+                    logger.info(f"  - Stage 2 (qa_pairs/behavioral): {stage2_duration_ms:.2f}ms")
+                    logger.info(f"  - 전체 필터링 시간: {total_filter_duration_ms:.2f}ms")
+
+                    if DemographicType.OCCUPATION in filters_to_validate:
+                        logger.info(f"  - OCCUPATION 미충족: {occupation_filter_failed}건")
+                    if DemographicType.MARITAL_STATUS in filters_to_validate:
+                        logger.info(f"  - MARITAL_STATUS 미충족: {marital_status_filter_failed}건")
                     if analysis.behavioral_conditions:
-                        for condition_key, expected_value in analysis.behavioral_conditions.items():
-                            # ⭐ expected_value=None은 "이 조건을 체크하지 않음"을 의미 → 스킵
-                            if expected_value is None:
-                                continue
+                        logger.info(f"  - BEHAVIORAL 미충족: {behavior_filter_failed}건")
 
-                            actual_value = behavior_values.get(condition_key)
-                            if actual_value is None:
-                                behavior_metadata_missing += 1
-                                behavior_pass = False
-                                break
-                            if actual_value != expected_value:
-                                behavior_filter_failed += 1
-                                behavior_pass = False
-                                break
-
-                    # ⭐ 모든 demographic 필터 검증 (REGION, MARITAL_STATUS, SUB_REGION 포함)
-                    all_pass = gender_pass and age_pass and occupation_pass and region_pass and marital_status_pass and sub_region_pass and behavior_pass
-
-                    # ⭐ 디버깅: 처음 5개 통과/실패 케이스 샘플
-                    if len(filtered_list) < 5 or (not all_pass and len(filtered_list) < 335):
-                        if len(filtered_list) < 3:  # 처음 3개 통과 케이스
-                            if all_pass:
-                                logger.info(f"     [필터 통과 #{len(filtered_list) + 1}] user_id={user_id}, gender={metadata.get('gender')}, age_group={metadata.get('age_group')}, gender_pass={gender_pass}, age_pass={age_pass}")
-
-                    if all_pass:
-                        filtered_list.append(doc)
-
-                filter_duration_ms = (perf_counter() - filter_start) * 1000
-                timings["post_filter_ms"] = filter_duration_ms
-                filtered_rrf_results = filtered_list
-                total_hits = len(filtered_rrf_results)
-
-                logger.info(f"  - 소스 누락 문서: {source_not_found_count}건")
-                logger.info(f"  ⭐ user_doc_map 적중: {user_doc_map_hit}건 (metadata 있음)")
-                logger.info(f"  ⭐ user_doc_map 미스: {user_doc_map_miss}건 (metadata 없을 수 있음)")
-                if DemographicType.GENDER in filters_to_validate:
-                    logger.info(f"  - 성별 metadata 없음: {gender_metadata_missing}건")
-                    logger.info(f"  - 성별 필터 미충족: {gender_filter_failed}건")
-                if DemographicType.AGE in filters_to_validate:
-                    logger.info(f"  - 연령 metadata 없음: {age_metadata_missing}건")
-                    logger.info(f"  - 연령 필터 미충족: {age_filter_failed}건")
-                if DemographicType.OCCUPATION in filters_to_validate:
-                    logger.info(f"  - 직업 metadata 없음: {occupation_metadata_missing}건")
-                    logger.info(f"  - 직업 필터 미충족: {occupation_filter_failed}건")
-                if DemographicType.REGION in filters_to_validate:
-                    logger.info(f"  - 지역 metadata 없음: {region_metadata_missing}건")
-                    logger.info(f"  - 지역 필터 미충족: {region_filter_failed}건")
-                if DemographicType.MARITAL_STATUS in filters_to_validate:
-                    logger.info(f"  - 결혼여부 metadata 없음: {marital_status_metadata_missing}건")
-                    logger.info(f"  - 결혼여부 필터 미충족: {marital_status_filter_failed}건")
-                if DemographicType.SUB_REGION in filters_to_validate:
-                    logger.info(f"  - 세부지역 metadata 없음: {sub_region_metadata_missing}건")
-                    logger.info(f"  - 세부지역 필터 미충족: {sub_region_filter_failed}건")
-                logger.info(f"  - 필터 조건 충족 문서: {len(filtered_rrf_results)}건")
-                if analysis.behavioral_conditions:
-                    logger.info(f"  ✅ 행동 필터 검증 완료")
-                    logger.info(f"  - 행동 정보 없음: {behavior_metadata_missing}건")
-                    logger.info(f"  - 행동 필터 미충족: {behavior_filter_failed}건")
+                logger.info(f"  ✅ 최종 결과: {len(filtered_rrf_results)}건")
         else:
             timings.setdefault('post_filter_ms', timings.get('post_filter_ms', 0.0))
 
@@ -4567,7 +5138,9 @@ async def search_natural_language(
                 logger.info(f"  - 행동 필터 미충족: {behavior_filter_failed}건")
 
         lazy_join_start = perf_counter()
-        final_hits = filtered_rrf_results[:window_size]
+        # ⭐ 응답 단계: 사용자가 요청한 page_size만큼만 반환
+        # window_size는 내부 검색/필터링용으로만 사용 (충분한 후보 확보)
+        final_hits = filtered_rrf_results[:page_size]
         results: List[SearchResult] = []
         inner_hits_map: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -4603,9 +5176,11 @@ async def search_natural_language(
             if doc_info:
                 src_info = doc_info.get("source")
                 if isinstance(src_info, dict):
+                    # ⭐ 순서 변경: Qdrant 데이터 먼저, OpenSearch 데이터로 덮어쓰기
+                    # 이렇게 하면 metadata, qa_pairs 등이 보존됨
                     merged_source = {}
-                    merged_source.update(src_info)
-                    merged_source.update(source)
+                    merged_source.update(source)      # Qdrant: user_id, text
+                    merged_source.update(src_info)    # OpenSearch: metadata, qa_pairs (우선)
                     source = merged_source
                     
                 inner_hit_wrapper = {"inner_hits": doc_info.get("inner_hits", {})}
@@ -4776,8 +5351,8 @@ async def search_natural_language(
         if cache_enabled and cache_limit > 0:
             stored_items = serialized_results[:cache_limit]
         page_results, has_more_local = _slice_results(stored_items, page, page_size)
+        # ⭐ total_hits는 이미 위에서 계산됨 (len(results))
         has_more = has_more_local and ((page * page_size) < total_hits)
-        total_hits = len(filtered_rrf_results)
         max_score = results[0].score if results else 0.0
         response_took_ms = int(total_duration_ms)
 
@@ -4786,7 +5361,7 @@ async def search_natural_language(
             logger.info(f"  - {key}: {timings[key]:.2f}")
 
         summary_parts = [
-            f"returned={len(page_results)}/{total_hits}",
+            f"returned={len(page_results)}건, 필터링후={len(filtered_rrf_results)}건, 전체={total_hits}건",
             f"total_ms={response_took_ms}",
         ]
         if rrf_k_used is not None:
@@ -4815,30 +5390,37 @@ async def search_natural_language(
             use_claude=use_claude,
         )
 
-        # requested_count 설정 (requested_size가 None이 아니면 그 값을, None이면 None)
-        requested_count = requested_size if requested_size is not None else None
+        # ⭐ total_hits: 필터링을 통과한 전체 결과 수
+        total_hits = len(filtered_rrf_results) if filtered_rrf_results else 0
+
+        # ⭐ requested_count 설정:
+        # - 쿼리에서 size가 명시되면 (예: "전문직 100명") → requested_size 값
+        #   단, 실제 반환된 결과 수(total_hits)보다 크면 total_hits로 제한
+        # - size가 없으면 (예: "전문직") → 실제 반환된 데이터 전체 수 (total_hits)
+        if requested_size is not None and requested_size > 0:
+            # 실제 반환된 결과 수를 초과하지 않도록 제한
+            requested_count = min(requested_size, total_hits)
+        else:
+            # size가 없으면 실제 반환된 결과 수 사용
+            requested_count = total_hits
         
         if cache_enabled and cache_key and stored_items:
-            cache_payload = {
-                "total_hits": total_hits,
-                "max_score": max_score,
-                "items": stored_items,
-                "page_size": page_size,
-                "filters": filters_for_response,
-                "extracted_entities": extracted_entities.to_dict(),
-                "behavioral_conditions": getattr(analysis, "behavioral_conditions", {}),
-                "use_claude": bool(use_claude),
-                "requested_count": requested_count,
-            }
-            try:
-                cache_client.setex(
-                    cache_key,
-                    cache_ttl,
-                    json.dumps(cache_payload, ensure_ascii=False),
-                )
-                logger.info(f"💾 Redis 검색 캐시 저장: key={cache_key}, ttl={cache_ttl}s")
-            except Exception as cache_exc:
-                logger.warning(f"⚠️ Redis 검색 캐시 저장 실패: {cache_exc}")
+            # ⭐ 백그라운드에서 cache_payload 생성 + 압축 저장 (응답 지연 0ms!)
+            background_tasks.add_task(
+                save_search_cache_compressed,
+                cache_key,
+                cache_ttl,
+                total_hits,
+                max_score,
+                stored_items,
+                page_size,
+                filters_for_response,
+                extracted_entities.to_dict(),
+                getattr(analysis, "behavioral_conditions", {}),
+                bool(use_claude),
+                requested_count,
+            )
+            logger.info(f"⏳ Redis 캐시 저장 예약 (백그라운드): key={cache_key}, ttl={cache_ttl}s")
         
         response = SearchResponse(
             requested_count=requested_count,
@@ -5082,388 +5664,21 @@ async def get_search_history_endpoint(
 
 
 def _filter_to_string(filter_dict: Dict[str, Any]) -> str:
+    """Helper: 필터를 문자열로 변환"""
     try:
         return json.dumps(filter_dict, ensure_ascii=False)
     except Exception:
         return str(filter_dict)
 
 
-AGE_GENDER_KEYWORDS = [
-    "metadata.age_group", "metadata.gender", "birth_year", "연령", "나이", "성별"
-]
-OCCUPATION_KEYWORDS = [
-    "metadata.occupation", "occupation", "직업", "직무"
-]
+# ⭐ Two-phase search helper 함수 제거됨 (단순화)
+# - is_age_or_gender_filter
+# - is_occupation_filter
+# → survey_responses_merged 통합 인덱스 사용으로 불필요
 
-
-def is_age_or_gender_filter(filter_dict: Dict[str, Any]) -> bool:
-    filter_str = _filter_to_string(filter_dict)
-    return any(keyword in filter_str for keyword in AGE_GENDER_KEYWORDS)
-
-
-def is_occupation_filter(filter_dict: Dict[str, Any]) -> bool:
-    filter_str = _filter_to_string(filter_dict)
-    return any(keyword in filter_str for keyword in OCCUPATION_KEYWORDS)
-
-
-async def run_two_phase_demographic_search(
-    request,
-    analysis,
-    extracted_entities,
-    filters: List[Dict[str, Any]],
-    size: int,
-    age_gender_filters: List[Dict[str, Any]],
-    occupation_filters: List[Dict[str, Any]],
-    data_fetcher: "DataFetcher",
-    timings: Dict[str, float],
-    overall_start: float,
-) -> Optional[SearchResponse]:
-    """두 단계 검색으로 user_id를 먼저 좁히고 정밀 조회"""
-    logger.info("🚀 두 단계 인구통계 최적화 실행")
-
-    async_client = data_fetcher.os_async_client
-    sync_client = data_fetcher.os_client
-    if not (async_client or sync_client):
-        logger.warning("⚠️ OpenSearch 클라이언트가 없어 2단계 검색을 건너뜁니다")
-        return None
-
-    stage1_start = perf_counter()
-    stage1_query_size = min(max(size * 50, 2000), 10000)
-    stage1_query = {
-        "query": {
-            "bool": {
-                "must": age_gender_filters
-            }
-        },
-        "size": stage1_query_size,
-        "_source": ["user_id"],
-        "track_total_hits": True
-    }
-
-    try:
-        # ⭐ survey_responses_merged만 사용
-        if async_client:
-            response_1st = await data_fetcher.search_opensearch_async(
-                index_name=request.index_name,  # survey_responses_merged
-                query=stage1_query,
-                size=stage1_query_size,
-                source_filter=None,
-                request_timeout=DEFAULT_OS_TIMEOUT,
-            )
-        else:
-            response_1st = data_fetcher.search_opensearch(
-                index_name=request.index_name,  # survey_responses_merged
-                query=stage1_query,
-                size=stage1_query_size,
-                source_filter=None,
-                request_timeout=DEFAULT_OS_TIMEOUT,
-            )
-    except Exception as e:
-        logger.warning(f"⚠️ 2단계 검색 Stage1 실패: {e}")
-        return None
-
-    timings['two_phase_stage1_ms'] = (perf_counter() - stage1_start) * 1000
-    hits_1st = response_1st.get('hits', {}).get('hits', [])
-    total_stage1 = response_1st.get('hits', {}).get('total', {}).get('value', len(hits_1st))
-
-    if not hits_1st:
-        logger.info("   ⚠️ Stage1에서 조건을 만족하는 user_id가 없습니다")
-        total_time = (perf_counter() - overall_start) * 1000
-        timings['total_ms'] = total_time
-        timings.setdefault('two_phase_stage2_ms', 0.0)
-        timings.setdefault('two_phase_fetch_demographics_ms', 0.0)
-        timings.setdefault('lazy_join_ms', 0.0)
-        timings.setdefault('post_filter_ms', 0.0)
-        timings.setdefault('rrf_recombination_ms', 0.0)
-        timings.setdefault('qdrant_parallel_ms', 0.0)
-        timings.setdefault('opensearch_parallel_ms', timings['two_phase_stage1_ms'])
-        logger.info("📈 성능 측정 요약 (ms):")
-        for key in sorted(timings.keys()):
-            logger.info(f"  - {key}: {timings[key]:.2f}")
-        return SearchResponse(
-            query=request.query,
-            session_id=getattr(request, "session_id", None),
-            total_hits=0,
-            max_score=0.0,
-            results=[],
-            query_analysis={
-                "intent": analysis.intent,
-                "must_terms": analysis.must_terms,
-                "should_terms": analysis.should_terms,
-                "alpha": analysis.alpha,
-                "confidence": analysis.confidence,
-                "extracted_entities": extracted_entities.to_dict(),
-                "filters": filters,
-                "size": size,
-                "timings_ms": timings,
-            },
-            took_ms=int(total_time)
-        )
-
-    user_ids_filtered = []
-    for hit in hits_1st:
-        src = hit.get('_source', {})
-        uid = src.get('user_id') or hit.get('_id')
-        if uid:
-            user_ids_filtered.append(uid)
-    user_ids_filtered = list(dict.fromkeys(user_ids_filtered))
-
-    logger.info(f"   ✅ Stage1 user_id 추출: {len(user_ids_filtered)}/{total_stage1}건")
-    if total_stage1 > len(user_ids_filtered):
-        logger.warning("   ⚠️ Stage1 size 제한으로 일부 user_id가 제외되었습니다")
-
-    if not user_ids_filtered:
-        total_time = (perf_counter() - overall_start) * 1000
-        timings['two_phase_stage2_ms'] = 0.0
-        timings['two_phase_fetch_demographics_ms'] = 0.0
-        timings['lazy_join_ms'] = 0.0
-        timings['post_filter_ms'] = 0.0
-        timings['rrf_recombination_ms'] = 0.0
-        timings.setdefault('opensearch_parallel_ms', timings['two_phase_stage1_ms'])
-        timings['total_ms'] = total_time
-        logger.info("📈 성능 측정 요약 (ms):")
-        for key in sorted(timings.keys()):
-            logger.info(f"  - {key}: {timings[key]:.2f}")
-        return SearchResponse(
-            query=request.query,
-            session_id=getattr(request, "session_id", None),
-            total_hits=0,
-            max_score=0.0,
-            results=[],
-            query_analysis={
-                "intent": analysis.intent,
-                "must_terms": analysis.must_terms,
-                "should_terms": analysis.should_terms,
-                "alpha": analysis.alpha,
-                "confidence": analysis.confidence,
-                "extracted_entities": extracted_entities.to_dict(),
-                "filters": filters,
-                "size": size,
-                "timings_ms": timings,
-            },
-            took_ms=int(total_time)
-        )
-
-    max_terms = 10000
-    if len(user_ids_filtered) > max_terms:
-        logger.warning(f"   ⚠️ user_id가 {len(user_ids_filtered)}건입니다. 상위 {max_terms}건만 사용합니다")
-        user_ids_filtered = user_ids_filtered[:max_terms]
-
-    detail_size = max(size * 2, min(len(user_ids_filtered), 500))
-    stage2_query = {
-        "query": {
-            "bool": {
-                "must": [
-                    {"terms": {"_id": user_ids_filtered}},
-                ]
-            }
-        },
-        "size": detail_size,
-        "_source": {
-            "includes": ["user_id", "metadata", "qa_pairs", "timestamp"]
-        },
-        "track_total_hits": True
-    }
-
-    stage2_start = perf_counter()
-    try:
-        # ⭐ survey_responses_merged만 사용
-        if async_client:
-            response_2nd = await data_fetcher.search_opensearch_async(
-                index_name=request.index_name,  # survey_responses_merged
-                query=stage2_query,
-                size=detail_size,
-                source_filter=None,
-                request_timeout=DEFAULT_OS_TIMEOUT,
-            )
-        else:
-            response_2nd = data_fetcher.search_opensearch(
-                index_name=request.index_name,  # survey_responses_merged
-                query=stage2_query,
-                size=detail_size,
-                source_filter=None,
-                request_timeout=DEFAULT_OS_TIMEOUT,
-            )
-    except Exception as e:
-        logger.warning(f"⚠️ 2단계 검색 Stage2 실패: {e}")
-        return None
-
-    timings['two_phase_stage2_ms'] = (perf_counter() - stage2_start) * 1000
-    hits_2nd = response_2nd.get('hits', {}).get('hits', [])
-    total_stage2 = response_2nd.get('hits', {}).get('total', {}).get('value', len(hits_2nd))
-    logger.info(f"   ✅ Stage2 결과: {len(hits_2nd)}건 (총 {total_stage2}건)")
-
-    if not hits_2nd:
-        total_time = (perf_counter() - overall_start) * 1000
-        timings.setdefault('two_phase_fetch_demographics_ms', 0.0)
-        timings['lazy_join_ms'] = 0.0
-        timings['post_filter_ms'] = 0.0
-        timings['rrf_recombination_ms'] = 0.0
-        timings.setdefault('opensearch_parallel_ms', timings.get('two_phase_stage1_ms', 0.0))
-        timings['total_ms'] = total_time
-        logger.info("📈 성능 측정 요약 (ms):")
-        for key in sorted(timings.keys()):
-            logger.info(f"  - {key}: {timings[key]:.2f}")
-        return SearchResponse(
-            query=request.query,
-            session_id=getattr(request, "session_id", None),
-            total_hits=0,
-            max_score=0.0,
-            results=[],
-            query_analysis={
-                "intent": analysis.intent,
-                "must_terms": analysis.must_terms,
-                "should_terms": analysis.should_terms,
-                "alpha": analysis.alpha,
-                "confidence": analysis.confidence,
-                "extracted_entities": extracted_entities.to_dict(),
-                "filters": filters,
-                "size": size,
-                "timings_ms": timings,
-            },
-            took_ms=int(total_time)
-        )
-
-    final_hits = hits_2nd[:size]
-    final_user_ids = [hit.get('_id') or hit.get('_source', {}).get('user_id') for hit in final_hits]
-
-    # ⭐ survey_responses_merged만 사용하므로 welcome_1st/welcome_2nd 조회 제거
-    timings['two_phase_fetch_demographics_ms'] = 0.0
-
-    results: List[SearchResult] = []
-    lazy_join_start = perf_counter()
-    final_hits = final_hits if 'final_hits' in locals() else []
-    for doc in final_hits:
-        source = doc.get('_source', {}) or {}
-        user_id = source.get('user_id') or hit.get('_id', '')
-        # ⭐ survey_responses_merged만 사용하므로 source의 metadata에서 직접 가져오기
-        source_metadata = source.get('metadata', {}) if isinstance(source, dict) else {}
-
-        behavioral_values = behavior_values_map.get(user_id, {}) if user_id else {}
-        behavioral_info: Dict[str, Any] = {}
-        if behavioral_values.get("smoker") is not None:
-            behavioral_info["smoker"] = behavioral_values.get("smoker")
-        if behavioral_values.get("has_vehicle") is not None:
-            behavioral_info["has_vehicle"] = behavioral_values.get("has_vehicle")
-        if behavioral_values.get("drinker") is not None:
-            behavioral_info["drinker"] = behavioral_values.get("drinker")
-
-        demographic_info: Dict[str, Any] = {}
-        if source_metadata:
-            demographic_info["age_group"] = source_metadata.get("age_group")
-            demographic_info["gender"] = source_metadata.get("gender")
-            demographic_info["birth_year"] = source_metadata.get("birth_year")
-            demographic_info["region"] = source_metadata.get("region")
-            demographic_info['occupation'] = source_metadata.get('occupation')
-            demographic_info["marital_status"] = source_metadata.get("marital_status")
-            demographic_info["sub_region"] = source_metadata.get("sub_region")
-            demographic_info["panel"] = source_metadata.get("panel")
-
-        if 'occupation' not in demographic_info or not demographic_info['occupation']:
-            qa_pairs_for_occ = source.get('qa_pairs', []) if isinstance(source, dict) else []
-            for qa in qa_pairs_for_occ:
-                if isinstance(qa, dict):
-                    q_text = qa.get('q_text', '')
-                    answer = str(qa.get('answer', qa.get('answer_text', '')))
-                    if '직업' in q_text or 'occupation' in q_text.lower() or '직무' in q_text:
-                        if answer:
-                            demographic_info['occupation'] = answer
-                        break
-
-        # marital_status를 qa_pairs에서 찾기
-        if 'marital_status' not in demographic_info or not demographic_info['marital_status']:
-            qa_pairs_list = source.get('qa_pairs', []) if isinstance(source, dict) else []
-            for qa in qa_pairs_list:
-                if isinstance(qa, dict):
-                    q_text = qa.get('q_text', '')
-                    answer = str(qa.get('answer', qa.get('answer_text', '')))
-                    if '결혼' in q_text or '혼인' in q_text:
-                        if answer:
-                            demographic_info['marital_status'] = answer
-                        break
-
-        # sub_region을 qa_pairs에서 찾기
-        if 'sub_region' not in demographic_info or not demographic_info['sub_region']:
-            qa_pairs_list = source.get('qa_pairs', []) if isinstance(source, dict) else []
-            for qa in qa_pairs_list:
-                if isinstance(qa, dict):
-                    q_text = qa.get('q_text', '')
-                    answer = str(qa.get('answer', qa.get('answer_text', '')))
-                    if '구' in q_text or '군' in q_text or '세부지역' in q_text or '어느 구' in q_text:
-                        if answer:
-                            demographic_info['sub_region'] = answer
-                        break
-
-        matched_qa = []
-        inner_hits = hit.get('inner_hits', {}).get('qa_pairs', {}).get('hits', {}).get('hits', [])
-        for inner_hit in inner_hits:
-            qa_data = inner_hit.get('_source', {}).copy()
-            qa_data['match_score'] = inner_hit.get('_score')
-            if 'highlight' in inner_hit:
-                qa_data['highlights'] = inner_hit['highlight']
-            matched_qa.append(qa_data)
-
-        # survey_datetime 추출 (metadata에서)
-        survey_datetime = None
-        if source_metadata and isinstance(source_metadata, dict):
-            survey_datetime = source_metadata.get("survey_datetime")
-        elif isinstance(source, dict):
-            metadata = source.get("metadata", {})
-            if isinstance(metadata, dict):
-                survey_datetime = metadata.get("survey_datetime")
-
-        results.append(
-            SearchResult(
-                user_id=user_id,
-                score=hit.get('_score', 0.0),
-                timestamp=source.get('timestamp') if isinstance(source, dict) else None,
-                survey_datetime=survey_datetime,
-                demographic_info=demographic_info if demographic_info else None,
-                behavioral_info=behavioral_info if behavioral_info else None,
-                qa_pairs=source.get('qa_pairs', [])[:5] if isinstance(source, dict) else [],
-                matched_qa_pairs=matched_qa,
-                highlights=hit.get('highlight'),
-            )
-        )
-    timings['lazy_join_ms'] = (perf_counter() - lazy_join_start) * 1000
-
-    timings.setdefault('post_filter_ms', 0.0)
-    timings.setdefault('rrf_recombination_ms', 0.0)
-    timings.setdefault('qdrant_parallel_ms', 0.0)
-    timings.setdefault('opensearch_parallel_ms', timings.get('two_phase_stage1_ms', 0.0) + timings.get('two_phase_stage2_ms', 0.0))
-
-    total_duration_ms = (perf_counter() - overall_start) * 1000
-    timings['total_ms'] = total_duration_ms
-
-    logger.info("📈 성능 측정 요약 (ms):")
-    for key in sorted(timings.keys()):
-        logger.info(f"  - {key}: {timings[key]:.2f}")
-
-    response_took_ms = int(total_duration_ms)
-    total_hits = len(final_hits)
-    max_score = final_hits[0].get('_score', 0.0) if final_hits else 0.0
-
-    response_payload = SearchResponse(
-        query=request.query,
-        total_hits=total_hits,
-        max_score=max_score,
-        results=results,
-        query_analysis={
-            "intent": analysis.intent,
-            "must_terms": analysis.must_terms,
-            "should_terms": analysis.should_terms,
-            "alpha": analysis.alpha,
-            "confidence": analysis.confidence,
-            "extracted_entities": extracted_entities.to_dict(),
-            "filters": filters,
-            "size": size,
-            "timings_ms": timings,
-        },
-        took_ms=response_took_ms,
-    )
-    return response_payload
 
 def get_user_id_from_doc(doc: Dict[str, Any]) -> Optional[str]:
+    """문서에서 user_id 추출"""
     if not isinstance(doc, dict):
         return None
     source = doc.get('_source')
@@ -5471,11 +5686,6 @@ def get_user_id_from_doc(doc: Dict[str, Any]) -> Optional[str]:
         uid = source.get('user_id')
         if uid:
             return uid
-        payload = source.get('payload')
-        if isinstance(payload, dict):
-            uid = payload.get('user_id')
-            if uid:
-                return uid
     uid = doc.get('_id')
     if uid:
         return uid

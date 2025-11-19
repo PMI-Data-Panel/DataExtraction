@@ -18,11 +18,18 @@ class Config:
     OPENSEARCH_HOST: str = os.getenv("OPENSEARCH_HOST", "localhost")
     OPENSEARCH_PORT: int = int(os.getenv("OPENSEARCH_PORT", "9200"))
     OPENSEARCH_USER: str = os.getenv("OPENSEARCH_USER", "admin")
+    OPENSEARCH_USERNAME: str = os.getenv("OPENSEARCH_USERNAME", os.getenv("OPENSEARCH_USER", "admin"))  # OPENSEARCH_USER와 동일하게 사용
     OPENSEARCH_PASSWORD: str = os.getenv("OPENSEARCH_PASSWORD", "admin")
     OPENSEARCH_USE_SSL: bool = os.getenv("OPENSEARCH_USE_SSL", "true").lower() == "true"
     OPENSEARCH_VERIFY_CERTS: bool = os.getenv("OPENSEARCH_VERIFY_CERTS", "false").lower() == "true"
     OPENSEARCH_SSL_ASSERT_HOSTNAME: bool = os.getenv("OPENSEARCH_SSL_ASSERT_HOSTNAME", "false").lower() == "true"
     OPENSEARCH_VERSION: float = float(os.getenv("OPENSEARCH_VERSION", "2.11"))
+    
+    # --- OpenSearch Dashboards ---
+    # OpenSearch와 동일한 호스트 사용, 포트만 다름 (기본값: 5601)
+    OPENSEARCH_DASHBOARDS_HOST: str = os.getenv("OPENSEARCH_DASHBOARDS_HOST", os.getenv("OPENSEARCH_HOST", "localhost"))
+    OPENSEARCH_DASHBOARDS_PORT: int = int(os.getenv("OPENSEARCH_DASHBOARDS_PORT", "5601"))
+    OPENSEARCH_DASHBOARDS_USE_SSL: bool = os.getenv("OPENSEARCH_DASHBOARDS_USE_SSL", os.getenv("OPENSEARCH_USE_SSL", "false")).lower() == "true"
 
     # --- Elasticsearch (레거시) ---
     ES_HOST: str = os.getenv("ES_HOST", "http://localhost:9200")

@@ -34,7 +34,12 @@ class DemographicExtractor:
     OCCUPATION_MAP = {
         # canonical: value normalized for metadata.occupation
         "사무직": {"value": "office", "synonyms": {"사무직", "사무원", "화이트칼라", "직장인"}},
-        "학생": {"value": "student", "synonyms": {"학생", "대학생", "고등학생", "중/고등학생", "대학생/대학원생"}},
+        # ⭐ 학생 세분화 (더 구체적인 것을 먼저 배치)
+        "대학생/대학원생": {"value": "university_graduate_student", "synonyms": {"대학생/대학원생"}},
+        "대학원생": {"value": "graduate_student", "synonyms": {"대학원생", "석사과정", "박사과정"}},
+        "대학생": {"value": "university_student", "synonyms": {"대학생", "대학교 학생", "대학교생"}},
+        "중/고등학생": {"value": "middle_high_student", "synonyms": {"중/고등학생", "중고등학생", "중학생", "고등학생"}},
+        "학생": {"value": "student", "synonyms": {"학생"}},  # 일반적인 "학생"
         "자영업": {"value": "self_employed", "synonyms": {"자영업", "소상공인"}},
         "전문직": {"value": "professional", "synonyms": {"전문직", "의사", "변호사", "회계사", "간호사", "엔지니어", "프로그래머"}},
         "서비스직": {"value": "service", "synonyms": {"서비스직", "서비스업", "미용", "통신", "안내", "요식업", "요식"}},
@@ -426,16 +431,26 @@ class DemographicExtractor:
         return None
 
     def _match_occupation(self, text: str):
-        """직업 매칭 (단어 경계 확인, 조사 허용)"""
-        # 단어 경계를 고려한 매칭 (조사 허용: "학생인", "학생이" 등)
+        """직업 매칭 (단어 경계 확인, 조사 허용, 긴 매칭 우선)"""
+        # ⭐ 더 긴 매칭을 우선하기 위해 모든 매칭을 수집한 후 정렬
+        matches = []
+
         for canon, info in self.OCCUPATION_MAP.items():
             for syn in info["synonyms"]:
                 # 단어 경계를 고려한 정규식 패턴
                 # 조사 허용: "학생인", "학생이", "학생을" 등
-                # ⭐ "쪽", "계열", "관련" 등 추가
                 pattern = r'(^|\s)' + re.escape(syn) + r'(\s|인|이|을|를|은|는|의|에|에서|와|과|쪽|계열|관련|분야|계통|$)'
                 if re.search(pattern, text):
-                    return canon, info["value"], info["synonyms"]
+                    # (매칭된 synonym 길이, canonical, info) 저장
+                    matches.append((len(syn), canon, info))
+                    break  # 같은 canonical에서 여러 synonym 중복 방지
+
+        if matches:
+            # 가장 긴 매칭 우선 (예: "대학생"이 "학생"보다 우선)
+            matches.sort(key=lambda x: x[0], reverse=True)
+            _, canon, info = matches[0]
+            return canon, info["value"], info["synonyms"]
+
         return None
 
     def parse_requested_size(self, text: str, default_size: int = 10, max_size: int = 1000) -> int:
