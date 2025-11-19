@@ -3,4 +3,14 @@
 .venv
 __pycache__
 __pycache__/
+<<<<<<< HEAD
 *.pyc
+=======
+*.pyc
+
+# SSL 인증서 (민감한 정보)
+nginx/ssl/*.key
+nginx/ssl/*.crt
+nginx/certbot/conf/
+nginx/certbot/www/
+

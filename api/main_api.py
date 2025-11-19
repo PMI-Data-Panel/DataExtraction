@@ -10,7 +10,6 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 import redis
 import anthropic
-
 # 설정
 from rag_query_analyzer.config import get_config, Config
 
@@ -18,6 +17,7 @@ from rag_query_analyzer.config import get_config, Config
 from indexer.router import router as indexer_router
 from .search_api import router as search_router
 from .visualization_api import router as visualization_router
+from .visualization_qa_api import router as visualization_qa_router
 from .search.refine_api import router as refine_router
 
 # --- 로깅 설정 ---
@@ -67,6 +67,9 @@ def create_app() -> FastAPI:
                 "http://127.0.0.1:5174",
                 "http://127.0.0.1:3000",
                 "http://127.0.0.1:8080",
+
+                # 프론트엔드 프로덕션 도메인
+                "https://data-panel-fe-six.vercel.app",
             ]
             # 환경변수에서 추가 오리진을 가져올 수 있음
             extra_origins = os.getenv("CORS_ORIGINS", "").split(",")
@@ -189,6 +192,8 @@ def create_app() -> FastAPI:
 
         # Visualization 라우터에 의존성 주입
         visualization_router.os_client = os_client
+        visualization_qa_router.os_client = os_client
+
 
         # Refine 라우터에 의존성 주입 (search_router와 동일한 의존성 공유)
         refine_router.os_client = os_client
@@ -362,6 +367,7 @@ def create_app() -> FastAPI:
         app.include_router(indexer_router)
         app.include_router(search_router)
         app.include_router(visualization_router)
+        app.include_router(visualization_qa_router)
         app.include_router(refine_router)
 
         return app

@@ -1,0 +1,254 @@
+[
+  {
+    "behavior_key": "smoker",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "흡연 경험 일반 담배브랜드",
+    "sample_user": "w59662057473609",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "has_vehicle",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "자동차 제조사",
+    "sample_user": "w338514789929409",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "drinker",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "음용경험 술",
+    "sample_user": "w338514789929409",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "ott_user",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "여러분이 현재 이용 중인 OTT 서비스는 몇 개인가요?",
+    "sample_user": "w47443699219576",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "has_pet",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "여러분은 반려동물을 키우는 중이시거나 혹은 키워보신 적이 있으신가요?",
+    "sample_user": "w57897343723659",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "ai_user",
+    "status": "✅ PASS",
+    "reason": "Extracted: False",
+    "found_questions": 1,
+    "sample_question": "여러분은 요즘 어떤 분야에서 AI 서비스를 활용하고 계신가요?",
+    "sample_user": "w98739254731810",
+    "extraction_result": false
+  },
+  {
+    "behavior_key": "exercises",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "여러분은 평소 체력 관리를 위해 어떤 활동을 하고 계신가요? 모두 선택해주세요.",
+    "sample_user": "w57897343723659",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "uses_fast_delivery",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "빠른 배송(당일·새벽·직진 배송) 서비스를 주로 어떤 제품을 구매할 때 이용하시나요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "visits_traditional_market",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "여러분은 전통시장을 얼마나 자주 방문하시나요?",
+    "sample_user": "w47443699219576",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "has_stress",
+    "status": "⚠️ PARTIAL",
+    "reason": "Question found, but extraction failed",
+    "found_questions": 1,
+    "sample_question": "다음 중 가장 스트레스를 많이 느끼는 상황은 무엇인가요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": null
+  },
+  {
+    "behavior_key": "travels",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "여러분은 올해 해외여행을 간다면 어디로 가고 싶나요? 모두 선택해주세요",
+    "sample_user": "w122442293597342",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "uses_food_delivery",
+    "status": "✅ PASS",
+    "reason": "Extracted: False",
+    "found_questions": 1,
+    "sample_question": "여러분은 야식을 먹을 때 보통 어떤 방법으로 드시나요?",
+    "sample_user": "w47443699219576",
+    "extraction_result": false
+  },
+  {
+    "behavior_key": "drinks_coffee",
+    "status": "⚠️ PARTIAL",
+    "reason": "Question found, but extraction failed",
+    "found_questions": 1,
+    "sample_question": "보유가전제품",
+    "sample_user": "w338514789929409",
+    "extraction_result": null
+  },
+  {
+    "behavior_key": "has_subscription",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "여러분은 할인, 캐시백, 멤버십 등 포인트 적립 혜택을 얼마나 신경 쓰시나요?",
+    "sample_user": "w98739254731810",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "uses_social_media",
+    "status": "⚠️ PARTIAL",
+    "reason": "Question found, but extraction failed",
+    "found_questions": 1,
+    "sample_question": "여러분은 요즘 가장 많이 사용하는 앱은 무엇인가요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": null
+  },
+  {
+    "behavior_key": "plays_games",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "여러분은 요즘 가장 많이 사용하는 앱은 무엇인가요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "watches_movies_dramas",
+    "status": "⚠️ PARTIAL",
+    "reason": "Question found, but extraction failed",
+    "found_questions": 1,
+    "sample_question": "여러분은 요즘 가장 많이 사용하는 앱은 무엇인가요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": null
+  },
+  {
+    "behavior_key": "uses_financial_services",
+    "status": "⚠️ PARTIAL",
+    "reason": "Question found, but extraction failed",
+    "found_questions": 1,
+    "sample_question": "여러분은 요즘 가장 많이 사용하는 앱은 무엇인가요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": null
+  },
+  {
+    "behavior_key": "uses_beauty_products",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "한 달 기준으로 스킨케어 제품에 평균적으로 얼마나 소비하시나요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "shops_fashion",
+    "status": "⚠️ PARTIAL",
+    "reason": "Question found, but extraction failed",
+    "found_questions": 1,
+    "sample_question": "여러분은 본인을 위해 소비하는 것 중 가장 기분 좋아지는 소비는 무엇인가요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": null
+  },
+  {
+    "behavior_key": "interested_in_home_appliances",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "보유가전제품",
+    "sample_user": "w338514789929409",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "uses_smart_devices",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "보유가전제품",
+    "sample_user": "w338514789929409",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "cares_about_environment",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "평소 일회용 비닐봉투 사용을 줄이기 위해 어떤 노력을 하고 계신가요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "does_charity",
+    "status": "✅ PASS",
+    "reason": "Extracted: False",
+    "found_questions": 1,
+    "sample_question": "여러분은 버리기 아까운 물건이 있을 때, 주로 어떻게 하시나요?",
+    "sample_user": "w98739254731810",
+    "extraction_result": false
+  },
+  {
+    "behavior_key": "interested_in_cars",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "보유차량여부",
+    "sample_user": "w338514789929409",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "uses_parcel_delivery",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "빠른 배송(당일·새벽·직진 배송) 서비스를 주로 어떤 제품을 구매할 때 이용하시나요?",
+    "sample_user": "w122442293597342",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "dines_out",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "여러분은 외부 식당에서 혼자 식사하는 빈도는 어느 정도인가요?",
+    "sample_user": "w98739254731810",
+    "extraction_result": true
+  },
+  {
+    "behavior_key": "attends_drinking_gatherings",
+    "status": "✅ PASS",
+    "reason": "Extracted: True",
+    "found_questions": 1,
+    "sample_question": "음용경험 술",
+    "sample_user": "w338514789929409",
+    "extraction_result": true
+  }
+]

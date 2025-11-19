@@ -98,13 +98,7 @@ services:
     # Redis 안정성을 위한 설정
     # 손상된 RDB 파일 문제 해결: RDB 저장 비활성화하고 AOF만 사용
     command: >
-      redis-server
-      --appendonly yes
-      --appendfsync everysec
-      --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
-      --save ""
-      --loglevel notice
+      redis-server --appendonly yes --appendfsync everysec --maxmemory 256mb --maxmemory-policy allkeys-lru --save "" --loglevel notice
 
     volumes:
       - redis_data:/data
@@ -114,7 +108,7 @@ services:
 
     # 헬스 체크 추가
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -142,7 +136,7 @@ services:
     networks:
       - rag_net
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9100/metrics || exit 1"]
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9100/metrics || exit 1" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -168,7 +162,7 @@ services:
     networks:
       - rag_net
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -204,11 +198,29 @@ services:
     depends_on:
       - prometheus
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1" ]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # 6. Nginx 리버스 프록시 (HTTPS - 간편 설정)
+  nginx:
+    container_name: nginx
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    restart: unless-stopped
+    networks:
+      - rag_net
+    depends_on:
+      - fastapi_server
+      - grafana
+      - prometheus
 
 networks:
   rag_net:
