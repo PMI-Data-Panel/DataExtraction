@@ -108,7 +108,7 @@ async def get_question_fields(
 
 @router.get("/question/{question_field}", response_model=QuestionDistributionResponse, summary="질문별 답변 분포 조회")
 async def get_question_distribution(
-    question_field: str = Field(..., description="질문 필드명 (예: q_marriage, q_education)"),
+    question_field: str,  # Path parameter는 Field() 사용 불가
     index_name: str = Query(default="survey_qa_analysis", description="인덱스 이름"),
     os_client: OpenSearch = Depends(get_os_client)
 ):
