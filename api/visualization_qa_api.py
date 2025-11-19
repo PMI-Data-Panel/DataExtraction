@@ -45,6 +45,21 @@ class QuestionListResponse(BaseModel):
     questions: List[Dict[str, str]] = Field(..., description="질문 필드 목록 (필드명, 설명)")
 
 
+class QuestionSummary(BaseModel):
+    """질문 요약 정보"""
+    question_field: str = Field(..., description="질문 필드명")
+    question_description: str = Field(..., description="질문 설명")
+    total_responses: int = Field(..., description="전체 응답 수")
+    top_answers: List[AnswerDistribution] = Field(..., description="상위 답변 (최대 5개)")
+
+
+class DashboardResponse(BaseModel):
+    """대시보드 전체 데이터 응답"""
+    total_users: int = Field(..., description="전체 사용자 수")
+    metadata_summary: Dict[str, Any] = Field(..., description="메타데이터 요약 (성별, 나이대, 지역 분포)")
+    question_summaries: List[QuestionSummary] = Field(..., description="주요 질문들의 답변 경향 요약")
+
+
 def get_os_client():
     """OpenSearch 클라이언트 가져오기"""
     if router.os_client is None:
@@ -138,7 +153,8 @@ async def get_question_distribution(
         response = os_client.search(index=index_name, body=query)
         
         total = response["hits"]["total"]["value"]
-        buckets = response["aggs"]["answer_distribution"]["buckets"]
+        aggs = response.get("aggregations", {})
+        buckets = aggs.get("answer_distribution", {}).get("buckets", [])
         
         answer_distribution = []
         for bucket in buckets:
@@ -220,19 +236,21 @@ async def get_filtered_stats(
         total = response["hits"]["total"]["value"]
         
         # 집계 결과 변환
+        aggs = response.get("aggregations", {})
+        
         gender_dist = [
             {"label": b["key"], "value": b["doc_count"], "percentage": round((b["doc_count"] / total * 100), 2)}
-            for b in response["aggs"]["gender_dist"]["buckets"]
+            for b in aggs.get("gender_dist", {}).get("buckets", [])
         ]
         
         age_group_dist = [
             {"label": b["key"], "value": b["doc_count"], "percentage": round((b["doc_count"] / total * 100), 2)}
-            for b in response["aggs"]["age_group_dist"]["buckets"]
+            for b in aggs.get("age_group_dist", {}).get("buckets", [])
         ]
         
         region_dist = [
             {"label": b["key"], "value": b["doc_count"], "percentage": round((b["doc_count"] / total * 100), 2)}
-            for b in response["aggs"]["region_dist"]["buckets"]
+            for b in aggs.get("region_dist", {}).get("buckets", [])
         ]
         
         return FilteredStatsResponse(
@@ -283,8 +301,9 @@ async def get_cross_analysis(
         
         response = os_client.search(index=index_name, body=query)
         
+        aggs = response.get("aggregations", {})
         result = []
-        for bucket1 in response["aggs"]["field1_dist"]["buckets"]:
+        for bucket1 in aggs.get("field1_dist", {}).get("buckets", []):
             field1_value = bucket1["key"]
             field2_dist = []
             
@@ -309,5 +328,235 @@ async def get_cross_analysis(
     
     except Exception as e:
         logger.error(f"Error getting cross analysis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/dashboard", response_model=DashboardResponse, summary="전체 데이터 답변 경향 대시보드")
+async def get_dashboard(
+    index_name: str = Query(default="survey_qa_analysis", description="인덱스 이름"),
+    question_fields: Optional[str] = Query(
+        None, 
+        description="조회할 질문 필드 목록 (쉼표로 구분, 예: q_marriage,q_education,q_job). 없으면 주요 질문 자동 선택"
+    ),
+    top_n: int = Query(default=5, description="각 질문별 상위 답변 개수"),
+    os_client: OpenSearch = Depends(get_os_client)
+):
+    """
+    전체 데이터의 답변 경향을 한 번에 조회합니다.
+    
+    - 전체 사용자 수
+    - 메타데이터 분포 (성별, 나이대, 지역)
+    - 주요 질문들의 답변 경향 (상위 답변만)
+    
+    예시:
+    - /visualization/qa/dashboard
+    - /visualization/qa/dashboard?question_fields=q_marriage,q_education,q_job&top_n=3
+    """
+    try:
+        # 1. 전체 사용자 수 및 메타데이터 분포 조회
+        metadata_query = {
+            "size": 0,
+            "aggs": {
+                "gender_dist": {
+                    "terms": {"field": "meta_gender.keyword", "size": 10}
+                },
+                "age_group_dist": {
+                    "terms": {"field": "meta_age_group.keyword", "size": 10}
+                },
+                "region_dist": {
+                    "terms": {"field": "meta_region.keyword", "size": 20}
+                }
+            }
+        }
+        
+        metadata_response = os_client.search(index=index_name, body=metadata_query)
+        total_users = metadata_response["hits"]["total"]["value"]
+        metadata_aggs = metadata_response.get("aggregations", {})
+        
+        metadata_summary = {
+            "gender_distribution": [
+                {"label": b["key"], "value": b["doc_count"], "percentage": round((b["doc_count"] / total_users * 100), 2)}
+                for b in metadata_aggs.get("gender_dist", {}).get("buckets", [])
+            ],
+            "age_group_distribution": [
+                {"label": b["key"], "value": b["doc_count"], "percentage": round((b["doc_count"] / total_users * 100), 2)}
+                for b in metadata_aggs.get("age_group_dist", {}).get("buckets", [])
+            ],
+            "region_distribution": [
+                {"label": b["key"], "value": b["doc_count"], "percentage": round((b["doc_count"] / total_users * 100), 2)}
+                for b in metadata_aggs.get("region_dist", {}).get("buckets", [])
+            ]
+        }
+        
+        # 2. 조회할 질문 필드 결정
+        if question_fields:
+            # 사용자가 지정한 필드 사용
+            fields_to_query = [f.strip() for f in question_fields.split(",") if f.strip()]
+        else:
+            # 주요 질문 필드 자동 선택
+            mapping = os_client.indices.get_mapping(index=index_name)
+            index_mapping = mapping[index_name]["mappings"]["properties"]
+            
+            # 주요 질문 필드 우선순위
+            priority_fields = [
+                "q_marriage", "q_education", "q_job", "q_appliances",
+                "q_phone_brand", "q_car_owned", "q_car_brand",
+                "q_smoke_type", "q_drink_type", "q_personal_income"
+            ]
+            
+            fields_to_query = [
+                field for field in priority_fields 
+                if field in index_mapping
+            ][:10]  # 최대 10개만
+        
+        # 3. 각 질문 필드의 답변 분포 조회
+        question_summaries = []
+        question_mapping = {
+            "q_gender": "성별",
+            "q_birth_year": "출생년도",
+            "q_region": "지역",
+            "q_sub_region": "세부 지역",
+            "q_marriage": "결혼여부",
+            "q_children_count": "자녀수",
+            "q_family_count": "가족수",
+            "q_education": "최종학력",
+            "q_job": "직업",
+            "q_job_role": "직무",
+            "q_personal_income": "월평균 개인소득",
+            "q_household_income": "월평균 가구소득",
+            "q_appliances": "보유가전제품",
+            "q_phone_brand": "보유 휴대폰 브랜드",
+            "q_phone_model": "보유 휴대폰 모델",
+            "q_car_owned": "보유차량여부",
+            "q_car_brand": "자동차 제조사",
+            "q_car_model": "자동차 모델",
+            "q_smoke_type": "흡연경험",
+            "q_smoke_brand": "흡연경험 담배브랜드",
+            "q_drink_type": "음용경험 술",
+        }
+        
+        for field in fields_to_query:
+            try:
+                query = {
+                    "size": 0,
+                    "aggs": {
+                        "answer_distribution": {
+                            "terms": {
+                                "field": f"{field}.keyword",
+                                "size": top_n,
+                                "order": {"_count": "desc"}
+                            }
+                        }
+                    }
+                }
+                
+                response = os_client.search(index=index_name, body=query)
+                total = response["hits"]["total"]["value"]
+                aggs = response.get("aggregations", {})
+                buckets = aggs.get("answer_distribution", {}).get("buckets", [])
+                
+                top_answers = []
+                for bucket in buckets:
+                    count = bucket["doc_count"]
+                    percentage = round((count / total * 100), 2) if total > 0 else 0
+                    top_answers.append(AnswerDistribution(
+                        answer=bucket["key"],
+                        count=count,
+                        percentage=percentage
+                    ))
+                
+                question_summaries.append(QuestionSummary(
+                    question_field=field,
+                    question_description=question_mapping.get(field, field.replace("q_", "").replace("_", " ")),
+                    total_responses=total,
+                    top_answers=top_answers
+                ))
+            except Exception as e:
+                logger.warning(f"Error getting distribution for {field}: {e}")
+                continue
+        
+        return DashboardResponse(
+            total_users=total_users,
+            metadata_summary=metadata_summary,
+            question_summaries=question_summaries
+        )
+    
+    except Exception as e:
+        logger.error(f"Error getting dashboard: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/multiple-questions", summary="여러 질문의 답변 분포를 한 번에 조회")
+async def get_multiple_question_distributions(
+    question_fields: str = Query(..., description="질문 필드 목록 (쉼표로 구분, 예: q_marriage,q_education,q_job)"),
+    index_name: str = Query(default="survey_qa_analysis", description="인덱스 이름"),
+    top_n: int = Query(default=10, description="각 질문별 상위 답변 개수"),
+    os_client: OpenSearch = Depends(get_os_client)
+):
+    """
+    여러 질문의 답변 분포를 한 번에 조회합니다.
+    
+    예시:
+    - /visualization/qa/multiple-questions?question_fields=q_marriage,q_education,q_job
+    """
+    try:
+        fields_to_query = [f.strip() for f in question_fields.split(",") if f.strip()]
+        
+        if not fields_to_query:
+            raise HTTPException(status_code=400, detail="질문 필드를 최소 1개 이상 지정해야 합니다.")
+        
+        # 여러 질문을 한 번에 집계 (multi_terms 또는 각각 별도 집계)
+        # 성능을 위해 각 질문별로 별도 쿼리 실행
+        results = {}
+        
+        for field in fields_to_query:
+            try:
+                query = {
+                    "size": 0,
+                    "aggs": {
+                        "answer_distribution": {
+                            "terms": {
+                                "field": f"{field}.keyword",
+                                "size": top_n,
+                                "order": {"_count": "desc"}
+                            }
+                        }
+                    }
+                }
+                
+                response = os_client.search(index=index_name, body=query)
+                total = response["hits"]["total"]["value"]
+                aggs = response.get("aggregations", {})
+                buckets = aggs.get("answer_distribution", {}).get("buckets", [])
+                
+                answer_distribution = []
+                for bucket in buckets:
+                    count = bucket["doc_count"]
+                    percentage = round((count / total * 100), 2) if total > 0 else 0
+                    answer_distribution.append({
+                        "answer": bucket["key"],
+                        "count": count,
+                        "percentage": percentage
+                    })
+                
+                results[field] = {
+                    "question_field": field,
+                    "total_responses": total,
+                    "answer_distribution": answer_distribution
+                }
+            except Exception as e:
+                logger.warning(f"Error getting distribution for {field}: {e}")
+                results[field] = {
+                    "question_field": field,
+                    "error": str(e)
+                }
+        
+        return {
+            "index_name": index_name,
+            "questions": results
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting multiple question distributions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
