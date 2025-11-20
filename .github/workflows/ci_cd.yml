@@ -371,8 +371,6 @@ jobs:
               docker compose build --no-cache || docker build -t ${IMAGE_TAG} .
             }
             
-<<<<<<< HEAD
-=======
             echo "=== SSL 인증서 생성 (없는 경우) ==="
             if [ ! -f nginx/ssl/nginx-selfsigned.crt ] || [ ! -f nginx/ssl/nginx-selfsigned.key ]; then
               echo "SSL 인증서가 없습니다. 생성 중..."
@@ -397,7 +395,6 @@ jobs:
               echo "✅ SSL 인증서 이미 존재"
             fi
             
->>>>>>> 30bed4e1b5046741eeec00de15bff537a5ecb047
             echo "=== Docker Compose로 서비스 시작 ==="
             if [ -f docker-compose.yml ]; then
               # 기존 컨테이너 완전히 중지 및 제거
@@ -436,17 +433,9 @@ jobs:
                 fi
               done
               
-              # 최종 헬스 체크
+              # 최종 HTTP 헬스 체크
               if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
                  curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
-<<<<<<< HEAD
-                echo "✅ 헬스 체크 성공!"
-              else
-                echo "❌ 헬스 체크 실패"
-                echo "컨테이너 로그:"
-                docker compose logs fastapi_server
-                echo "⚠️ 헬스 체크 실패했지만 배포는 계속 진행합니다."
-=======
                 echo "✅ HTTP 헬스 체크 성공!"
               else
                 echo "❌ HTTP 헬스 체크 실패"
@@ -464,7 +453,6 @@ jobs:
               else
                 echo "⚠️ HTTPS 헬스 체크 실패 (Nginx가 아직 시작 중일 수 있음)"
                 docker compose logs nginx | tail -20 || true
->>>>>>> 30bed4e1b5046741eeec00de15bff537a5ecb047
               fi
             else
               # Docker Compose가 없는 경우 직접 컨테이너 실행
