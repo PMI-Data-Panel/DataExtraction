@@ -397,8 +397,8 @@ jobs:
             
             echo "=== Docker Compose로 서비스 시작 ==="
             if [ -f docker-compose.yml ]; then
-              # 기존 컨테이너 완전히 중지 및 제거
-              docker compose down -v || true
+              # 기존 컨테이너 중지 및 제거 (볼륨은 유지하여 Grafana/Prometheus 데이터 보존)
+              docker compose down || true
               
               # 이미지 태그 업데이트 (docker-compose.yml에 image 필드가 있는 경우)
               # 또는 로컬 빌드 사용

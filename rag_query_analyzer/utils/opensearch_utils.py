@@ -20,11 +20,7 @@ def create_opensearch_client(config: Config) -> OpenSearch:
         verify_certs=config.OPENSEARCH_VERIFY_CERTS,
         ssl_assert_hostname=config.OPENSEARCH_SSL_ASSERT_HOSTNAME,
         ssl_show_warn=False,
-<<<<<<< HEAD
         timeout=180,  # 대량 데이터 조회 대응 (전체 데이터 약 35000개)
-=======
-        timeout=30,
->>>>>>> 30bed4e1b5046741eeec00de15bff537a5ecb047
         max_retries=3,
         retry_on_timeout=True
     )
@@ -39,7 +35,6 @@ def create_opensearch_client(config: Config) -> OpenSearch:
         raise
 
 
-<<<<<<< HEAD
 def ensure_max_result_window(client: OpenSearch, index_name: str, max_result_window: int = 50000) -> bool:
     """
     인덱스의 max_result_window 설정을 확인하고 필요시 업데이트
@@ -86,7 +81,8 @@ def ensure_max_result_window(client: OpenSearch, index_name: str, max_result_win
     except Exception as e:
         logger.error(f"❌ 인덱스 {index_name}의 max_result_window 설정 실패: {e}")
         return False
-=======
+
+
 def create_hybrid_index(client: OpenSearch, index_name: str, config: Config):
     """하이브리드 구조의 OpenSearch 인덱스 생성"""
 
@@ -298,4 +294,3 @@ def get_index_stats(client: OpenSearch, index_name: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"❌ 통계 조회 실패: {e}")
         return {}
->>>>>>> 30bed4e1b5046741eeec00de15bff537a5ecb047
