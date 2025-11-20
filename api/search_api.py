@@ -12,10 +12,12 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from typing import List, Dict, Any, Optional, Set, Tuple, Literal
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from opensearchpy import OpenSearch
 import pandas as pd
 import numpy as np
+from cachetools import TTLCache
 
 # 분석기 및 쿼리 빌더
 from rag_query_analyzer.analyzers.main_analyzer import AdvancedRAGQueryAnalyzer
@@ -328,6 +330,11 @@ router = APIRouter(
     tags=["Search"]
 )
 
+# ⭐ 1차 메모리 캐시 (초고속!)
+# - maxsize: 최대 100개 검색 결과 캐싱
+# - ttl: 300초 (5분) 후 자동 만료
+memory_cache = TTLCache(maxsize=100, ttl=300)
+
 # OpenSearch 요청 타임아웃 (복잡한 쿼리나 대용량 검색을 위해 30초로 설정)
 DEFAULT_OS_TIMEOUT = 180  # 대량 데이터 조회 대응 (전체 데이터 약 35000개)
 
@@ -350,7 +357,8 @@ _SUMMARY_RESPONSE_TEMPLATE = (
 
 _DEFAULT_SUMMARY_INSTRUCTIONS = (
     "검색 결과를 분석하여 사용자에게 도움이 되는 핵심 인사이트를 한국어로 제공하세요. "
-    "정량적 지표(응답자 수, 비율 등)가 있을 경우 명시하고, 데이터의 편향이나 한계도 언급하세요."
+    "정량적 지표(응답자 수, 비율 등)가 있을 경우 명시하고, 데이터의 편향이나 한계도 언급하세요. "
+    "⚠️ 중요: 모든 요약 필드(highlights, demographic_summary, behavioral_summary 등)는 각각 최대 2줄로 간결하게 작성하세요."
 )
 
 
@@ -513,6 +521,12 @@ def _maybe_generate_llm_summary(
         f"총 검색 결과 수: {response.total_hits}\n"
         f"현재 반환된 결과 수: {len(response.results)}\n\n"
         f"요약 지침: {instructions}\n\n"
+        "⚠️ 중요: 모든 요약 필드는 각각 최대 2줄로 간결하게 작성하세요.\n"
+        "- highlights: 각 항목은 1줄로, 최대 2개 항목\n"
+        "- demographic_summary: 최대 2줄\n"
+        "- behavioral_summary: 최대 2줄\n"
+        "- data_signals: 각 항목은 1줄로, 최대 2개 항목\n"
+        "- follow_up_questions: 각 항목은 1줄로, 최대 2개 항목\n\n"
         "검색 결과(최대 일부) JSON:\n"
         f"{json.dumps(prepared_results, ensure_ascii=False, indent=2)}\n\n"
         "응답은 반드시 JSON 형식으로 작성하세요. 형식 예시는 다음과 같습니다:\n"
@@ -605,11 +619,28 @@ def _persist_search_logs(
             }
             _redis_list_append(client, conversation_key, user_entry, conversation_max, conversation_ttl)
 
+            # 전체 검색 결과를 직렬화하여 포함
+            serialized_results = None
+            if response.results:
+                try:
+                    serialized_results = [_serialize_result(result) for result in response.results]
+                except Exception as exc:
+                    logger.warning(f"⚠️ 대화 로그용 검색 결과 직렬화 실패: {exc}")
+                    serialized_results = None
+            
             assistant_payload: Dict[str, Any] = {
+                "requested_count": getattr(response, "requested_count", None),
+                "query": request.query,
                 "total_hits": response.total_hits,
+                "max_score": getattr(response, "max_score", None),
+                "results": serialized_results,  # 전체 검색 결과 포함
                 "returned_count": len(response.results or []),
                 "cache_hit": cache_hit,
                 "top_user_ids": top_user_ids,
+                "took_ms": getattr(response, "took_ms", None),
+                "page": response.page,
+                "page_size": response.page_size,
+                "has_more": getattr(response, "has_more", False),
             }
             if response.llm_summary:
                 assistant_payload["llm_summary"] = response.llm_summary
@@ -617,7 +648,7 @@ def _persist_search_logs(
             assistant_entry = {
                 "role": "assistant",
                 "timestamp": timestamp,
-                "content": _truncate_text(assistant_payload, 4000),
+                "content": assistant_payload,  # 전체 딕셔너리 저장 (truncate 제거)
                 "session_id": session_id,
                 "user_id": user_id,
                 "request_id": request_id,
@@ -628,6 +659,15 @@ def _persist_search_logs(
         owner_id = user_id or session_id or "default"
         history_key = _make_history_key(search_history_prefix, owner_id)
         if history_key:
+            # 전체 검색 결과를 직렬화하여 포함
+            serialized_results = None
+            if response.results:
+                try:
+                    serialized_results = [_serialize_result(result) for result in response.results]
+                except Exception as exc:
+                    logger.warning(f"⚠️ 검색 결과 직렬화 실패: {exc}")
+                    serialized_results = None
+            
             history_entry = {
                 "timestamp": timestamp,
                 "user_id": user_id,
@@ -646,6 +686,7 @@ def _persist_search_logs(
                 "top_user_ids": top_user_ids,
                 "llm_summary": response.llm_summary,
                 "metadata": request_metadata,
+                "results": serialized_results,  # 전체 검색 결과 포함
             }
             _redis_list_append(client, history_key, history_entry, search_history_max, search_history_ttl)
 
@@ -678,6 +719,7 @@ class SearchHistoryEntry(BaseModel):
     top_user_ids: List[str] = Field(default_factory=list)
     llm_summary: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
+    results: Optional[List[Dict[str, Any]]] = Field(default=None, description="전체 검색 결과 (모든 사용자 데이터 포함)")
 
 
 def _parse_conversation_record(item: str) -> Optional[ConversationMessage]:
@@ -690,11 +732,16 @@ def _parse_conversation_record(item: str) -> Optional[ConversationMessage]:
         return None
 
     content = payload.get("content")
+    # assistant 메시지의 content가 문자열이면 JSON으로 파싱 시도
+    # (이전 버전 호환성: _truncate_text로 저장된 경우)
     if payload.get("role") == "assistant" and isinstance(content, str):
         try:
             content = json.loads(content)
         except Exception:
+            # JSON 파싱 실패 시 문자열 그대로 유지
             pass
+    # content가 이미 딕셔너리인 경우 그대로 사용 (새 버전)
+    
     return ConversationMessage(
         role=payload.get("role"),
         timestamp=payload.get("timestamp"),
@@ -740,6 +787,7 @@ def _parse_search_history_record(item: str) -> Optional[SearchHistoryEntry]:
         top_user_ids=payload.get("top_user_ids") or [],
         llm_summary=llm_summary,
         metadata=payload.get("metadata"),
+        results=payload.get("results"),  # 전체 검색 결과 포함
     )
 
 
@@ -1535,6 +1583,33 @@ class SimpleResponse(BaseModel):
         description="쿼리 분석 정보 (keywords, filters_applied, behavioral_conditions)"
     )
     took_ms: int = Field(..., description="검색 소요 시간 (밀리초)")
+
+
+# ===== 초경량화 응답 모델 (무한 스크롤용) =====
+
+class LightResult(BaseModel):
+    """초경량 검색 결과 (demographics만, qa_pairs 제외)"""
+    user_id: str = Field(..., description="사용자 ID")
+    score: float = Field(..., description="검색 점수")
+    timestamp: str = Field(..., description="응답 타임스탬프")
+    survey_datetime: Optional[str] = Field(None, description="설문 응답 시간")
+    demographic_info: Dict[str, Optional[str]] = Field(
+        ...,
+        description="인구통계 정보 (age_group, gender, birth_year, region, sub_region, occupation, marital_status, panel)"
+    )
+
+
+class SearchResponseLight(BaseModel):
+    """초경량 검색 응답 (무한 스크롤 페이지네이션)"""
+    query: str = Field(..., description="검색 쿼리")
+    total_hits: int = Field(..., description="전체 결과 수 (필터링 후)")
+    results: List[LightResult] = Field(..., description="현재 페이지 결과")
+    page: int = Field(..., description="현재 페이지 번호 (1부터 시작)")
+    page_size: int = Field(..., description="페이지 당 결과 수")
+    has_more: bool = Field(..., description="다음 페이지 존재 여부")
+    took_ms: int = Field(..., description="검색 소요 시간 (밀리초)")
+    cache_hit: bool = Field(default=False, description="캐시 히트 여부")
+    cache_type: Optional[str] = Field(None, description="캐시 타입 (memory, redis, none)")
 
 
 BEHAVIOR_YES_TOKENS = {
@@ -3226,13 +3301,51 @@ async def search_natural_language(
                     filters_signature=filters_signature,
                     behavior_signature=behavior_signature,
                 )
-                # ⭐ 압축 캐시 로드
-                cache_payload = load_search_cache_compressed(cache_key)
-                if cache_payload:
+
+                # ========================================
+                # ⭐ 1차: 메모리 캐시 조회 (0.001초)
+                # ========================================
+                if cache_key in memory_cache:
+                    cache_payload = memory_cache[cache_key]
                     cache_hit = True
+                    logger.info(f"🔁 메모리 캐시 히트: key={cache_key[:50]}...")
+
                     extracted_entities_dict = cache_payload.get("extracted_entities")
                     if extracted_entities_dict is None:
                         extracted_entities_dict = extracted_entities.to_dict()
+
+                    cached_response = _build_cached_response(
+                        payload=cache_payload,
+                        request=request,
+                        analysis=analysis,
+                        filters_for_response=filters_for_response,
+                        overall_start=overall_start,
+                        extracted_entities_dict=extracted_entities_dict,
+                    )
+                    return _finalize_search_response(
+                        request=request,
+                        response=cached_response,
+                        analysis=analysis,
+                        cache_hit=True,
+                        timings=cached_response.query_analysis.get("timings_ms") if cached_response.query_analysis else None,
+                    )
+
+                # ========================================
+                # ⭐ 2차: Redis 캐시 조회 (0.02초)
+                # ========================================
+                cache_payload = load_search_cache_compressed(cache_key)
+                if cache_payload:
+                    cache_hit = True
+                    logger.info(f"🔁 Redis 캐시 히트: key={cache_key[:50]}...")
+
+                    # ⭐ Redis → 메모리 캐시로 승격
+                    memory_cache[cache_key] = cache_payload
+                    logger.info(f"  ✅ Redis → 메모리 캐시 승격 완료")
+
+                    extracted_entities_dict = cache_payload.get("extracted_entities")
+                    if extracted_entities_dict is None:
+                        extracted_entities_dict = extracted_entities.to_dict()
+
                     cached_response = _build_cached_response(
                         payload=cache_payload,
                         request=request,
@@ -3249,7 +3362,7 @@ async def search_natural_language(
                         timings=cached_response.query_analysis.get("timings_ms") if cached_response.query_analysis else None,
                     )
             except Exception as cache_exc:
-                logger.warning(f"⚠️ Redis 검색 캐시 조회 실패: {cache_exc}")
+                logger.warning(f"⚠️ 캐시 조회 실패: {cache_exc}")
                 cache_key = None
                 cache_enabled = False
 
@@ -5405,14 +5518,35 @@ async def search_natural_language(
             requested_count = total_hits
         
         if cache_enabled and cache_key and stored_items:
-            # ⭐ 백그라운드에서 cache_payload 생성 + 압축 저장 (응답 지연 0ms!)
+            # ⭐ 1차: 메모리 캐시에 즉시 저장 (전체 정보, 다음 요청부터 0.001초!)
+            cache_payload_for_memory = {
+                "total_hits": total_hits,
+                "max_score": max_score,
+                "items": stored_items,  # ✅ qa_pairs 포함 (전체)
+                "page_size": page_size,
+                "filters": filters_for_response,
+                "extracted_entities": extracted_entities.to_dict(),
+                "behavioral_conditions": getattr(analysis, "behavioral_conditions", {}),
+                "use_claude": bool(use_claude),
+                "requested_count": requested_count,
+            }
+            memory_cache[cache_key] = cache_payload_for_memory
+            logger.info(f"✅ 메모리 캐시 저장 완료: {len(stored_items)}건 (전체 정보)")
+
+            # ⭐⭐⭐ 경량화: Redis 저장용 (qa_pairs, matched_qa_pairs, highlights 제외)
+            lightweight_items = []
+            for item in stored_items:
+                lightweight_item = {k: v for k, v in item.items() if k not in ['qa_pairs', 'matched_qa_pairs', 'highlights']}
+                lightweight_items.append(lightweight_item)
+
+            # ⭐ 2차: 백그라운드에서 Redis 압축 저장 (경량화, 영구 보존)
             background_tasks.add_task(
                 save_search_cache_compressed,
                 cache_key,
                 cache_ttl,
                 total_hits,
                 max_score,
-                stored_items,
+                lightweight_items,  # ⭐ 경량화된 버전!
                 page_size,
                 filters_for_response,
                 extracted_entities.to_dict(),
@@ -5420,7 +5554,7 @@ async def search_natural_language(
                 bool(use_claude),
                 requested_count,
             )
-            logger.info(f"⏳ Redis 캐시 저장 예약 (백그라운드): key={cache_key}, ttl={cache_ttl}s")
+            logger.info(f"⏳ Redis 캐시 저장 예약 (백그라운드, 경량화): {len(lightweight_items)}건")
         
         response = SearchResponse(
             requested_count=requested_count,
@@ -5594,6 +5728,121 @@ async def test_filters(
 
 
 @router.get(
+    "/nl/stream",
+    summary="자연어 검색 실시간 스트리밍 (SSE)",
+)
+async def search_natural_language_stream(
+    query: str = Query(..., description="자연어 쿼리"),
+    index_name: str = Query(default="survey_responses_merged", description="검색할 인덱스 이름"),
+    size: int = Query(default=10, ge=1, le=50000, description="반환할 결과 개수"),
+    use_vector_search: bool = Query(default=True, description="벡터 검색 사용 여부"),
+    page: int = Query(default=1, ge=1, description="페이지 번호"),
+    session_id: Optional[str] = Query(default=None, description="세션 ID"),
+    os_client: OpenSearch = Depends(lambda: router.os_client),
+):
+    """
+    검색 과정을 실시간으로 스트리밍하는 SSE 엔드포인트
+    
+    검색 단계별로 다음 정보를 실시간으로 전송:
+    - 쿼리 분석 결과 (alpha 값, intent 등)
+    - OpenSearch 검색 결과 (건수)
+    - Qdrant 검색 결과 (건수)
+    - RRF 점수 계산 결과
+    - 필터링 후 건수
+    - 최종 결과
+    """
+    async def event_generator():
+        try:
+            # 1. 쿼리 분석 시작
+            yield f"data: {json.dumps({'event': 'query_analysis_start', 'query': query}, ensure_ascii=False)}\n\n"
+            
+            config = getattr(router, 'config', None)
+            if config is None:
+                from rag_query_analyzer.config import get_config
+                config = get_config()
+                router.config = config
+            
+            analyzer = getattr(router, 'analyzer', None)
+            if analyzer is None:
+                analyzer = AdvancedRAGQueryAnalyzer(config)
+                router.analyzer = analyzer
+            
+            use_claude = config.ENABLE_CLAUDE_ANALYZER
+            analysis = analyzer.analyze_query(query, use_claude=use_claude)
+            
+            if analysis is None:
+                yield f"data: {json.dumps({'event': 'error', 'message': 'Query analysis failed'}, ensure_ascii=False)}\n\n"
+                return
+            
+            # 2. 쿼리 분석 완료
+            analysis_data = {
+                'event': 'query_analysis_complete',
+                'intent': analysis.intent,
+                'alpha': analysis.alpha,
+                'must_terms': analysis.must_terms,
+                'should_terms': analysis.should_terms,
+                'confidence': analysis.confidence
+            }
+            yield f"data: {json.dumps(analysis_data, ensure_ascii=False)}\n\n"
+            
+            # 3. OpenSearch 검색 시작
+            yield f"data: {json.dumps({'event': 'opensearch_search_start'}, ensure_ascii=False)}\n\n"
+            
+            # 검색 요청 생성
+            search_request = NLSearchRequest(
+                query=query,
+                index_name=index_name,
+                size=size,
+                use_vector_search=use_vector_search,
+                page=page,
+                session_id=session_id,
+                log_conversation=False,  # 스트리밍 중에는 로그 저장 안 함
+                log_search_history=False,
+            )
+            
+            # 검색 실행 (중간 단계 추적을 위해 수정 필요)
+            # 우선 간단하게 검색 실행 후 결과만 전송
+            from fastapi import BackgroundTasks
+            background_tasks = BackgroundTasks()
+            response = await search_natural_language(search_request, background_tasks, os_client)
+            
+            # 4. 검색 완료 - 최종 결과 전송
+            search_complete_data = {
+                'event': 'search_complete',
+                'total_hits': response.total_hits,
+                'returned_count': len(response.results or []),
+                'max_score': getattr(response, 'max_score', None),
+                'took_ms': getattr(response, 'took_ms', None),
+                'alpha': analysis.alpha,
+            }
+            yield f"data: {json.dumps(search_complete_data, ensure_ascii=False)}\n\n"
+            
+            # 5. 최종 결과 전송
+            final_result_data = {
+                'event': 'final_result',
+                'response': response.model_dump()
+            }
+            yield f"data: {json.dumps(final_result_data, ensure_ascii=False)}\n\n"
+            
+            # 완료
+            yield f"data: {json.dumps({'event': 'done'}, ensure_ascii=False)}\n\n"
+            
+        except Exception as e:
+            logger.error(f"SSE 스트리밍 오류: {e}", exc_info=True)
+            yield f"data: {json.dumps({'event': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # nginx 버퍼링 비활성화
+        }
+    )
+
+
+@router.get(
     "/logs/conversation/{session_id}",
     summary="대화 히스토리 조회 (Redis)",
 )
@@ -5620,11 +5869,19 @@ async def get_conversation_logs_endpoint(
         parsed = _parse_conversation_record(item)
         if parsed is not None:
             messages.append(parsed)
+    
+    # 메시지를 딕셔너리로 변환 (Pydantic 모델 직렬화)
+    messages_dict = []
+    for msg in messages:
+        msg_dict = msg.model_dump()
+        # assistant 메시지의 content가 딕셔너리인지 확인하고 그대로 유지
+        # (이미 _parse_conversation_record에서 처리됨)
+        messages_dict.append(msg_dict)
 
     return {
         "session_id": session_id,
-        "count": len(messages),
-        "messages": [msg.model_dump() for msg in messages],
+        "count": len(messages_dict),
+        "messages": messages_dict,
     }
 
 
