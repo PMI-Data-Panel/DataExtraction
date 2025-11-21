@@ -18,6 +18,7 @@
 
     # Cache & Session
     redis==5.0.1
+    cachetools==5.3.3
 
     # Utilities
     python-dotenv==1.0.1
