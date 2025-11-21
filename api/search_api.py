@@ -531,20 +531,46 @@ def _maybe_generate_llm_summary(
 
     instructions = getattr(request, "llm_summary_instructions", None) or _DEFAULT_SUMMARY_INSTRUCTIONS
 
+    # ⭐⭐⭐ 활성화된 behavioral 필터 추출
+    active_behavioral = {
+        k: v for k, v in getattr(analysis, 'behavioral_conditions', {}).items()
+        if v is not None and v is not False  # None과 False 제외
+    }
+
+    # 한글 설명으로 변환
+    behavioral_text = ""
+    if active_behavioral:
+        items = []
+        for k, v in active_behavioral.items():
+            config = BEHAVIORAL_KEYWORD_MAP.get(k, {})
+            label = config.get('question_text', k)
+            # 간결하게 표시
+            if isinstance(v, bool):
+                items.append(f"- {label}: {'예' if v else '아니오'}")
+            else:
+                items.append(f"- {label}: {v}")
+        behavioral_text = "\n".join(items)
+
     prompt = (
         "당신은 설문조사 데이터 분석 전문가입니다. "
         "주어진 검색 결과를 바탕으로 사용자의 질문에 대한 인사이트를 제공하세요.\n\n"
         f"사용자 질의: {request.query}\n"
         f"예상 검색 의도: {getattr(analysis, 'intent', 'N/A')}\n"
         f"추출된 must_terms: {getattr(analysis, 'must_terms', [])}\n"
-        f"추출된 should_terms: {getattr(analysis, 'should_terms', [])}\n"
+        f"추출된 should_terms: {getattr(analysis, 'should_terms', [])}\n\n"
+        # ⭐⭐⭐ 적용된 행동 필터 정보 추가!
+        f"📋 적용된 행동 필터:\n{behavioral_text or '없음'}\n\n"
+        f"⚠️ 매우 중요: 위 행동 필터가 적용되어 모든 검색 결과는 이미 필터링된 상태입니다.\n"
+        f"검색된 모든 응답자는 위 조건을 만족합니다. behavioral_summary 작성 시 반드시 이를 반영하세요.\n"
+        f"예: '흡연 여부: 예' 필터 적용 시 → '모든 응답자는 흡연자입니다'\n"
+        f"예: 'OTT 서비스 개수: 2개' 필터 적용 시 → '모든 응답자는 OTT 서비스 2개를 이용합니다'\n\n"
         f"총 검색 결과 수: {response.total_hits}\n"
         f"현재 반환된 결과 수: {len(response.results)}\n\n"
         f"요약 지침: {instructions}\n\n"
         "⚠️ 중요: 모든 요약 필드는 각각 최대 2줄로 간결하게 작성하세요.\n"
         "- highlights: 각 항목은 1줄로, 최대 2개 항목\n"
         "- demographic_summary: 최대 2줄\n"
-        "- behavioral_summary: 최대 2줄\n"
+        "- behavioral_summary: 최대 2줄 (⭐ 적용된 행동 필터를 반드시 반영하세요!)\n"
         "- data_signals: 각 항목은 1줄로, 최대 2개 항목\n"
         "- follow_up_questions: 각 항목은 1줄로, 최대 2개 항목\n\n"
         "검색 결과(최대 일부) JSON:\n"
@@ -3307,6 +3333,93 @@ def extract_behavior_from_qa_pairs(
     return None
 
 
+def validate_llm_extraction(
+    query: str,
+    conditions: Dict[str, Union[bool, str]]
+) -> Dict[str, Union[bool, str]]:
+    """LLM 추출 결과 검증 (환각 제거! 🚨)
+
+    전략:
+    1. Categorical (문자열): 값 키워드 확인 (엄격!)
+    2. Boolean: 도메인 키워드만 확인 (느슨!)
+
+    Args:
+        query: 검색 쿼리
+        conditions: LLM이 추출한 behavioral 조건
+
+    Returns:
+        검증 통과한 조건만 포함
+    """
+    validated = {}
+    query_lower = query.lower()
+
+    # ⭐ 환각 의심: 짧은 쿼리에 너무 많은 패턴
+    if len(query) < 20 and len(conditions) > 3:
+        logger.warning(
+            f"🚨 환각 의심: 짧은 쿼리({len(query)}자)에 "
+            f"너무 많은 패턴({len(conditions)}개) - 전체 제거"
+        )
+        return {}
+
+    for behavior_key, value in conditions.items():
+        keyword_config = BEHAVIORAL_KEYWORD_MAP.get(behavior_key, {})
+
+        if not keyword_config:
+            logger.warning(f"⚠️ 검증 실패: {behavior_key} (정의되지 않은 패턴)")
+            continue
+
+        answer_values = keyword_config.get('answer_values')
+
+        # ========================================
+        # ⭐ Categorical: Value 키워드 확인 (엄격!)
+        # ========================================
+        if answer_values and isinstance(value, str):
+            value_keywords = answer_values.get(value, [])
+
+            has_value_keyword = any(
+                kw.lower() in query_lower
+                for kw in value_keywords
+            )
+
+            if has_value_keyword:
+                validated[behavior_key] = value
+                logger.debug(f"  ✅ Categorical 통과: {behavior_key}='{value}'")
+            else:
+                logger.warning(
+                    f"  ⚠️ Categorical 제거: {behavior_key}='{value}' "
+                    f"(값 키워드 없음: {value_keywords})"
+                )
+
+        # ========================================
+        # ⭐ Boolean: 도메인 키워드만 확인 (느슨!)
+        # ========================================
+        elif isinstance(value, bool):
+            # ⭐⭐⭐ 핵심: question_keywords로 도메인만 확인!
+            domain_keywords = keyword_config.get('question_keywords', set())
+
+            # 도메인 키워드가 쿼리에 있는지 확인
+            # 예: "ott", "스트리밍" 같은 도메인 단어
+            has_domain_keyword = any(
+                kw.lower() in query_lower
+                for kw in domain_keywords
+            )
+
+            if has_domain_keyword:
+                validated[behavior_key] = value
+                logger.debug(f"  ✅ Boolean 통과: {behavior_key}={value}")
+            else:
+                logger.warning(
+                    f"  ⚠️ Boolean 제거: {behavior_key}={value} "
+                    f"(도메인 키워드 없음: {list(domain_keywords)[:3]}...)"
+                )
+
+    if len(validated) < len(conditions):
+        removed = set(conditions.keys()) - set(validated.keys())
+        logger.info(f"🔍 검증 완료: {len(removed)}개 제거 - {removed}")
+
+    return validated
+
+
 def filter_redundant_patterns(
     conditions: Dict[str, Union[bool, str]]
 ) -> Dict[str, Union[bool, str]]:
@@ -3382,35 +3495,44 @@ def extract_behavioral_conditions_llm(
 
     patterns_text = "\n\n".join(pattern_descriptions)
 
-    # System prompt
+    # System prompt (강화된 버전 - 환각 방지!)
     system_prompt = f"""당신은 사용자의 검색 쿼리에서 행동 패턴을 추출하는 전문가입니다.
 
 다음은 가능한 모든 행동 패턴 목록입니다:
 
 {patterns_text}
 
-**중요 규칙**:
-1. 쿼리에서 **명확하게 언급된 패턴만** 추출하세요.
-2. 사용자의 표현이 질문과 다르더라도, **의미상 같으면** 매칭하세요.
-   예: "유럽 여행 가고 싶은" → "overseas_travel_preference: 유럽"
-   예: "ChatGPT 쓰는" → "ai_chatbot_service: ChatGPT"
-   예: "흡연자" → "smoker: true"
-3. ⭐ **더 구체적인 패턴을 우선**하세요.
-   올바른 예시:
-   - "유럽 여행" → {{"overseas_travel_preference": "유럽"}} ✅
-     (travels는 제외! overseas_travel_preference가 더 구체적)
-   - "ChatGPT 사용" → {{"ai_chatbot_service": "ChatGPT"}} ✅
-     (ai_user는 제외! ai_chatbot_service가 더 구체적)
-4. 애매하거나 추측이 필요한 것은 포함하지 마세요.
-5. **반드시 JSON 형식으로만** 응답하세요.
-6. 다른 설명 없이 JSON만 출력하세요.
+**🚨 절대적 규칙**:
+1. ⭐ **쿼리에 명시적으로 언급된 것만** 추출하세요.
+2. ⭐ **절대로 추측하거나 추론하지 마세요.**
+3. ⭐ **통계적 경향을 가정하지 마세요.**
+4. ⭐ **더 구체적인 패턴을 우선**하세요 (구체적 패턴이 있으면 일반 패턴은 제외).
+5. 애매하거나 불확실한 것은 절대 포함하지 마세요.
 
-출력 형식:
+**학습 예시** (반드시 따라야 함):
+
+✅ 올바른 예시:
+- 쿼리: "유럽 여행 가는 사람" → {{"overseas_travel_preference": "유럽"}}
+- 쿼리: "ChatGPT 쓰는 30대" → {{"ai_chatbot_service": "ChatGPT"}}
+- 쿼리: "흡연자이면서 운동하는" → {{"smoker": true, "exercises": true}}
+
+❌ 잘못된 예시 (절대 하지 말 것):
+- 쿼리: "20대 남성" → {{}}  (행동 패턴 없음! 나이/성별은 Demographics)
+- 쿼리: "직장인" → {{}}  (행동 패턴 없음!)
+- 쿼리: "대학생" → {{}}  (행동 패턴 없음!)
+
+⚠️ 환각 예시 (절대 금지):
+- 쿼리: "20대" → {{"ai_chatbot_service": "ChatGPT"}}  ← 절대 안됨!
+  이유: "ChatGPT"가 쿼리에 없음
+- 쿼리: "남성" → {{"exercise_type": "헬스"}}  ← 절대 안됨!
+  이유: "헬스"가 쿼리에 없음
+
+**출력 형식**:
 {{
-  "behavior_key": "답변 값 또는 true/false"
+  "behavior_key": "값"
 }}
 
-매칭되는 패턴이 없으면 빈 객체: {{}}"""
+매칭되는 패턴이 없으면 반드시: {{}}"""
 
     user_prompt = f'검색 쿼리: "{query}"'
 
@@ -3449,13 +3571,16 @@ def extract_behavioral_conditions_llm(
 
         conditions = json.loads(response_text)
 
-        # ⭐ 중복 패턴 제거 (안전장치!)
+        # ⭐⭐⭐ 1단계: 검증 (환각 제거!)
+        conditions = validate_llm_extraction(query, conditions)
+
+        # ⭐⭐⭐ 2단계: 중복 패턴 제거
         conditions = filter_redundant_patterns(conditions)
 
         # 캐시 저장
         llm_query_cache[cache_key] = conditions
 
-        logger.info(f"✅ LLM 추출: {len(conditions)}개 패턴 - {conditions}")
+        logger.info(f"✅ LLM 추출 (검증 완료): {len(conditions)}개 패턴 - {conditions}")
 
         return conditions
 
