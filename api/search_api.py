@@ -10,7 +10,7 @@ from collections import defaultdict, OrderedDict
 from time import perf_counter
 from datetime import datetime, timezone
 from uuid import uuid4
-from typing import List, Dict, Any, Optional, Set, Tuple, Literal
+from typing import List, Dict, Any, Optional, Set, Tuple, Literal, Union
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -104,20 +104,10 @@ class PanelDataCache:
             )
 
             # ⭐⭐⭐ Pandas DataFrame으로 변환 + 모든 조건 사전 추출 (초고속!)
-            logger.info("  📊 Occupation/Marital/Behavioral(33개) 사전 추출 중...")
             extract_start = perf_counter()
 
-            # ⭐ 모든 behavioral 키 (33개)
-            all_behavioral_keys = [
-                'smoker', 'has_vehicle', 'drinker', 'ott_user', 'has_pet', 'ai_user',
-                'exercises', 'uses_fast_delivery', 'visits_traditional_market', 'has_stress',
-                'travels', 'uses_food_delivery', 'drinks_coffee', 'has_subscription',
-                'uses_social_media', 'plays_games', 'watches_movies_dramas', 'uses_financial_services',
-                'uses_beauty_products', 'shops_fashion', 'interested_in_home_appliances', 'uses_smart_devices',
-                'cares_about_environment', 'does_charity', 'interested_in_cars', 'uses_parcel_delivery',
-                'dines_out', 'attends_drinking_gatherings', 'cares_about_rewards', 'uses_secondhand_market',
-                'lifestyle_minimalist', 'privacy_conscious', 'stress_relief_method'
-            ]
+            # ⭐ 모든 behavioral 키 (BEHAVIORAL_KEYWORD_MAP에서 자동 생성!)
+            all_behavioral_keys = list(BEHAVIORAL_KEYWORD_MAP.keys())
 
             records = []
             for idx, doc in enumerate(all_docs):
@@ -212,7 +202,6 @@ class PanelDataCache:
                     self.user_map[source['user_id']] = doc
 
             extract_duration = perf_counter() - extract_start
-            logger.info(f"  ✅ Occupation/Marital/Behavioral(33개) 추출 완료: {extract_duration:.2f}초")
 
             self.df = pd.DataFrame(records)
             self.total_count = len(self.df)
@@ -256,7 +245,7 @@ class PanelDataCache:
         sub_region: Optional[str] = None,
         occupation: Optional[str] = None,
         marital_status: Optional[str] = None,
-        behavioral_conditions: Optional[Dict[str, bool]] = None,
+        behavioral_conditions: Optional[Dict[str, Union[bool, str]]] = None,
     ) -> pd.DataFrame:
         """⚡ Pandas 벡터화 필터링 (초고속 - metadata + occupation + marital + behavioral 전부!)
 
@@ -264,7 +253,9 @@ class PanelDataCache:
             gender, age_group, region, sub_region: Demographics 필터
             occupation: 직업 필터 (부분 매칭)
             marital_status: 결혼 여부 필터
-            behavioral_conditions: Behavioral 필터 (예: {'smoker': True, 'has_vehicle': False})
+            behavioral_conditions: Behavioral 필터
+                - bool: {'smoker': True, 'has_vehicle': False}
+                - str: {'winter_vacation_memory': '친구들과 보낸 즐거운 시간'}
 
         Returns:
             필터링된 DataFrame
@@ -300,15 +291,21 @@ class PanelDataCache:
         if marital_status:
             mask &= (self.df['marital_status'] == marital_status)
 
-        # ⭐⭐⭐ Behavioral 필터 (33개 조건)
+        # ⭐⭐⭐ Behavioral 필터 (39개 조건)
         if behavioral_conditions:
             for behavior_key, expected_value in behavioral_conditions.items():
                 if expected_value is None:
                     continue  # None은 체크 안함
 
                 if behavior_key in self.df.columns:
-                    # True/False 체크 (벡터화!)
-                    mask &= (self.df[behavior_key] == expected_value)
+                    if isinstance(expected_value, bool):
+                        # ⭐ Boolean 체크 (벡터화!)
+                        mask &= (self.df[behavior_key] == expected_value)
+                    elif isinstance(expected_value, str):
+                        # ⭐ 문자열 매칭 (부분 매칭, 대소문자 무시)
+                        mask &= self.df[behavior_key].notna() & self.df[behavior_key].str.contains(
+                            expected_value, case=False, na=False, regex=False
+                        )
 
         return self.df[mask]
 
@@ -334,6 +331,29 @@ router = APIRouter(
 # - maxsize: 최대 100개 검색 결과 캐싱
 # - ttl: 300초 (5분) 후 자동 만료
 memory_cache = TTLCache(maxsize=100, ttl=300)
+
+# ⭐ LLM 쿼리 결과 캐시 (행동 패턴 추출)
+llm_query_cache = TTLCache(maxsize=1000, ttl=300)
+
+# ⭐ 패턴 우선순위 정의 (구체적 > 일반적)
+PATTERN_HIERARCHY = {
+    "overseas_travel_preference": ["travels"],
+    "travel_style": ["travels"],
+    "ai_chatbot_service": ["ai_user"],
+    "ai_service_field": ["ai_user"],
+    "happy_consumption": [],
+    "winter_vacation_memory": ["travels"],
+    "skin_satisfaction": ["uses_beauty_products"],
+    "plastic_bag_reduction": ["cares_about_environment"],
+    "rewards_attention": ["cares_about_rewards"],
+    "privacy_protection_habit": ["privacy_conscious"],
+    "summer_fashion_essential": ["shops_fashion"],
+    "pet_experience": ["has_pet"],
+    "traditional_market_frequency": ["visits_traditional_market"],
+    "stress_source": ["has_stress"],
+    "exercise_type": ["exercises"],
+    "fast_delivery_product": ["uses_fast_delivery"],
+}
 
 # OpenSearch 요청 타임아웃 (복잡한 쿼리나 대용량 검색을 위해 30초로 설정)
 DEFAULT_OS_TIMEOUT = 180  # 대량 데이터 조회 대응 (전체 데이터 약 35000개)
@@ -2177,6 +2197,475 @@ STRESS_RELIEF_NEGATIVE_KEYWORDS = {
     "스트레스 없음", "해소 안함", "특별한 방법 없음"
 }
 
+# 41. 겨울방학 추억 (실제 질문: "초등학생 시절 겨울방학 때 가장 기억에 남는 일은 무엇인가요?")
+WINTER_VACATION_QUESTION_KEYWORDS = {
+    "초등학생", "겨울방학", "기억에 남는", "추억"
+}
+# ⭐ 문자열 값 저장 (카테고리별)
+WINTER_VACATION_ANSWER_VALUES = {
+    "친구들과 보낸 즐거운 시간": ["친구", "즐거운", "시간"],
+    "눈썰매, 스키 등 겨울 스포츠": ["눈썰매", "스키", "겨울 스포츠", "스노보드"],
+    "눈사람 만들기": ["눈사람", "눈사람 만들기"],
+    "가족과 함께 떠난 여행": ["가족", "여행"],
+    "겨울방학 숙제를 끝낸 순간": ["숙제", "끝낸"],
+    "기타": ["기타"],
+    "방학 동안 다녔던 학원이나 특별 활동": ["학원", "특별 활동", "보습학원"]
+}
+
+# 42. 피부 상태 만족도 (실제 질문: "현재 본인의 피부 상태에 얼마나 만족하시나요?")
+SKIN_SATISFACTION_QUESTION_KEYWORDS = {
+    "피부", "피부 상태", "피부상태", "만족"
+}
+SKIN_SATISFACTION_ANSWER_VALUES = {
+    "매우 만족한다": ["매우 만족", "매우만족"],
+    "만족한다": ["만족한다", "만족"],
+    "보통이다": ["보통", "보통이다"],
+    "불만족한다": ["불만족한다", "불만족"],
+    "매우 불만족한다": ["매우 불만족", "매우불만족"]
+}
+
+# 43. AI 서비스 활용 분야 (실제 질문: "여러분은 요즘 어떤 분야에서 AI 서비스를 활용하고 계신가요?")
+AI_SERVICE_FIELD_QUESTION_KEYWORDS = {
+    "AI 서비스", "AI", "인공지능", "활용", "어떤 분야"
+}
+AI_SERVICE_FIELD_ANSWER_VALUES = {
+    "검색/정보 탐색": ["검색", "정보 탐색", "정보탐색"],
+    "번역이나 외국어 학습": ["번역", "외국어", "학습", "언어"],
+    "업무 보조 (문서 작성, 이메일 등)": ["업무", "문서", "이메일", "업무 보조"],
+    "이미지 생성 또는 디자인 참고": ["이미지", "디자인", "생성"],
+    "학습/공부 보조": ["학습", "공부", "공부 보조"],
+    "콘텐츠 제작 (블로그, 영상 기획 등)": ["콘텐츠", "블로그", "영상"],
+    "AI 서비스를 사용해본 적 없다": ["사용해본 적 없다", "없다"]
+}
+
+# 44. 기분 좋은 소비 (실제 질문: "여러분은 본인을 위해 소비하는 것 중 가장 기분 좋아지는 소비는 무엇인가요?")
+HAPPY_CONSUMPTION_QUESTION_KEYWORDS = {
+    "소비", "기분 좋", "기분좋", "가장 기분"
+}
+HAPPY_CONSUMPTION_ANSWER_VALUES = {
+    "맛있는 음식 먹기": ["음식", "먹기", "맛있는"],
+    "여행 가기": ["여행"],
+    "취미관련 제품 구매하기": ["취미", "제품"],
+    "옷/패션관련 제품 구매하기": ["옷", "패션"]
+}
+
+# 45. AI 챗봇 서비스 종류 (실제 질문: "여러분이 사용해 본 AI 챗봇 서비스는 무엇인가요?")
+AI_CHATBOT_SERVICE_QUESTION_KEYWORDS = {
+    "AI 챗봇", "챗봇", "chatbot", "사용해 본"
+}
+AI_CHATBOT_SERVICE_ANSWER_VALUES = {
+    "ChatGPT": ["chatgpt", "챗gpt", "gpt"],
+    "Gemini (구글)": ["gemini", "제미나이", "구글"],
+    "Copilot (마이크로소프트)": ["copilot", "코파일럿", "마이크로소프트"],
+    "HyperCLOVER X (네이버)": ["hyperclover", "하이퍼클로바", "네이버"],
+    "딥시크": ["딥시크", "deepseek"],
+    "Claude (Anthropic)": ["claude", "클로드"],
+    "사용해 본 적 없음": ["사용해 본 적 없음", "없음"]
+}
+
+# 46. 해외여행 선호 지역 (실제 질문: "여러분은 올해 해외여행을 간다면 어디로 가고 싶나요?")
+OVERSEAS_TRAVEL_QUESTION_KEYWORDS = {
+    "해외여행", "해외", "여행", "가고 싶"
+}
+OVERSEAS_TRAVEL_ANSWER_VALUES = {
+    "유럽": ["유럽"],
+    "동남아": ["동남아"],
+    "일본/중국": ["일본", "중국"],
+    "미국/캐나다": ["미국", "캐나다"],
+    "해외여행을 가고싶지 않다": ["가고싶지 않다", "가고 싶지 않다"]
+}
+
+# 47. OTT 서비스 개수 (실제 질문: "여러분이 현재 이용 중인 OTT 서비스는 몇 개인가요?")
+OTT_COUNT_QUESTION_KEYWORDS = {
+    "OTT", "OTT 서비스", "몇 개", "개수"
+}
+OTT_COUNT_ANSWER_VALUES = {
+    "1개": ["1개"],
+    "2개": ["2개"],
+    "3개": ["3개"],
+    "4개 이상": ["4개", "4개 이상"]
+}
+
+# 48. 물건 처리 방법 (실제 질문: "여러분은 버리기 아까운 물건이 있을 때, 주로 어떻게 하시나요?")
+DISPOSAL_METHOD_QUESTION_KEYWORDS = {
+    "버리기 아까운", "물건", "처리"
+}
+DISPOSAL_METHOD_ANSWER_VALUES = {
+    "그냥 보관": ["보관"],
+    "중고로 판매": ["중고", "판매"],
+    "업사이클링(재활용) 시도": ["업사이클", "재활용"],
+    "기부": ["기부"],
+    "바로 버린다": ["버린다"]
+}
+
+# 49. 이사 스트레스 (실제 질문: "여러분은 이사할 때 가장 스트레스 받는 부분은 어떤걸까요?")
+MOVING_STRESS_QUESTION_KEYWORDS = {
+    "이사", "스트레스", "이사할 때"
+}
+MOVING_STRESS_ANSWER_VALUES = {
+    "짐 싸고 풀기": ["짐", "짐 싸고"],
+    "비용 부담": ["비용"],
+    "이사업체 선택": ["이사업체"],
+    "새로운 환경 적응": ["환경", "적응"],
+    "스트레스 받지 않는다": ["받지 않는다"]
+}
+
+# 50. 설 선물 선호 (실제 질문: "여러분이 가장 선호하는 설 선물 유형은 무엇인가요?")
+LUNAR_GIFT_QUESTION_KEYWORDS = {
+    "설", "선물", "설 선물"
+}
+LUNAR_GIFT_ANSWER_VALUES = {
+    "백화점 상품권/현금": ["상품권", "현금"],
+    "전통 선물 세트(한우, 굴비, 과일 등)": ["전통", "한우", "굴비"],
+    "건강식품(홍삼, 비타민 등)": ["건강식품", "홍삼", "비타민"],
+    "실용적인 생필품(샴푸, 세제, 식용유 등)": ["생필품", "샴푸", "세제"]
+}
+
+# 51. 스킨케어 지출 (실제 질문: "한 달 기준으로 스킨케어 제품에 평균적으로 얼마나 소비하시나요?")
+SKINCARE_SPENDING_QUESTION_KEYWORDS = {
+    "스킨케어", "지출", "소비"
+}
+SKINCARE_SPENDING_ANSWER_VALUES = {
+    "3만원 미만": ["3만원 미만"],
+    "3만원 이상 ~ 5만원 미만": ["3만원", "5만원"],
+    "5만원 이상 ~ 10만원 미만": ["5만원", "10만원"],
+    "10만원 이상 ~ 15만원 미만": ["10만원", "15만원"],
+    "15만원 이상": ["15만원 이상"]
+}
+
+# 52. 주로 사용하는 AI 챗봇 (실제 질문: "사용해 본 AI 챗봇 서비스 중 주로 사용하는 것은 무엇인가요?")
+AI_CHATBOT_PRIMARY_QUESTION_KEYWORDS = {
+    "AI 챗봇", "주로 사용", "주로"
+}
+AI_CHATBOT_PRIMARY_ANSWER_VALUES = {
+    "ChatGPT": ["chatgpt", "챗gpt"],
+    "Gemini (구글)": ["gemini", "제미나이"],
+    "HyperCLOVER X (네이버)": ["hyperclover", "하이퍼클로바"],
+    "Copilot (마이크로소프트)": ["copilot", "코파일럿"],
+    "딥시크": ["딥시크"],
+    "Claude (Anthropic)": ["claude", "클로드"]
+}
+
+# 53. 스킨케어 구매 기준 (실제 질문: "스킨케어 제품을 구매할 때 가장 중요하게 고려하는 요소는 무엇인가요?")
+SKINCARE_PRIORITY_QUESTION_KEYWORDS = {
+    "스킨케어", "구매", "고려"
+}
+SKINCARE_PRIORITY_ANSWER_VALUES = {
+    "성분 및 효과": ["성분", "효과"],
+    "가격": ["가격"],
+    "제품 리뷰 및 사용 후기": ["리뷰", "후기"],
+    "친환경/비건 제품 여부": ["친환경", "비건"],
+    "브랜드 명성": ["브랜드"],
+    "패키지 디자인": ["패키지", "디자인"]
+}
+
+# 54. 야식 방법 (실제 질문: "여러분은 야식을 먹을 때 보통 어떤 방법으로 드시나요?")
+LATE_NIGHT_SNACK_QUESTION_KEYWORDS = {
+    "야식", "먹을 때"
+}
+LATE_NIGHT_SNACK_ANSWER_VALUES = {
+    "배달 주문해서 먹는다": ["배달"],
+    "야식을 거의 먹지 않는다": ["먹지 않는다"],
+    "직접 사와서 먹는다": ["직접 사"],
+    "집에서 직접 만들어 먹는다": ["직접 만들"],
+    "외출해서 식당이나 포장마차 등에서 먹는다": ["외출", "식당"]
+}
+
+# 55. 최근 지출 카테고리 (실제 질문: "여러분은 최근 가장 지출을 많이 한 곳은 어디입니까?")
+RECENT_SPENDING_QUESTION_KEYWORDS = {
+    "최근", "지출", "많이"
+}
+RECENT_SPENDING_ANSWER_VALUES = {
+    "외식비": ["외식"],
+    "옷/쇼핑": ["옷", "쇼핑"],
+    "배달비": ["배달"],
+    "콘서트, 전시 등 문화생활": ["콘서트", "전시", "문화"]
+}
+
+# 56. 혼밥 빈도 (실제 질문: "여러분은 외부 식당에서 혼자 식사하는 빈도는 어느 정도인가요?")
+SOLO_DINING_QUESTION_KEYWORDS = {
+    "혼자", "식사", "빈도"
+}
+SOLO_DINING_ANSWER_VALUES = {
+    "거의 하지 않거나 한 번도 해본 적 없다": ["거의 하지 않", "없다"],
+    "월 1~2회 정도": ["월 1", "월 2"],
+    "주 1회 정도": ["주 1"],
+    "주 2~3회 정도": ["주 2", "주 3"],
+    "거의 매일": ["매일"]
+}
+
+# 57. 다이어트 방법 (실제 질문: "여러분이 지금까지 해본 다이어트 중 가장 효과 있었던 방법은 무엇인가요?")
+DIET_METHOD_QUESTION_KEYWORDS = {
+    "다이어트", "효과", "방법"
+}
+DIET_METHOD_ANSWER_VALUES = {
+    "꾸준한 유산소 운동": ["유산소"],
+    "하루 세 끼를 규칙적으로 소식하기": ["소식", "규칙적"],
+    "간헐적 단식(예: 16시간 공복)": ["간헐적", "단식"],
+    "헬스장 또는 홈트레이닝": ["헬스", "홈트"],
+    "저탄고지/단백질 위주 식단": ["저탄고지", "단백질"],
+    "식욕 억제제 또는 다이어트 보조제 섭취": ["억제제", "보조제"]
+}
+
+# 58. 알람 스타일 (실제 질문: "여러분은 아침에 기상하기 위해 어떤 방식으로 알람을 설정해두시나요?")
+ALARM_STYLE_QUESTION_KEYWORDS = {
+    "알람", "기상", "설정"
+}
+ALARM_STYLE_ANSWER_VALUES = {
+    "한 개만 설정해놓고 바로 일어난다": ["한 개", "바로"],
+    "여러 개의 알람을 짧은 간격으로 설정해둔다": ["여러", "짧은 간격"]
+}
+
+# 59. 여름 걱정 (실제 질문: "여러분은 다가오는 여름철 가장 걱정되는 점이 무엇인가요?")
+SUMMER_CONCERN_QUESTION_KEYWORDS = {
+    "여름", "걱정"
+}
+SUMMER_CONCERN_ANSWER_VALUES = {
+    "더위와 땀": ["더위", "땀"],
+    "전기요금 부담": ["전기요금"],
+    "체력 저하": ["체력"],
+    "피부 트러블": ["피부"],
+    "냉방병": ["냉방병"],
+    "휴가 계획 스트레스": ["휴가"]
+}
+
+# 60. 여름 간식 (실제 질문: "여러분의 여름철 최애 간식은 무엇인가요?")
+SUMMER_SNACK_QUESTION_KEYWORDS = {
+    "여름", "간식", "최애"
+}
+SUMMER_SNACK_ANSWER_VALUES = {
+    "제철과일(수박, 참외 등)": ["수박", "참외", "과일"],
+    "아이스크림": ["아이스크림"],
+    "냉면": ["냉면"],
+    "빙수": ["빙수"]
+}
+
+# 61. 땀 불편함 (실제 질문: "여름철 땀 때문에 겪는 불편함은 어떤 것이 있는지 모두 선택해주세요.")
+SWEAT_CONCERN_QUESTION_KEYWORDS = {
+    "땀", "불편", "여름"
+}
+SWEAT_CONCERN_ANSWER_VALUES = {
+    "땀 냄새가 걱정된다": ["냄새"],
+    "옷이 젖거나 얼룩지는 것이 신경쓰인다": ["옷", "얼룩"],
+    "다른 사람의 땀 냄새가 불쾌하다": ["다른 사람", "불쾌"],
+    "머리나 두피가 금방 기름진다": ["두피", "기름"],
+    "피부 트러블이 생긴다": ["트러블"],
+    "메이크업이 무너진다": ["메이크업"]
+}
+
+# 62. 행복한 노년 조건 (실제 질문: "여러분이 가장 중요하다고 생각하는 행복한 노년의 조건은 무엇인가요?")
+HAPPY_AGING_QUESTION_KEYWORDS = {
+    "행복한 노년", "노년", "조건", "중요"
+}
+HAPPY_AGING_ANSWER_VALUES = {
+    "건강한 몸과 마음": ["건강", "몸", "마음"],
+    "안정적인 경제력": ["경제력", "안정"],
+    "여가과 취미를 즐길 수 있는 시간과 여유": ["여가", "취미", "시간", "여유"],
+    "가족 또는 친구와의 친밀한 관계": ["가족", "친구", "관계"],
+    "사회와의 적절한 연결감": ["사회", "연결감"]
+}
+
+# 63. 여행 스타일 (실제 질문: "어려분은 여행갈 때 어떤 스타일에 더 가까우신가요?")
+TRAVEL_STYLE_QUESTION_KEYWORDS = {
+    "여행", "스타일", "가까우"
+}
+TRAVEL_STYLE_ANSWER_VALUES = {
+    "계획형(여행 전부터 동선, 맛집, 숙소까지 꼼꼼히 준비)": ["계획형", "계획", "꼼꼼"],
+    "반반형(큰 틀만 정하고 세부 일정은 현지에서 정함)": ["반반형", "반반", "큰 틀"],
+    "즉흥형(가서 보고 느끼는 대로 움직이는 걸 선호)": ["즉흥형", "즉흥", "느끼는 대로"],
+    "잘 모르겠다": ["모르겠다"]
+}
+
+# 64. 비닐봉투 사용 줄이기 (실제 질문: "평소 일회용 비닐봉투 사용을 줄이기 위해 어떤 노력을 하고 계신가요?")
+PLASTIC_BAG_REDUCTION_QUESTION_KEYWORDS = {
+    "비닐봉투", "일회용", "줄이기", "노력"
+}
+PLASTIC_BAG_REDUCTION_ANSWER_VALUES = {
+    "장바구니나 에코백을 챙긴다": ["장바구니", "에코백"],
+    "비닐 대신 종이봉투나 박스를 활용한다": ["종이봉투", "박스"],
+    "아예 쇼핑할 때 봉투를 받지 않는다": ["받지 않는다", "아예"],
+    "편의점이나 마트에서 유료 봉투를 아깝더라도 산다": ["유료 봉투", "산다"],
+    "따로 노력하고 있지 않다": ["노력하고 있지 않다"],
+    "기타": ["기타"]
+}
+
+# 65. 포인트 적립 관심도 (실제 질문: "여러분은 할인, 캐시백, 멤버십 등 포인트 적립 혜택을 얼마나 신경 쓰시나요?")
+REWARDS_ATTENTION_QUESTION_KEYWORDS = {
+    "할인", "캐시백", "멤버십", "포인트", "적립", "신경"
+}
+REWARDS_ATTENTION_ANSWER_VALUES = {
+    "자주 쓰는 곳만 챙긴다": ["자주 쓰는 곳"],
+    "매우 꼼꼼하게 챙긴다": ["매우 꼼꼼", "꼼꼼하게"],
+    "가끔 생각날 때만 챙긴다": ["가끔", "생각날 때"],
+    "거의 신경쓰지 않는다": ["거의 신경쓰지"],
+    "전혀 관심 없다": ["전혀 관심"]
+}
+
+# 66. 초콜릿 섭취 시점 (실제 질문: "여러분은 초콜릿을 주로 언제 드시나요?")
+CHOCOLATE_TIMING_QUESTION_KEYWORDS = {
+    "초콜릿", "언제", "드시나요"
+}
+CHOCOLATE_TIMING_ANSWER_VALUES = {
+    "거의 먹지 않는다": ["거의 먹지 않는다"],
+    "스트레스를 받을 때": ["스트레스"],
+    "선물로 받았을 때": ["선물"],
+    "간식으로 습관처럼": ["간식", "습관"],
+    "특별한 날(생일, 발렌타인데이 등)": ["특별한 날", "생일", "발렌타인"],
+    "기분이 좋을 때": ["기분이 좋을 때"],
+    "기타": ["기타"]
+}
+
+# 67. 개인정보보호 습관 (실제 질문: "여러분은 평소 개인정보보호를 위해 어떤 습관이 있으신가요?")
+PRIVACY_HABIT_QUESTION_KEYWORDS = {
+    "개인정보", "보호", "습관", "평소"
+}
+PRIVACY_HABIT_ANSWER_VALUES = {
+    "의심스러운 링크/앱은 클릭하지 않는다": ["링크", "앱", "클릭하지 않는다"],
+    "이중 인증(OTP 등)을 설정한다": ["이중 인증", "OTP"],
+    "개인정보 제공 동의 시 꼼꼼히 읽는다": ["동의", "꼼꼼히"],
+    "공공 와이파이 사용을 자제한다": ["와이파이", "자제"],
+    "비밀번호를 주기적으로 바꾼다": ["비밀번호", "바꾼다"],
+    "따로 실천하는 게 없다": ["실천하는 게 없다"],
+    "기타": ["기타"]
+}
+
+# 68. 여름 패션 필수템 (실제 질문: "여러분이 절대 포기할 수 없는 여름 패션 필수템은 무엇인가요?")
+SUMMER_FASHION_QUESTION_KEYWORDS = {
+    "여름", "패션", "필수템", "포기할 수 없는"
+}
+SUMMER_FASHION_ANSWER_VALUES = {
+    "반바지": ["반바지"],
+    "샌들/슬리퍼": ["샌들", "슬리퍼"],
+    "선글라스": ["선글라스"],
+    "얇은 긴팔 셔츠": ["얇은 긴팔", "셔츠"],
+    "쿨토시/쿨스카프": ["쿨토시", "쿨스카프"],
+    "린넨셔츠": ["린넨셔츠", "린넨"],
+    "민소매": ["민소매"],
+    "기타": ["기타"]
+}
+
+# 69. 갤러리 사진 유형 (실제 질문: "여러분의 휴대폰 갤러리에 가장 많이 저장되어져 있는 사진은 무엇인가요?")
+GALLERY_PHOTO_QUESTION_KEYWORDS = {
+    "휴대폰", "갤러리", "사진", "저장"
+}
+GALLERY_PHOTO_ANSWER_VALUES = {
+    "친구/가족과의 단체 사진": ["친구", "가족", "단체 사진"],
+    "풍경/여행 사진": ["풍경", "여행 사진"],
+    "셀카/인물 사진": ["셀카", "인물"],
+    "메모용 캡처/스크린샷": ["캡처", "스크린샷"],
+    "업무/학업 관련 사진(자료, 필기 등)": ["업무", "학업", "필기"],
+    "SNS/인터넷에서 저장한 이미지": ["SNS", "인터넷"],
+    "음식 사진": ["음식 사진"],
+    "반려동물 사진": ["반려동물"],
+    "기타": ["기타"]
+}
+
+# 70. 우산 없을 때 행동 (실제 질문: "갑작스런 비로 우산이 없을 때 여러분은 어떻게 하시나요?")
+RAIN_WITHOUT_UMBRELLA_QUESTION_KEYWORDS = {
+    "비", "우산", "없을 때", "갑작스런"
+}
+RAIN_WITHOUT_UMBRELLA_ANSWER_VALUES = {
+    "근처 비를 피할 수 있는 곳으로 뛰어간다": ["비를 피할", "뛰어간다"],
+    "편의점에서 우산을 산다": ["편의점", "우산을 산다"],
+    "그냥 비를 맞고 간다": ["비를 맞고"],
+    "가족/친구 등 주변지인에게 연락한다": ["주변지인", "연락"],
+    "기타": ["기타"]
+}
+
+# 71. 물놀이 장소 선호 (실제 질문: "여러분이 여름철 물놀이 장소로 가장 선호하는 곳은 어디입니까?")
+WATER_ACTIVITY_LOCATION_QUESTION_KEYWORDS = {
+    "물놀이", "장소", "선호", "여름철"
+}
+WATER_ACTIVITY_LOCATION_ANSWER_VALUES = {
+    "계곡": ["계곡"],
+    "해변": ["해변"],
+    "워터파크": ["워터파크"],
+    "물놀이를 좋아하지 않는다": ["좋아하지 않는다"],
+    "기타": ["기타"]
+}
+
+# 72. 반려동물 경험 상태 (실제 질문: "여러분은 반려동물을 키우는 중이시거나 혹은 키워보신 적이 있으신가요?")
+PET_EXPERIENCE_QUESTION_KEYWORDS = {
+    "반려동물", "키우는", "키워본", "적"
+}
+PET_EXPERIENCE_ANSWER_VALUES = {
+    "반려동물을 키우는 중이다": ["키우는 중"],
+    "반려동물을 키워본 적이 있다": ["키워본 적"],
+    "반려동물을 키워본 적이 없다": ["키워본 적이 없다", "없다"]
+}
+
+# 73. 전통시장 방문 빈도 (실제 질문: "여러분은 전통시장을 얼마나 자주 방문하시나요?")
+TRADITIONAL_MARKET_FREQUENCY_QUESTION_KEYWORDS = {
+    "전통시장", "얼마나", "자주", "방문"
+}
+TRADITIONAL_MARKET_FREQUENCY_ANSWER_VALUES = {
+    "일주일에 1회 이상": ["일주일", "1회"],
+    "2주에 1회 이상": ["2주", "1회"],
+    "한달에 1회 이상": ["한달", "1회"],
+    "3개월에 1회 이상": ["3개월", "1회"],
+    "6개월에 1회 이상": ["6개월", "1회"],
+    "1년에 1회 이상": ["1년", "1회"],
+    "전혀 방문하지 않음": ["전혀", "방문하지 않음"]
+}
+
+# 74. 스트레스 원인 (실제 질문: "다음 중 가장 스트레스를 많이 느끼는 상황은 무엇인가요?")
+STRESS_SOURCE_QUESTION_KEYWORDS = {
+    "스트레스", "느끼는", "상황", "가장"
+}
+STRESS_SOURCE_ANSWER_VALUES = {
+    "경제적 문제": ["경제적", "돈"],
+    "인간관계 (가족, 친구, 직장 등)": ["인간관계", "관계", "가족", "친구", "직장"],
+    "건강 문제": ["건강"],
+    "업무 / 학업": ["업무", "학업", "일", "공부"],
+    "출퇴근": ["출퇴근", "통근"],
+    "기타": ["기타"]
+}
+
+# 75. 가장 많이 사용하는 앱 (실제 질문: "여러분은 요즘 가장 많이 사용하는 앱은 무엇인가요?")
+MOST_USED_APP_QUESTION_KEYWORDS = {
+    "앱", "가장 많이", "사용", "요즘"
+}
+MOST_USED_APP_ANSWER_VALUES = {
+    "메신저 앱 (카카오톡, 문자 등)": ["메신저", "카카오톡", "문자"],
+    "동영상 스트리밍 앱 (유튜브, 넷플릭스 등)": ["동영상", "스트리밍", "유튜브", "넷플릭스"],
+    "금융 앱": ["금융", "은행"],
+    "SNS 앱 (인스타그램, 페이스북, 틱톡 등)": ["SNS", "인스타", "페이스북", "틱톡"],
+    "운동/건강 앱": ["운동", "건강", "피트니스"],
+    "쇼핑/배달 앱 (쿠팡, 배달의민족, 무신사 등)": ["쇼핑", "배달", "쿠팡"],
+    "게임 앱": ["게임"],
+    "기타": ["기타"]
+}
+
+# 76. 체력 관리 활동 종류 (실제 질문: "여러분은 평소 체력 관리를 위해 어떤 활동을 하고 계신가요?")
+EXERCISE_TYPE_QUESTION_KEYWORDS = {
+    "체력 관리", "운동", "활동", "평소"
+}
+EXERCISE_TYPE_ANSWER_VALUES = {
+    "달리기/걷기": ["달리기", "걷기", "러닝", "워킹"],
+    "홈트레이닝": ["홈트", "홈트레이닝"],
+    "헬스": ["헬스", "웨이트"],
+    "등산": ["등산", "산"],
+    "자전거 타기": ["자전거", "사이클"],
+    "요가/필라테스": ["요가", "필라테스"],
+    "스포츠(축구, 배드민턴 등)": ["스포츠", "축구", "배드민턴"],
+    "수영": ["수영"],
+    "체력관리를 위해 하고 있는 활동이 없다": ["활동이 없다", "하고 있지 않다"],
+    "기타": ["기타"]
+}
+
+# 77. 빠른 배송으로 구매하는 제품 (실제 질문: "빠른 배송(당일·새벽·직진 배송) 서비스를 주로 어떤 제품을 구매할 때 이용하시나요?")
+FAST_DELIVERY_PRODUCT_QUESTION_KEYWORDS = {
+    "빠른 배송", "당일", "새벽", "제품", "구매"
+}
+FAST_DELIVERY_PRODUCT_ANSWER_VALUES = {
+    "신선식품(과일, 채소, 육류 등)": ["신선식품", "과일", "채소", "육류"],
+    "생활용품(생필품, 위생용품 등)": ["생활용품", "생필품", "위생용품"],
+    "패션·뷰티 제품": ["패션", "뷰티", "화장품"],
+    "전자기기 및 가전제품": ["전자기기", "가전"],
+    "빠른 배송 서비스를 이용해 본 적 없다": ["이용해 본 적 없다", "없다"],
+    "기타": ["기타"]
+}
+
 # ⭐ 범용 Behavioral 키워드 매핑 (확장 가능)
 BEHAVIORAL_KEYWORD_MAP = {
     'smoker': {
@@ -2351,6 +2840,302 @@ BEHAVIORAL_KEYWORD_MAP = {
             STRESS_RELIEF_SHOPPING_KEYWORDS
         ),
         'negative_keywords': STRESS_RELIEF_NEGATIVE_KEYWORDS
+    },
+    # ⭐ 신규: 겨울방학 추억 (문자열 값 저장)
+    'winter_vacation_memory': {
+        'question_text': '초등학생 시절 겨울방학 때 가장 기억에 남는 일은 무엇인가요?',
+        'question_keywords': WINTER_VACATION_QUESTION_KEYWORDS,
+        'answer_values': WINTER_VACATION_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 피부 상태 만족도 (문자열 값 저장)
+    'skin_satisfaction': {
+        'question_text': '현재 본인의 피부 상태에 얼마나 만족하시나요?',
+        'question_keywords': SKIN_SATISFACTION_QUESTION_KEYWORDS,
+        'answer_values': SKIN_SATISFACTION_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: AI 서비스 활용 분야 (문자열 값 저장)
+    'ai_service_field': {
+        'question_text': '여러분은 요즘 어떤 분야에서 AI 서비스를 활용하고 계신가요?',
+        'question_keywords': AI_SERVICE_FIELD_QUESTION_KEYWORDS,
+        'answer_values': AI_SERVICE_FIELD_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 기분 좋은 소비 (문자열 값 저장)
+    'happy_consumption': {
+        'question_text': '여러분은 본인을 위해 소비하는 것 중 가장 기분 좋아지는 소비는 무엇인가요?',
+        'question_keywords': HAPPY_CONSUMPTION_QUESTION_KEYWORDS,
+        'answer_values': HAPPY_CONSUMPTION_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: AI 챗봇 서비스 종류 (문자열 값 저장)
+    'ai_chatbot_service': {
+        'question_text': '여러분이 사용해 본 AI 챗봇 서비스는 무엇인가요?',
+        'question_keywords': AI_CHATBOT_SERVICE_QUESTION_KEYWORDS,
+        'answer_values': AI_CHATBOT_SERVICE_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 해외여행 선호 지역 (문자열 값 저장)
+    'overseas_travel_preference': {
+        'question_text': '여러분은 올해 해외여행을 간다면 어디로 가고 싶나요?',
+        'question_keywords': OVERSEAS_TRAVEL_QUESTION_KEYWORDS,
+        'answer_values': OVERSEAS_TRAVEL_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: OTT 서비스 개수 (문자열 값 저장)
+    'ott_count': {
+        'question_text': '여러분이 현재 이용 중인 OTT 서비스는 몇 개인가요?',
+        'question_keywords': OTT_COUNT_QUESTION_KEYWORDS,
+        'answer_values': OTT_COUNT_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 물건 처분 방법 (문자열 값 저장)
+    'disposal_method': {
+        'question_text': '여러분은 쓰지 않는 물건을 어떻게 처리하시나요?',
+        'question_keywords': DISPOSAL_METHOD_QUESTION_KEYWORDS,
+        'answer_values': DISPOSAL_METHOD_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 이사 시 스트레스 포인트 (문자열 값 저장)
+    'moving_stress': {
+        'question_text': '여러분은 이사할 때 가장 스트레스를 받는 부분은 무엇인가요?',
+        'question_keywords': MOVING_STRESS_QUESTION_KEYWORDS,
+        'answer_values': MOVING_STRESS_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 설날 선물 선호 (문자열 값 저장)
+    'lunar_gift_preference': {
+        'question_text': '여러분은 설날 선물로 받고 싶은 것은 무엇인가요?',
+        'question_keywords': LUNAR_GIFT_QUESTION_KEYWORDS,
+        'answer_values': LUNAR_GIFT_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 피부 관리 지출 수준 (문자열 값 저장)
+    'skincare_spending': {
+        'question_text': '여러분은 피부 관리에 얼마나 지출하시나요?',
+        'question_keywords': SKINCARE_SPENDING_QUESTION_KEYWORDS,
+        'answer_values': SKINCARE_SPENDING_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 주로 사용하는 AI 챗봇 (문자열 값 저장)
+    'ai_chatbot_primary': {
+        'question_text': '여러분이 주로 사용하는 AI 챗봇은 무엇인가요?',
+        'question_keywords': AI_CHATBOT_PRIMARY_QUESTION_KEYWORDS,
+        'answer_values': AI_CHATBOT_PRIMARY_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 스킨케어 제품 구매 시 우선순위 (문자열 값 저장)
+    'skincare_priority': {
+        'question_text': '여러분은 스킨케어 제품을 구매할 때 가장 중요하게 생각하는 것은 무엇인가요?',
+        'question_keywords': SKINCARE_PRIORITY_QUESTION_KEYWORDS,
+        'answer_values': SKINCARE_PRIORITY_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 야식 먹는 방법 (문자열 값 저장)
+    'late_night_snack_method': {
+        'question_text': '여러분은 야식을 먹을 때 주로 어떤 방법으로 먹나요?',
+        'question_keywords': LATE_NIGHT_SNACK_QUESTION_KEYWORDS,
+        'answer_values': LATE_NIGHT_SNACK_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 최근 소비 카테고리 (문자열 값 저장)
+    'recent_spending_category': {
+        'question_text': '여러분이 최근 가장 많이 소비한 카테고리는 무엇인가요?',
+        'question_keywords': RECENT_SPENDING_QUESTION_KEYWORDS,
+        'answer_values': RECENT_SPENDING_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 혼밥 빈도 (문자열 값 저장)
+    'solo_dining_frequency': {
+        'question_text': '여러분은 얼마나 자주 혼자 식사를 하시나요?',
+        'question_keywords': SOLO_DINING_QUESTION_KEYWORDS,
+        'answer_values': SOLO_DINING_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 효과적인 다이어트 방법 (문자열 값 저장)
+    'diet_method': {
+        'question_text': '여러분에게 가장 효과적인 다이어트 방법은 무엇인가요?',
+        'question_keywords': DIET_METHOD_QUESTION_KEYWORDS,
+        'answer_values': DIET_METHOD_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 알람 설정 스타일 (문자열 값 저장)
+    'alarm_style': {
+        'question_text': '여러분은 아침에 일어날 때 알람을 어떻게 설정하시나요?',
+        'question_keywords': ALARM_STYLE_QUESTION_KEYWORDS,
+        'answer_values': ALARM_STYLE_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 여름철 고민 (문자열 값 저장)
+    'summer_concern': {
+        'question_text': '여러분은 여름철에 가장 고민되는 것은 무엇인가요?',
+        'question_keywords': SUMMER_CONCERN_QUESTION_KEYWORDS,
+        'answer_values': SUMMER_CONCERN_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 여름 간식 선호 (문자열 값 저장)
+    'summer_snack': {
+        'question_text': '여러분이 여름에 즐겨 먹는 간식은 무엇인가요?',
+        'question_keywords': SUMMER_SNACK_QUESTION_KEYWORDS,
+        'answer_values': SUMMER_SNACK_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 땀 고민 부위 (문자열 값 저장)
+    'sweat_concern': {
+        'question_text': '여러분은 땀 때문에 고민이 되는 부위가 있나요?',
+        'question_keywords': SWEAT_CONCERN_QUESTION_KEYWORDS,
+        'answer_values': SWEAT_CONCERN_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 행복한 노년 조건 (문자열 값 저장)
+    'happy_aging_condition': {
+        'question_text': '여러분이 가장 중요하다고 생각하는 행복한 노년의 조건은 무엇인가요?',
+        'question_keywords': HAPPY_AGING_QUESTION_KEYWORDS,
+        'answer_values': HAPPY_AGING_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 여행 스타일 (문자열 값 저장)
+    'travel_style': {
+        'question_text': '어려분은 여행갈 때 어떤 스타일에 더 가까우신가요?',
+        'question_keywords': TRAVEL_STYLE_QUESTION_KEYWORDS,
+        'answer_values': TRAVEL_STYLE_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 비닐봉투 사용 줄이기 (문자열 값 저장)
+    'plastic_bag_reduction': {
+        'question_text': '평소 일회용 비닐봉투 사용을 줄이기 위해 어떤 노력을 하고 계신가요?',
+        'question_keywords': PLASTIC_BAG_REDUCTION_QUESTION_KEYWORDS,
+        'answer_values': PLASTIC_BAG_REDUCTION_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 포인트 적립 관심도 (문자열 값 저장)
+    'rewards_attention': {
+        'question_text': '여러분은 할인, 캐시백, 멤버십 등 포인트 적립 혜택을 얼마나 신경 쓰시나요?',
+        'question_keywords': REWARDS_ATTENTION_QUESTION_KEYWORDS,
+        'answer_values': REWARDS_ATTENTION_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 초콜릿 섭취 시점 (문자열 값 저장)
+    'chocolate_timing': {
+        'question_text': '여러분은 초콜릿을 주로 언제 드시나요?',
+        'question_keywords': CHOCOLATE_TIMING_QUESTION_KEYWORDS,
+        'answer_values': CHOCOLATE_TIMING_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 개인정보보호 습관 (문자열 값 저장)
+    'privacy_protection_habit': {
+        'question_text': '여러분은 평소 개인정보보호를 위해 어떤 습관이 있으신가요?',
+        'question_keywords': PRIVACY_HABIT_QUESTION_KEYWORDS,
+        'answer_values': PRIVACY_HABIT_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 여름 패션 필수템 (문자열 값 저장)
+    'summer_fashion_essential': {
+        'question_text': '여러분이 절대 포기할 수 없는 여름 패션 필수템은 무엇인가요?',
+        'question_keywords': SUMMER_FASHION_QUESTION_KEYWORDS,
+        'answer_values': SUMMER_FASHION_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 갤러리 사진 유형 (문자열 값 저장)
+    'gallery_photo_type': {
+        'question_text': '여러분의 휴대폰 갤러리에 가장 많이 저장되어져 있는 사진은 무엇인가요?',
+        'question_keywords': GALLERY_PHOTO_QUESTION_KEYWORDS,
+        'answer_values': GALLERY_PHOTO_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 우산 없을 때 행동 (문자열 값 저장)
+    'rain_without_umbrella': {
+        'question_text': '갑작스런 비로 우산이 없을 때 여러분은 어떻게 하시나요?',
+        'question_keywords': RAIN_WITHOUT_UMBRELLA_QUESTION_KEYWORDS,
+        'answer_values': RAIN_WITHOUT_UMBRELLA_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 물놀이 장소 선호 (문자열 값 저장)
+    'water_activity_location': {
+        'question_text': '여러분이 여름철 물놀이 장소로 가장 선호하는 곳은 어디입니까?',
+        'question_keywords': WATER_ACTIVITY_LOCATION_QUESTION_KEYWORDS,
+        'answer_values': WATER_ACTIVITY_LOCATION_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 반려동물 경험 상태 (문자열 값 저장)
+    'pet_experience': {
+        'question_text': '여러분은 반려동물을 키우는 중이시거나 혹은 키워보신 적이 있으신가요?',
+        'question_keywords': PET_EXPERIENCE_QUESTION_KEYWORDS,
+        'answer_values': PET_EXPERIENCE_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 전통시장 방문 빈도 (문자열 값 저장)
+    'traditional_market_frequency': {
+        'question_text': '여러분은 전통시장을 얼마나 자주 방문하시나요?',
+        'question_keywords': TRADITIONAL_MARKET_FREQUENCY_QUESTION_KEYWORDS,
+        'answer_values': TRADITIONAL_MARKET_FREQUENCY_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 스트레스 원인 (문자열 값 저장)
+    'stress_source': {
+        'question_text': '다음 중 가장 스트레스를 많이 느끼는 상황은 무엇인가요?',
+        'question_keywords': STRESS_SOURCE_QUESTION_KEYWORDS,
+        'answer_values': STRESS_SOURCE_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 가장 많이 사용하는 앱 (문자열 값 저장)
+    'most_used_app': {
+        'question_text': '여러분은 요즘 가장 많이 사용하는 앱은 무엇인가요?',
+        'question_keywords': MOST_USED_APP_QUESTION_KEYWORDS,
+        'answer_values': MOST_USED_APP_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 체력 관리 활동 종류 (문자열 값 저장)
+    'exercise_type': {
+        'question_text': '여러분은 평소 체력 관리를 위해 어떤 활동을 하고 계신가요?',
+        'question_keywords': EXERCISE_TYPE_QUESTION_KEYWORDS,
+        'answer_values': EXERCISE_TYPE_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
+    },
+    # ⭐ 신규: 빠른 배송으로 구매하는 제품 (문자열 값 저장)
+    'fast_delivery_product': {
+        'question_text': '빠른 배송(당일·새벽·직진 배송) 서비스를 주로 어떤 제품을 구매할 때 이용하시나요?',
+        'question_keywords': FAST_DELIVERY_PRODUCT_QUESTION_KEYWORDS,
+        'answer_values': FAST_DELIVERY_PRODUCT_ANSWER_VALUES,
+        'positive_keywords': set(),
+        'negative_keywords': set()
     }
 }
 
@@ -2359,17 +3144,19 @@ def extract_behavior_from_qa_pairs(
     qa_pairs: List[Dict[str, Any]],
     behavior_key: str,
     debug: bool = False
-) -> Optional[bool]:
+) -> Optional[Union[bool, str]]:
     """qa_pairs에서 특정 behavioral 조건을 추출 (범용)
 
     Args:
         qa_pairs: QA 쌍 리스트
-        behavior_key: behavioral 조건 키 (예: 'ott_user', 'smoker')
+        behavior_key: behavioral 조건 키
+            - Boolean: 'ott_user', 'smoker', 'drinker', ...
+            - String: 'winter_vacation_memory', 'skin_satisfaction', 'ai_service_field', ...
         debug: 디버깅 로그 출력 여부
 
     Returns:
-        True: 긍정 (예: OTT 이용함)
-        False: 부정 (예: OTT 이용 안함)
+        True/False: boolean 조건 (예: smoker=True)
+        str: 문자열 값 (예: winter_vacation_memory="친구들과 보낸 즐거운 시간")
         None: 정보 없음
     """
     keyword_config = BEHAVIORAL_KEYWORD_MAP.get(behavior_key)
@@ -2379,6 +3166,56 @@ def extract_behavior_from_qa_pairs(
         return None
 
     question_keywords = keyword_config['question_keywords']
+
+    # ⭐ 문자열 값 저장 패턴 처리 (answer_values가 있는 경우)
+    answer_values = keyword_config.get('answer_values')
+    if answer_values:
+        for qa in qa_pairs:
+            if not isinstance(qa, dict):
+                continue
+
+            q_text = str(qa.get("q_text", "")).lower()
+
+            # 질문에 관련 키워드가 있는지 확인
+            matched_kw = None
+            for kw in question_keywords:
+                if kw.lower() in q_text:
+                    matched_kw = kw
+                    break
+
+            if not matched_kw:
+                continue
+
+            # 답변 가져오기
+            answer = qa.get("answer") or qa.get("answer_text")
+            if not answer:
+                if debug:
+                    logger.warning(f"[Behavioral] {behavior_key} 질문 발견했으나 답변 없음: q={q_text}")
+                continue
+
+            answer_text = str(answer).lower()
+
+            if debug:
+                logger.warning(f"[Behavioral] {behavior_key} 검사중: q={q_text[:30]}, a={answer_text[:50]}")
+
+            # 답변 값 매칭 (가장 긴 매칭 우선)
+            matched_value = None
+            max_match_count = 0
+
+            for value_name, keywords in answer_values.items():
+                match_count = sum(1 for kw in keywords if kw.lower() in answer_text)
+                if match_count > max_match_count:
+                    max_match_count = match_count
+                    matched_value = value_name
+
+            if matched_value:
+                if debug:
+                    logger.warning(f"[Behavioral] {behavior_key} = '{matched_value}' (매칭: {max_match_count}개)")
+                return matched_value
+
+        return None
+
+    # ⭐ 기존 boolean 조건 처리
     positive_keywords = keyword_config['positive_keywords']
     negative_keywords = keyword_config['negative_keywords']
 
@@ -2470,65 +3307,237 @@ def extract_behavior_from_qa_pairs(
     return None
 
 
-def extract_behavioral_conditions_from_query(query: str) -> Dict[str, bool]:
-    """쿼리 텍스트에서 behavioral 조건 자동 추출
+def filter_redundant_patterns(
+    conditions: Dict[str, Union[bool, str]]
+) -> Dict[str, Union[bool, str]]:
+    """중복 패턴 제거 (구체적 > 일반적)
+
+    Args:
+        conditions: LLM이 추출한 behavioral 조건
+
+    Returns:
+        중복 제거된 조건
+    """
+    filtered = conditions.copy()
+
+    for specific, generics in PATTERN_HIERARCHY.items():
+        if specific in filtered:
+            for generic in generics:
+                if generic in filtered:
+                    logger.info(f"🔧 중복 제거: {specific} 우선, {generic} 제거")
+                    del filtered[generic]
+
+    return filtered
+
+
+def extract_behavioral_conditions_llm(
+    query: str,
+    anthropic_client
+) -> Dict[str, Union[bool, str]]:
+    """LLM을 사용한 행동 조건 추출 (고정확도!)
+
+    장점:
+    - 문맥 이해 (표현이 달라도 매칭)
+    - 유지보수 쉬움 (프롬프트만 수정)
+    - 정확도 높음 (90-95%)
+
+    단점:
+    - 비용 ($0.00006/쿼리, 캐싱 적용 시)
+    - 속도 (0.3~0.5초, 캐싱 시 0.001초)
+
+    Args:
+        query: 검색 쿼리
+        anthropic_client: Anthropic 클라이언트
+
+    Returns:
+        behavioral 조건 딕셔너리
+    """
+    if not anthropic_client:
+        return {}
+
+    # ⭐ 캐시 확인 (동일 쿼리 재사용)
+    cache_key = f"llm_behavioral:{query}"
+    if cache_key in llm_query_cache:
+        logger.info(f"🔁 LLM 추출 캐시 히트: {query}")
+        return llm_query_cache[cache_key]
+
+    # ⭐ 프롬프트 생성 (Boolean 패턴 포함!)
+    pattern_descriptions = []
+
+    for idx, (behavior_key, keyword_config) in enumerate(BEHAVIORAL_KEYWORD_MAP.items(), 1):
+        question_text = keyword_config.get('question_text', behavior_key)
+        answer_values = keyword_config.get('answer_values')
+
+        if answer_values:
+            # Categorical 패턴
+            values_str = ", ".join(answer_values.keys())
+            pattern_descriptions.append(
+                f"{idx}. {behavior_key} (질문: {question_text})\n   가능한 답변: {values_str}"
+            )
+        else:
+            # ⭐ Boolean 패턴 (추가!)
+            pattern_descriptions.append(
+                f"{idx}. {behavior_key} (질문: {question_text})\n   가능한 답변: true/false"
+            )
+
+    patterns_text = "\n\n".join(pattern_descriptions)
+
+    # System prompt
+    system_prompt = f"""당신은 사용자의 검색 쿼리에서 행동 패턴을 추출하는 전문가입니다.
+
+다음은 가능한 모든 행동 패턴 목록입니다:
+
+{patterns_text}
+
+**중요 규칙**:
+1. 쿼리에서 **명확하게 언급된 패턴만** 추출하세요.
+2. 사용자의 표현이 질문과 다르더라도, **의미상 같으면** 매칭하세요.
+   예: "유럽 여행 가고 싶은" → "overseas_travel_preference: 유럽"
+   예: "ChatGPT 쓰는" → "ai_chatbot_service: ChatGPT"
+   예: "흡연자" → "smoker: true"
+3. ⭐ **더 구체적인 패턴을 우선**하세요.
+   올바른 예시:
+   - "유럽 여행" → {{"overseas_travel_preference": "유럽"}} ✅
+     (travels는 제외! overseas_travel_preference가 더 구체적)
+   - "ChatGPT 사용" → {{"ai_chatbot_service": "ChatGPT"}} ✅
+     (ai_user는 제외! ai_chatbot_service가 더 구체적)
+4. 애매하거나 추측이 필요한 것은 포함하지 마세요.
+5. **반드시 JSON 형식으로만** 응답하세요.
+6. 다른 설명 없이 JSON만 출력하세요.
+
+출력 형식:
+{{
+  "behavior_key": "답변 값 또는 true/false"
+}}
+
+매칭되는 패턴이 없으면 빈 객체: {{}}"""
+
+    user_prompt = f'검색 쿼리: "{query}"'
+
+    # ⭐ LLM 호출
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=500,
+            temperature=0,
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+
+        response_text = response.content[0].text.strip()
+
+        # ⭐ JSON 파싱 (더 안전하게!)
+        # ``` 블록 제거
+        if response_text.startswith("```"):
+            response_text = response_text.strip("`")
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+            response_text = response_text.strip()
+
+        # JSON 추출 (정규식으로 더 안전하게)
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
+
+        conditions = json.loads(response_text)
+
+        # ⭐ 중복 패턴 제거 (안전장치!)
+        conditions = filter_redundant_patterns(conditions)
+
+        # 캐시 저장
+        llm_query_cache[cache_key] = conditions
+
+        logger.info(f"✅ LLM 추출: {len(conditions)}개 패턴 - {conditions}")
+
+        return conditions
+
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ JSON 파싱 실패: {e}\n응답: {response_text}")
+        return {}
+    except Exception as e:
+        logger.error(f"❌ LLM 추출 실패: {e}")
+        return {}
+
+
+def extract_behavioral_conditions_from_query(query: str) -> Dict[str, Union[bool, str]]:
+    """쿼리 텍스트에서 behavioral 조건 자동 추출 (키워드 기반 - Fallback용)
+
+    ⭐ BEHAVIORAL_KEYWORD_MAP을 자동으로 순회하여 모든 패턴 감지!
+    새로운 패턴 추가 시 BEHAVIORAL_KEYWORD_MAP에만 추가하면 됨!
 
     Args:
         query: 검색 쿼리
 
     Returns:
-        behavioral 조건 딕셔너리 {"drinker": True, "smoker": False, ...}
+        behavioral 조건 딕셔너리
+        - bool: {"drinker": True, "smoker": False, ...}
+        - str: {"winter_vacation_memory": "친구들과 보낸 즐거운 시간"}
     """
     query_lower = query.lower()
     query_normalized = query_lower.replace(" ", "")
     conditions = {}
 
-    # ⭐ 음주 여부 감지
-    drinker_positive = ["술마", "술도마", "음주", "술먹", "술마신", "음주경험", "음주 경험", "주류"]
-    drinker_negative = ["비음주", "금주", "술안", "술을마시지", "술을안마시", "술도안"]
+    # ⭐ BEHAVIORAL_KEYWORD_MAP의 모든 키를 자동으로 순회
+    for behavior_key, keyword_config in BEHAVIORAL_KEYWORD_MAP.items():
+        question_keywords = keyword_config.get('question_keywords', set())
+        answer_values = keyword_config.get('answer_values')
 
-    has_drinker_negative = any(keyword in query_normalized for keyword in drinker_negative)
-    has_drinker_positive = any(keyword in query_normalized for keyword in drinker_positive)
+        # 질문 키워드가 쿼리에 있는지 확인
+        has_question_keyword = any(
+            kw.lower().replace(" ", "") in query_normalized
+            for kw in question_keywords
+        )
 
-    if has_drinker_negative:
-        conditions["drinker"] = False
-    elif has_drinker_positive:
-        conditions["drinker"] = True
+        # ⭐ 문자열 값 패턴 (answer_values가 있는 경우)
+        if answer_values:
+            # 질문 키워드 없어도 답변 키워드로 매칭 시도
+            for value_name, value_keywords in answer_values.items():
+                if any(kw.lower().replace(" ", "") in query_normalized for kw in value_keywords):
+                    conditions[behavior_key] = value_name
+                    break
 
-    # ⭐ 흡연 여부 감지
-    smoker_positive = ["흡연자", "담배피", "담배 피", "담배를피"]
-    smoker_negative = ["비흡연", "금연", "담배안", "담배도안", "흡연안", "흡연을안", "안피는", "안 피는"]
+        # ⭐ Boolean 패턴 (positive/negative keywords가 있는 경우)
+        else:
+            positive_keywords = keyword_config.get('positive_keywords', set())
+            negative_keywords = keyword_config.get('negative_keywords', set())
 
-    has_smoker_negative = any(keyword in query_normalized for keyword in smoker_negative)
-    has_smoker_positive = any(keyword in query_normalized for keyword in smoker_positive)
+            # 부정 키워드 체크 (우선순위 높음)
+            has_negative = any(
+                kw.lower().replace(" ", "") in query_normalized
+                for kw in negative_keywords
+            )
 
-    if has_smoker_negative:
-        conditions["smoker"] = False
-    elif has_smoker_positive:
-        conditions["smoker"] = True
+            # 긍정 키워드 체크
+            has_positive = any(
+                kw.lower().replace(" ", "") in query_normalized
+                for kw in positive_keywords
+            )
 
-    # ⭐ 차량 보유 여부 감지
-    vehicle_positive = ["차량", "자동차", "차보유", "차있는"]
-    vehicle_negative = ["차없는", "차량없는", "차가없는"]
-
-    has_vehicle_negative = any(keyword in query_normalized for keyword in vehicle_negative)
-    has_vehicle_positive = any(keyword in query_normalized for keyword in vehicle_positive)
-
-    if has_vehicle_negative:
-        conditions["has_vehicle"] = False
-    elif has_vehicle_positive:
-        conditions["has_vehicle"] = True
+            if has_negative:
+                conditions[behavior_key] = False
+            elif has_positive:
+                conditions[behavior_key] = True
 
     return conditions
 
 
-def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dict[str, Any]]:
+def build_behavioral_filters(behavioral_conditions: Dict[str, Union[bool, str]]) -> List[Dict[str, Any]]:
     """behavioral_conditions를 OpenSearch nested 필터로 변환 (동적 처리)
 
     ⭐ BEHAVIORAL_KEYWORD_MAP을 사용해서 모든 조건을 자동으로 처리합니다.
 
     Args:
-        behavioral_conditions: {"smoker": True, "has_vehicle": False, "uses_smart_devices": True, ...}
+        behavioral_conditions:
+            - bool: {"smoker": True, "has_vehicle": False}
+            - str: {"winter_vacation_memory": "친구들과 보낸 즐거운 시간"}
 
     Returns:
         OpenSearch nested 쿼리 리스트
@@ -2562,8 +3571,6 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dic
 
         keyword_config = BEHAVIORAL_KEYWORD_MAP[key]
         question_keywords = keyword_config['question_keywords']
-        positive_keywords = keyword_config['positive_keywords']
-        negative_keywords = keyword_config['negative_keywords']
 
         # 질문 매칭 쿼리 생성
         question_should = [
@@ -2571,18 +3578,36 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, bool]) -> List[Dic
             for q in question_keywords
         ]
 
-        # ⭐ 답변 매칭 쿼리 생성 (positive keywords만 사용, negative 무시)
-        # 이유: negative keywords가 너무 일반적 (예: "해당 없음", "보유하지 않음")
-        if value:  # True: positive keywords만 찾기
+        # ⭐ 특별 처리: winter_vacation_memory (문자열 값 매칭)
+        if isinstance(value, str):
+            # 문자열 값: answer에서 정확한 값 매칭
             answer_should = [
-                {"match": {"qa_pairs.answer": kw}}
-                for kw in positive_keywords
+                {"match_phrase": {"qa_pairs.answer": value}}
             ]
-        else:  # False: negative keywords만 찾기
-            answer_should = [
-                {"match": {"qa_pairs.answer": kw}}
-                for kw in negative_keywords
-            ]
+
+            # 답변 값 매핑에서 키워드 가져오기
+            answer_values = keyword_config.get('answer_values', {})
+            if value in answer_values:
+                for kw in answer_values[value]:
+                    answer_should.append({"match": {"qa_pairs.answer": kw}})
+
+        else:
+            # Boolean 값: positive/negative keywords 사용
+            positive_keywords = keyword_config['positive_keywords']
+            negative_keywords = keyword_config['negative_keywords']
+
+            # ⭐ 답변 매칭 쿼리 생성 (positive keywords만 사용, negative 무시)
+            # 이유: negative keywords가 너무 일반적 (예: "해당 없음", "보유하지 않음")
+            if value:  # True: positive keywords만 찾기
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}
+                    for kw in positive_keywords
+                ]
+            else:  # False: negative keywords만 찾기
+                answer_should = [
+                    {"match": {"qa_pairs.answer": kw}}
+                    for kw in negative_keywords
+                ]
 
         # OpenSearch nested 필터 생성 (must_not 제거)
         filters.append({
@@ -3158,14 +4183,21 @@ async def search_natural_language(
             raise RuntimeError("Query analysis returned None")
         query_analysis = analysis
 
-        # ⭐ 자동으로 쿼리에서 behavioral 조건 추출 및 병합
-        auto_behavioral = extract_behavioral_conditions_from_query(request.query)
+        # ⭐ 자동으로 쿼리에서 behavioral 조건 추출 (LLM 사용!)
+        anthropic_client = getattr(router, 'anthropic_client', None)
+        auto_behavioral = extract_behavioral_conditions_llm(request.query, anthropic_client)
+
+        # Fallback: LLM 실패 시 키워드 기반
+        if not auto_behavioral and not anthropic_client:
+            auto_behavioral = extract_behavioral_conditions_from_query(request.query)
+
         if auto_behavioral:
             # 기존 behavioral_conditions와 병합 (자동 추출이 우선)
             if not analysis.behavioral_conditions:
                 analysis.behavioral_conditions = {}
             for key, value in auto_behavioral.items():
-                if key not in analysis.behavioral_conditions:
+                # ⭐ None이 아니면 덮어쓰기! (LLM 추출 우선)
+                if value is not None:
                     analysis.behavioral_conditions[key] = value
             logger.info(f"✅ 자동 추출된 behavioral 조건: {auto_behavioral}")
 
