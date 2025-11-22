@@ -7,10 +7,12 @@ API Module - FastAPI 라우터 및 엔드포인트
 from .main_api import app, create_app
 from .search_api import router as search_router
 from .visualization_api import router as visualization_router
+from .log_streaming import router as log_streaming_router
 
 __all__ = [
     'app',
     'create_app',
     'search_router',
     'visualization_router',
+    'log_streaming_router',
 ]

@@ -221,33 +221,55 @@ jobs:
           docker compose build fastapi_server
           docker compose up -d fastapi_server
 
-          # 컨테이너 로그 확인
-          echo "컨테이너 로그 확인 중..."
-          docker compose logs fastapi_server | tail -20
+          # 컨테이너 상태 확인
+          echo "=== 컨테이너 상태 확인 ==="
+          docker compose ps
           
-          # 헬스 체크 (최대 60초 대기, 루트 경로 사용)
-          echo "헬스 체크 대기 중..."
-          sleep 10  # 초기 대기 시간 증가
+          # 컨테이너 로그 확인 (실시간 모니터링)
+          echo "=== 컨테이너 로그 확인 중... ==="
+          docker compose logs fastapi_server | tail -30
           
-          for i in {1..12}; do
+          # 헬스 체크 (Panel 데이터 프리로드 및 모델 로딩 시간 고려하여 대기 시간 증가)
+          echo "=== 헬스 체크 대기 중... ==="
+          echo "⚠️ FastAPI 서버는 Panel 데이터 프리로드 및 모델 로딩으로 인해 시작에 시간이 걸릴 수 있습니다."
+          sleep 30  # 초기 대기 시간 증가 (10초 → 30초)
+          
+          # 헬스 체크 재시도 (최대 180초 대기)
+          MAX_RETRIES=24  # 24번 재시도 = 120초 추가 대기
+          HEALTH_CHECK_SUCCESS=false
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            # 컨테이너 상태 확인
+            CONTAINER_STATUS=$(docker compose ps fastapi_server --format "{{.Status}}" 2>/dev/null | head -1 || echo "unknown")
+            echo "컨테이너 상태 확인 중... (재시도 $i/$MAX_RETRIES)"
+            
             # 루트 경로로 헬스 체크 (또는 /docs 경로)
             if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
                curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
-              echo "헬스 체크 성공!"
+              echo "✅ 헬스 체크 성공!"
+              HEALTH_CHECK_SUCCESS=true
               break
             else
-              echo "헬스 체크 실패, 재시도 중... ($i/6)"
+              echo "헬스 체크 실패, 재시도 중... ($i/$MAX_RETRIES)"
+              # 컨테이너 상태 확인
+              if ! echo "$CONTAINER_STATUS" | grep -q "Up"; then
+                echo "⚠️ 컨테이너가 실행 중이 아닐 수 있습니다. 로그 확인:"
+                docker compose logs --tail=50 fastapi_server
+              fi
               sleep 5
             fi
           done
 
           # 최종 헬스 체크
-          if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
-             curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
+          if [ "$HEALTH_CHECK_SUCCESS" = "true" ]; then
             echo "✅ 헬스 체크 성공!"
           else
             echo "❌ 헬스 체크 실패"
-            echo "컨테이너 로그:"
+            echo "=== 컨테이너 상태 ==="
+            docker compose ps
+            echo "=== 컨테이너 로그 (최근 100줄) ==="
+            docker compose logs --tail=100 fastapi_server
+            echo "=== 컨테이너 로그 (전체) ==="
             docker compose logs fastapi_server
             exit 1
           fi
@@ -408,38 +430,55 @@ jobs:
               docker compose build --no-cache || true
               docker compose up -d --force-recreate --build --remove-orphans
               
-              # 컨테이너 로그 확인
-              echo "컨테이너 로그 확인 중..."
-              docker compose logs fastapi_server | tail -20
-              
-              # 헬스 체크 (최대 60초 대기, 루트 경로 사용)
-              echo "헬스 체크 대기 중..."
-              sleep 15
+              # 컨테이너 상태 확인
+              echo "=== 컨테이너 상태 확인 ==="
               docker compose ps
               
-              # 헬스 체크 확인
-              for i in {1..12}; do
+              # 컨테이너 로그 확인 (실시간 모니터링)
+              echo "=== 컨테이너 로그 확인 중... ==="
+              docker compose logs fastapi_server | tail -30
+              
+              # 헬스 체크 (Panel 데이터 프리로드 및 모델 로딩 시간 고려하여 대기 시간 증가)
+              echo "=== 헬스 체크 대기 중... ==="
+              echo "⚠️ FastAPI 서버는 Panel 데이터 프리로드 및 모델 로딩으로 인해 시작에 시간이 걸릴 수 있습니다."
+              sleep 30  # 초기 대기 시간 증가 (15초 → 30초)
+              
+              # 헬스 체크 재시도 (최대 180초 대기)
+              MAX_RETRIES=24  # 24번 재시도 = 120초 추가 대기
+              HEALTH_CHECK_SUCCESS=false
+              
+              for i in $(seq 1 $MAX_RETRIES); do
+                # 컨테이너 상태 확인
+                CONTAINER_STATUS=$(docker compose ps fastapi_server --format "{{.Status}}" 2>/dev/null | head -1 || echo "unknown")
+                echo "컨테이너 상태 확인 중... (재시도 $i/$MAX_RETRIES)"
+                
                 # 루트 경로로 헬스 체크 (또는 /docs 경로)
                 if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
                    curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
-                  echo "헬스 체크 성공!"
+                  echo "✅ 헬스 체크 성공!"
+                  HEALTH_CHECK_SUCCESS=true
                   break
                 else
-                  echo "헬스 체크 실패, 재시도 중... ($i/12)"
+                  echo "헬스 체크 실패, 재시도 중... ($i/$MAX_RETRIES)"
                   # 컨테이너 상태 확인
-                  docker compose ps
-                  docker compose logs --tail=10 fastapi_server
+                  if ! echo "$CONTAINER_STATUS" | grep -q "Up"; then
+                    echo "⚠️ 컨테이너가 실행 중이 아닐 수 있습니다. 로그 확인:"
+                    docker compose logs --tail=50 fastapi_server
+                  fi
                   sleep 5
                 fi
               done
               
               # 최종 HTTP 헬스 체크
-              if curl -f -s http://localhost:8000/ > /dev/null 2>&1 || \
-                 curl -f -s http://localhost:8000/docs > /dev/null 2>&1; then
+              if [ "$HEALTH_CHECK_SUCCESS" = "true" ]; then
                 echo "✅ HTTP 헬스 체크 성공!"
               else
                 echo "❌ HTTP 헬스 체크 실패"
-                echo "컨테이너 로그:"
+                echo "=== 컨테이너 상태 ==="
+                docker compose ps
+                echo "=== 컨테이너 로그 (최근 100줄) ==="
+                docker compose logs --tail=100 fastapi_server
+                echo "=== 컨테이너 로그 (전체) ==="
                 docker compose logs fastapi_server
                 echo "⚠️ HTTP 헬스 체크 실패했지만 배포는 계속 진행합니다."
               fi
