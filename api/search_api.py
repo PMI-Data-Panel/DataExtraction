@@ -199,7 +199,11 @@ class PanelDataCache:
                     '_doc': doc,
                 }
 
-                # ⭐⭐⭐ Behavioral 컬럼 추가 (33개)
+                # ⭐ 모든 behavioral 컬럼 기본값으로 초기화 (None)
+                for key in all_behavioral_keys:
+                    record[key] = None
+
+                # ⭐ 실제 추출된 값으로 업데이트
                 record.update(behavioral_values)
 
                 records.append(record)
@@ -334,10 +338,17 @@ class PanelDataCache:
                         # ⭐ Boolean 체크 (벡터화!)
                         mask &= (self.df[behavior_key] == expected_value)
                     elif isinstance(expected_value, str):
-                        # ⭐ 문자열 매칭 (부분 매칭, 대소문자 무시)
-                        mask &= self.df[behavior_key].notna() & self.df[behavior_key].str.contains(
-                            expected_value, case=False, na=False, regex=False
-                        )
+                        # ⭐ 정확 매칭 먼저 시도
+                        exact_match = (self.df[behavior_key] == expected_value)
+                        
+                        # ⭐ 부분 매칭 (Fallback - 정확 매칭 실패 시)
+                        partial_match = self.df[behavior_key].notna() & \
+                                       self.df[behavior_key].str.contains(
+                                           expected_value, case=False, na=False, regex=False
+                                       )
+                        
+                        # 둘 중 하나라도 매칭
+                        mask &= (exact_match | partial_match)
 
         return self.df[mask]
 
@@ -2480,7 +2491,9 @@ SUMMER_CONCERN_ANSWER_VALUES = {
 
 # 60. 여름 간식 (실제 질문: "여러분의 여름철 최애 간식은 무엇인가요?")
 SUMMER_SNACK_QUESTION_KEYWORDS = {
-    "여름", "간식", "최애"
+    "여름", "간식", "최애",
+    "수박", "참외", "과일",  # ⭐ 추가!
+    "아이스크림", "냉면", "빙수"  # ⭐ 추가!
 }
 SUMMER_SNACK_ANSWER_VALUES = {
     "제철과일(수박, 참외 등)": ["수박", "참외", "과일"],
@@ -3187,6 +3200,7 @@ def extract_all_behaviors_batch(qa_pairs: List[Dict[str, Any]]) -> Dict[str, Any
     1. SequenceMatcher 제거 (100배 개선) ⚡
     2. 해시맵 전처리 O(1) 조회 (10배 개선) ⚡
     3. Early termination (2-3배 개선) ⚡
+    4. 정규화 매칭 (공백/물음표/대소문자 차이 무시) ⚡
 
     Args:
         qa_pairs: list of dict (각 dict는 질문/답변 쌍)
@@ -3194,12 +3208,23 @@ def extract_all_behaviors_batch(qa_pairs: List[Dict[str, Any]]) -> Dict[str, Any
     Returns:
         Dict[behavior_key, value] - 모든 behavioral 패턴의 값
     """
-    # ⚡ 최적화 1: 해시맵 전처리 (question_text → behavior_key)
-    question_to_behavior = {
-        config['question_text']: behavior_key
-        for behavior_key, config in BEHAVIORAL_KEYWORD_MAP.items()
-        if config.get('question_text')
-    }
+    # ⭐ 정규화 함수 (강화)
+    def normalize_question(text: str) -> str:
+        """질문 텍스트 정규화 (공백, 물음표, 느낌표, 대소문자 정규화)"""
+        import re
+        if not text:
+            return ""
+        text = text.strip()
+        text = re.sub(r'\s+', ' ', text)  # 공백 정규화 (여러 공백 → 하나)
+        text = text.rstrip('?!')  # 물음표, 느낌표 제거
+        return text.lower()
+    
+    # ⚡ 최적화 1: 해시맵 전처리 (정규화된 question_text → behavior_key)
+    question_to_behavior = {}
+    for behavior_key, config in BEHAVIORAL_KEYWORD_MAP.items():
+        if config.get('question_text'):
+            normalized = normalize_question(config['question_text'])
+            question_to_behavior[normalized] = behavior_key
 
     # 결과 딕셔너리 초기화
     behavioral_values = {}
@@ -3223,8 +3248,9 @@ def extract_all_behaviors_batch(qa_pairs: List[Dict[str, Any]]) -> Dict[str, Any
 
         answer_text = str(answer).lower()
 
-        # ⚡ 최적화 2: 해시맵으로 O(1) 조회 (question_text가 있는 경우)
-        behavior_key = question_to_behavior.get(q_text)
+        # ⚡ 최적화 2: 해시맵으로 O(1) 조회 (정규화된 question_text로 매칭)
+        normalized_q = normalize_question(q_text)
+        behavior_key = question_to_behavior.get(normalized_q)
         if behavior_key and behavioral_values.get(behavior_key) is None:
             config = BEHAVIORAL_KEYWORD_MAP[behavior_key]
             answer_values = config.get('answer_values')
@@ -3253,26 +3279,26 @@ def extract_all_behaviors_batch(qa_pairs: List[Dict[str, Any]]) -> Dict[str, Any
                 elif negative_kw and any(kw.lower() in answer_text for kw in negative_kw):
                     behavioral_values[behavior_key] = False
 
-        # Fallback: question_keywords 매칭 (question_text 없는 패턴용)
+        # ⭐ Fallback: question_keywords 매칭 (정확 매칭 실패 시 Fallback)
+        # question_text가 있어도 정확 매칭 실패 시 question_keywords로 시도!
         for behavior_key, config in BEHAVIORAL_KEYWORD_MAP.items():
             # 이미 값이 추출된 경우 스킵
             if behavioral_values.get(behavior_key) is not None:
                 continue
 
-            # question_text가 있는 패턴은 이미 처리됨
-            if config.get('question_text'):
-                continue
-
+            # ⭐ question_text가 있어도 Fallback 시도! (정확 매칭 실패 시)
             question_keywords = config.get('question_keywords', set())
             answer_values = config.get('answer_values')
 
+            if not question_keywords:
+                continue
+
             # Question keywords 매칭
             is_matched = False
-            if question_keywords:
-                for kw in question_keywords:
-                    if kw.lower() in q_text_lower:
-                        is_matched = True
-                        break
+            for kw in question_keywords:
+                if kw.lower() in q_text_lower:
+                    is_matched = True
+                    break
 
             if not is_matched:
                 continue
