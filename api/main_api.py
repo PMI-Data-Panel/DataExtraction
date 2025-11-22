@@ -253,31 +253,45 @@ def create_app() -> FastAPI:
                     logger.warning(f"[WARNING] Async OpenSearch 연결 실패: {e}")
 
                 # ⭐ Panel 데이터 메모리 프리로드 (초고속 검색을 위한 최적화)
-                try:
-                    logger.info("=" * 60)
-                    logger.info("⚡ Panel 데이터 메모리 프리로드 시작...")
-                    logger.info("=" * 60)
-
+                # 환경변수로 제어: ENABLE_PANEL_PRELOAD=false로 설정 시 비활성화
+                enable_panel_preload = os.getenv("ENABLE_PANEL_PRELOAD", "true").lower() == "true"
+                
+                if enable_panel_preload:
+                    # 백그라운드 태스크로 실행하여 서버 시작을 차단하지 않음
+                    import asyncio
                     from connectors.data_fetcher import DataFetcher
                     from .search_api import panel_cache
+                    
+                    async def preload_panel_data():
+                        """Panel 데이터를 백그라운드에서 프리로드"""
+                        try:
+                            logger.info("=" * 60)
+                            logger.info("⚡ Panel 데이터 메모리 프리로드 시작 (백그라운드)...")
+                            logger.info("=" * 60)
 
-                    data_fetcher = DataFetcher(
-                        opensearch_client=os_client,
-                        qdrant_client=qdrant_client,
-                        async_opensearch_client=async_os_client
-                    )
+                            data_fetcher = DataFetcher(
+                                opensearch_client=os_client,
+                                qdrant_client=qdrant_client,
+                                async_opensearch_client=async_os_client
+                            )
 
-                    await panel_cache.initialize(data_fetcher, index_name="survey_responses_merged")
+                            await panel_cache.initialize(data_fetcher, index_name="survey_responses_merged")
 
-                    logger.info("=" * 60)
-                    logger.info("✅ Panel 데이터 프리로드 완료!")
-                    logger.info(f"   - 전체 패널: {panel_cache.total_count:,}명")
-                    logger.info(f"   - 로딩 시간: {panel_cache.load_time:.2f}초")
-                    logger.info(f"   - 이후 검색은 0.05-0.2초 이내 응답 예상")
-                    logger.info("=" * 60)
-                except Exception as e:
-                    logger.error(f"❌ Panel 데이터 프리로드 실패: {e}")
-                    logger.warning("   → 기존 Scroll API 방식으로 작동합니다 (느림)")
+                            logger.info("=" * 60)
+                            logger.info("✅ Panel 데이터 프리로드 완료!")
+                            logger.info(f"   - 전체 패널: {panel_cache.total_count:,}명")
+                            logger.info(f"   - 로딩 시간: {panel_cache.load_time:.2f}초")
+                            logger.info(f"   - 이후 검색은 0.05-0.2초 이내 응답 예상")
+                            logger.info("=" * 60)
+                        except Exception as e:
+                            logger.error(f"❌ Panel 데이터 프리로드 실패: {e}")
+                            logger.warning("   → 기존 Scroll API 방식으로 작동합니다 (느림)")
+                    
+                    # 백그라운드 태스크로 실행 (서버 시작을 차단하지 않음)
+                    asyncio.create_task(preload_panel_data())
+                    logger.info("ℹ️  Panel 데이터 프리로드가 백그라운드에서 시작되었습니다. 서버는 즉시 사용 가능합니다.")
+                else:
+                    logger.info("ℹ️  Panel 데이터 프리로드가 비활성화되었습니다. (ENABLE_PANEL_PRELOAD=false)")
 
                 # ⭐ RAG Query Analyzer 사전 로딩 (첫 검색 응답 속도 개선)
                 try:
