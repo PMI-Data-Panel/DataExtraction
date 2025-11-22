@@ -4256,7 +4256,7 @@ class NLSearchRequest(BaseModel):
         default="survey_responses_merged",
         description="검색할 인덱스 이름 (기본값: survey_responses_merged; 와일드카드 사용 가능)"
     )
-    size: int = Field(default=10, ge=1, le=50000, description="반환할 결과 개수 (쿼리에서 추출된 인원 수가 없을 때 사용, 전체 데이터 약 35000개)")
+    size: int = Field(default=30000, ge=1, le=50000, description="반환할 결과 개수 (쿼리에서 추출된 인원 수가 없을 때 사용, 전체 데이터 약 35000개)")
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
     page: int = Field(default=1, ge=1, description="요청할 페이지 번호 (1부터 시작)")
     use_claude_analyzer: Optional[bool] = Field(
@@ -4577,11 +4577,11 @@ async def search_natural_language(
 
         # 1) 추출: filters + size
         extractor = DemographicExtractor()
-        # ⭐ 쿼리에서 인원 수를 추출하지 못한 경우 request.size를 기본값으로 사용
+       
         extracted_entities, requested_size = extractor.extract_with_size(
             request.query, 
-            default_size=getattr(request, "size", 10),  # request.size를 기본값으로 전달
-            max_size=50000
+            default_size=getattr(request, "size", 30000),  
+            max_size=60000
         )
 
         # ⭐ Claude의 demographics를 extracted_entities에 병합
@@ -4665,10 +4665,10 @@ async def search_natural_language(
 
         # ⭐ page_size 결정: 
         # 1. 쿼리에서 명시적으로 인원 수를 추출한 경우 (예: "300명") → 추출된 값 사용
-        # 2. 쿼리에서 인원 수를 추출하지 못한 경우 → request.size 사용 (기본값 10)
+        # 2. 쿼리에서 인원 수를 추출하지 못한 경우 → request.size 사용 (기본값 30000)
         # 
         # requested_size가 request.size와 같으면 쿼리에서 추출하지 못한 것으로 간주
-        request_size = getattr(request, "size", 10)
+        request_size = getattr(request, "size", 30000)
         if requested_size is not None and requested_size > 0:
             # 쿼리에서 명시적으로 추출한 경우 (request.size와 다름)
             if requested_size != request_size:
@@ -7087,13 +7087,13 @@ async def search_natural_language(
         # ⭐ requested_count 설정:
         # - 쿼리에서 size가 명시되면 (예: "전문직 100명") → requested_size 값
         #   단, 실제 반환된 결과 수(total_hits)보다 크면 total_hits로 제한
-        # - size가 없으면 (예: "전문직") → 실제 반환된 데이터 전체 수 (total_hits)
+        # - size가 없으면 (예: "전문직") → page_size 사용 (기본값 30000)
         if requested_size is not None and requested_size > 0:
             # 실제 반환된 결과 수를 초과하지 않도록 제한
             requested_count = min(requested_size, total_hits)
         else:
-            # size가 없으면 실제 반환된 결과 수 사용
-            requested_count = total_hits
+            # size가 없으면 page_size 사용 (기본값 30000)
+            requested_count = min(page_size, total_hits)
         
         if cache_enabled and cache_key and stored_items:
             # ⭐ 1차: 메모리 캐시에 즉시 저장 (전체 정보, 다음 요청부터 0.001초!)
