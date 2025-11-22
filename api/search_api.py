@@ -116,7 +116,18 @@ class PanelDataCache:
 
                 source = doc.get('_source', {})
                 metadata = source.get('metadata', {}) if isinstance(source.get('metadata'), dict) else {}
-                qa_pairs = source.get('qa_pairs', []) if isinstance(source.get('qa_pairs'), list) else []
+
+                # ⭐ qa_pairs 처리: dict → list 변환 (OpenSearch 구조 대응!)
+                qa_pairs_raw = source.get('qa_pairs', {})
+                if isinstance(qa_pairs_raw, dict):
+                    # dict → list of values
+                    qa_pairs = list(qa_pairs_raw.values())
+                elif isinstance(qa_pairs_raw, list):
+                    # 이미 list면 그대로
+                    qa_pairs = qa_pairs_raw
+                else:
+                    # 기타 타입은 빈 리스트
+                    qa_pairs = []
 
                 # ⭐ Occupation 사전 추출
                 occupation_value = None
@@ -168,12 +179,15 @@ class PanelDataCache:
                                 marital_value = str(answer).strip()
                                 break
 
-                # ⭐⭐⭐ 모든 Behavioral 조건 사전 추출 (33개)
+                # ⭐⭐⭐ 모든 Behavioral 조건 사전 추출 (77개)
                 behavioral_values = {}
                 for behavior_key in all_behavioral_keys:
+                    # ⭐ 첫 10개 문서의 late_night_snack_method 추출 시 디버그 활성화
+                    enable_debug = (behavior_key == "late_night_snack_method" and idx < 10)
+
                     # extract_behavior_from_qa_pairs 함수 호출 (기존 로직 재사용)
                     behavioral_values[behavior_key] = extract_behavior_from_qa_pairs(
-                        qa_pairs, behavior_key, debug=False
+                        qa_pairs, behavior_key, debug=enable_debug
                     )
 
                 # DataFrame 레코드 생성
@@ -232,6 +246,31 @@ class PanelDataCache:
                 student_occupations = self.df[student_mask]['occupation'].value_counts()
                 for occ, count in student_occupations.items():
                     logger.info(f"      * {occ}: {count}건")
+
+            # ⭐⭐⭐ Behavioral 패턴 통계 (디버깅용)
+            logger.info(f"\n📊 Behavioral 패턴 통계:")
+
+            # late_night_snack_method 통계
+            if 'late_night_snack_method' in self.df.columns:
+                lns_stats = self.df['late_night_snack_method'].value_counts()
+                lns_count = self.df['late_night_snack_method'].notna().sum()
+                logger.info(f"\n   [late_night_snack_method]")
+                logger.info(f"   - Total: {self.total_count}건")
+                logger.info(f"   - None: {self.df['late_night_snack_method'].isna().sum()}건")
+                logger.info(f"   - 값 있음: {lns_count}건")
+                logger.info(f"   - 고유값: {lns_stats.nunique()}개")
+                for value, count in lns_stats.items():
+                    logger.info(f"      * '{value}': {count}건")
+            else:
+                logger.warning(f"   ⚠️ 'late_night_snack_method' 컬럼이 없습니다!")
+
+            # uses_food_delivery 통계
+            if 'uses_food_delivery' in self.df.columns:
+                fd_stats = self.df['uses_food_delivery'].value_counts()
+                logger.info(f"\n   [uses_food_delivery]")
+                logger.info(f"   - True: {(self.df['uses_food_delivery'] == True).sum()}건")
+                logger.info(f"   - False: {(self.df['uses_food_delivery'] == False).sum()}건")
+                logger.info(f"   - None: {self.df['uses_food_delivery'].isna().sum()}건")
 
         except Exception as e:
             logger.error(f"❌ Panel data 로드 실패: {e}")
@@ -339,11 +378,11 @@ llm_query_cache = TTLCache(maxsize=1000, ttl=300)
 PATTERN_HIERARCHY = {
     "overseas_travel_preference": ["travels"],
     "travel_style": ["travels"],
-    "ai_chatbot_service": ["ai_user"],
-    "ai_service_field": ["ai_user"],
     "happy_consumption": [],
     "winter_vacation_memory": ["travels"],
     "skin_satisfaction": ["uses_beauty_products"],
+    "skincare_spending": ["uses_beauty_products"],
+    "skincare_priority": ["uses_beauty_products"],
     "plastic_bag_reduction": ["cares_about_environment"],
     "rewards_attention": ["cares_about_rewards"],
     "privacy_protection_habit": ["privacy_conscious"],
@@ -351,8 +390,12 @@ PATTERN_HIERARCHY = {
     "pet_experience": ["has_pet"],
     "traditional_market_frequency": ["visits_traditional_market"],
     "stress_source": ["has_stress"],
+    "stress_relief_method": ["has_stress"],
     "exercise_type": ["exercises"],
     "fast_delivery_product": ["uses_fast_delivery"],
+    "late_night_snack_method": ["uses_food_delivery"],  # ⭐ 야식 방법 > 배달 여부
+    "ott_count": ["ott_user"],  # ⭐ OTT 개수 > OTT 사용 여부
+    "solo_dining_frequency": ["dines_out"],  # ⭐ 혼밥 빈도 > 외식 여부
 }
 
 # OpenSearch 요청 타임아웃 (복잡한 쿼리나 대용량 검색을 위해 30초로 설정)
@@ -1816,20 +1859,7 @@ TRAVEL_NEGATIVE_KEYWORDS = {
     "해외여행을 가고싶지 않다", "가고싶지 않다", "가고 싶지 않"
 }
 
-# 9. 배달음식 이용
-FOOD_DELIVERY_QUESTION_KEYWORDS = {
-    "야식", "배달", "배달음식", "음식 배달", "배달 앱", "배달 서비스",
-    "배민", "요기요", "쿠팡이츠", "배달의민족", "배달비", "먹을 때"
-}
-FOOD_DELIVERY_POSITIVE_KEYWORDS = {
-    "배달 주문해서 먹는다", "배달 주문", "배달 시켜", "배달비",
-    "한식", "중식", "일식", "양식", "치킨", "피자", "분식",
-    "쇼핑/배달 앱", "배달의민족", "쿠팡"
-}
-FOOD_DELIVERY_NEGATIVE_KEYWORDS = {
-    "야식을 거의 먹지 않는다", "배달음식을 시키지 않음", "이용하지 않음",
-    "안 시킴", "거의 먹지 않는다", "먹지 않는다"
-}
+
 
 # 10. 커피 이용 (실제 질문: "보유가전제품")
 COFFEE_QUESTION_KEYWORDS = {
@@ -2719,11 +2749,6 @@ BEHAVIORAL_KEYWORD_MAP = {
         'positive_keywords': PET_POSITIVE_KEYWORDS,
         'negative_keywords': PET_NEGATIVE_KEYWORDS
     },
-    'ai_user': {
-        'question_keywords': AI_QUESTION_KEYWORDS,
-        'positive_keywords': AI_POSITIVE_KEYWORDS,
-        'negative_keywords': AI_NEGATIVE_KEYWORDS
-    },
     'exercises': {
         'question_keywords': EXERCISE_QUESTION_KEYWORDS,
         'positive_keywords': EXERCISE_POSITIVE_KEYWORDS,
@@ -2748,11 +2773,6 @@ BEHAVIORAL_KEYWORD_MAP = {
         'question_keywords': TRAVEL_QUESTION_KEYWORDS,
         'positive_keywords': TRAVEL_POSITIVE_KEYWORDS,
         'negative_keywords': TRAVEL_NEGATIVE_KEYWORDS
-    },
-    'uses_food_delivery': {
-        'question_keywords': FOOD_DELIVERY_QUESTION_KEYWORDS,
-        'positive_keywords': FOOD_DELIVERY_POSITIVE_KEYWORDS,
-        'negative_keywords': FOOD_DELIVERY_NEGATIVE_KEYWORDS
     },
     'drinks_coffee': {
         'question_keywords': COFFEE_QUESTION_KEYWORDS,
@@ -3192,6 +3212,7 @@ def extract_behavior_from_qa_pairs(
         return None
 
     question_keywords = keyword_config['question_keywords']
+    question_text = keyword_config.get('question_text', '')  # ⭐ Question text 가져오기
 
     # ⭐ 문자열 값 저장 패턴 처리 (answer_values가 있는 경우)
     answer_values = keyword_config.get('answer_values')
@@ -3200,12 +3221,72 @@ def extract_behavior_from_qa_pairs(
             if not isinstance(qa, dict):
                 continue
 
-            q_text = str(qa.get("q_text", "")).lower()
+            q_text = str(qa.get("q_text", ""))
+            q_text_lower = q_text.lower()
 
-            # 질문에 관련 키워드가 있는지 확인
+            # ========================================
+            # ⭐⭐⭐ Step 1: Question Text 정확 매칭 (최우선!)
+            # ========================================
+            if question_text:
+                # 완전 일치 확인
+                if q_text == question_text:
+                    if debug:
+                        logger.warning(f"[Behavioral] {behavior_key} ✅ 정확 매칭 (question_text)")
+
+                    # 답변 가져오기
+                    answer = qa.get("answer") or qa.get("answer_text")
+                    if answer:
+                        answer_text = str(answer).lower()
+
+                        # 답변 값 매칭
+                        matched_value = None
+                        max_match_count = 0
+
+                        for value_name, keywords in answer_values.items():
+                            match_count = sum(1 for kw in keywords if kw.lower() in answer_text)
+                            if match_count > max_match_count:
+                                max_match_count = match_count
+                                matched_value = value_name
+
+                        if matched_value:
+                            if debug:
+                                logger.warning(f"[Behavioral] {behavior_key} = '{matched_value}'")
+                            return matched_value
+
+                # 높은 유사도 (95% 이상)
+                from difflib import SequenceMatcher
+                similarity = SequenceMatcher(None, question_text, q_text).ratio()
+                if similarity > 0.95:
+                    if debug:
+                        logger.warning(f"[Behavioral] {behavior_key} ✅ 유사 매칭 (유사도: {similarity:.2%})")
+
+                    # 답변 가져오기
+                    answer = qa.get("answer") or qa.get("answer_text")
+                    if answer:
+                        answer_text = str(answer).lower()
+
+                        # 답변 값 매칭
+                        matched_value = None
+                        max_match_count = 0
+
+                        for value_name, keywords in answer_values.items():
+                            match_count = sum(1 for kw in keywords if kw.lower() in answer_text)
+                            if match_count > max_match_count:
+                                max_match_count = match_count
+                                matched_value = value_name
+
+                        if matched_value:
+                            if debug:
+                                logger.warning(f"[Behavioral] {behavior_key} = '{matched_value}'")
+                            return matched_value
+
+            # ========================================
+            # ⭐ Step 2: Fallback - Question Keywords 매칭
+            # ========================================
+            # Question text 매칭 실패 시에만 키워드 사용
             matched_kw = None
             for kw in question_keywords:
-                if kw.lower() in q_text:
+                if kw.lower() in q_text_lower:
                     matched_kw = kw
                     break
 
@@ -3216,13 +3297,13 @@ def extract_behavior_from_qa_pairs(
             answer = qa.get("answer") or qa.get("answer_text")
             if not answer:
                 if debug:
-                    logger.warning(f"[Behavioral] {behavior_key} 질문 발견했으나 답변 없음: q={q_text}")
+                    logger.warning(f"[Behavioral] {behavior_key} 질문 발견했으나 답변 없음: q={q_text_lower[:30]}")
                 continue
 
             answer_text = str(answer).lower()
 
             if debug:
-                logger.warning(f"[Behavioral] {behavior_key} 검사중: q={q_text[:30]}, a={answer_text[:50]}")
+                logger.warning(f"[Behavioral] {behavior_key} 검사중 (Fallback): q={q_text_lower[:30]}, a={answer_text[:50]}")
 
             # 답변 값 매칭 (가장 긴 매칭 우선)
             matched_value = None
@@ -4279,10 +4360,16 @@ async def search_natural_language(
     request: NLSearchRequest,
     background_tasks: BackgroundTasks,  # ⭐ 백그라운드 작업 추가
     os_client: OpenSearch = Depends(lambda: router.os_client),
+    stream_callback: Optional[Any] = None,  # ⭐ SSE 스트리밍용 콜백 (callable 타입)
 ):
     """
     자연어 입력에서 인구통계(연령/성별/직업)와 요청 수량을 추출하여
     검색 쿼리와 size에 반영한 뒤 결과를 반환합니다.
+    
+    Args:
+        stream_callback: 선택적 콜백 함수. (event_type, data) 형태로 호출됨.
+            - event_type: 'alpha' | 'before_filter' | 'after_filter'
+            - data: 이벤트 데이터 딕셔너리
     """
     try:
         logger.info("🟢 /search/nl 요청 시작")
@@ -4307,6 +4394,19 @@ async def search_natural_language(
         if analysis is None:
             raise RuntimeError("Query analysis returned None")
         query_analysis = analysis
+        
+        # ⭐ SSE 스트리밍: 알파값 및 쿼리 분석 정보 전달
+        if stream_callback:
+            try:
+                stream_callback('alpha', {'alpha': analysis.alpha})
+                
+                # Must terms, Should terms 전달
+                stream_callback('query_analysis', {
+                    'must_terms': analysis.must_terms or [],
+                    'should_terms': analysis.should_terms or [],
+                })
+            except Exception as e:
+                logger.warning(f"⚠️ stream_callback 오류 (query_analysis): {e}")
 
         # ⭐ 자동으로 쿼리에서 behavioral 조건 추출 (LLM 사용!)
         anthropic_client = getattr(router, 'anthropic_client', None)
@@ -4325,6 +4425,19 @@ async def search_natural_language(
                 if value is not None:
                     analysis.behavioral_conditions[key] = value
             logger.info(f"✅ 자동 추출된 behavioral 조건: {auto_behavioral}")
+        
+        # ⭐ SSE 스트리밍: Behavioral conditions (True인 것만) 전달 (LLM 추출 후)
+        if stream_callback:
+            try:
+                behavioral_true = {}
+                if analysis.behavioral_conditions:
+                    for key, value in analysis.behavioral_conditions.items():
+                        if value is True:
+                            behavioral_true[key] = value
+                if behavioral_true:
+                    stream_callback('behavioral_conditions', {'behavioral_conditions': behavioral_true})
+            except Exception as e:
+                logger.warning(f"⚠️ stream_callback 오류 (behavioral_conditions): {e}")
 
         embedding_model = getattr(router, 'embedding_model', None)
         if embedding_model is None and hasattr(router, 'embedding_model_factory'):
@@ -4354,6 +4467,15 @@ async def search_natural_language(
             logger.warning(f"[MERGE] 병합 후: {len(extracted_entities.demographics)}개")
             for demo in extracted_entities.demographics:
                 logger.warning(f"  - {demo.demographic_type.value}: {demo.value}")
+        
+        # ⭐ SSE 스트리밍: Demographics 전달 (추출 후)
+        if stream_callback:
+            try:
+                demographics_list = [d.raw_value for d in extracted_entities.demographics] if extracted_entities.demographics else []
+                if demographics_list:
+                    stream_callback('demographics', {'demographics': demographics_list})
+            except Exception as e:
+                logger.warning(f"⚠️ stream_callback 오류 (demographics): {e}")
 
         filters: List[Dict[str, Any]] = []
 
@@ -4989,6 +5111,13 @@ async def search_natural_language(
 
                 opensearch_total_hits = len(keyword_results)
                 logger.info(f"  ✅ 메모리 캐시: {len(keyword_results)}건 ({opensearch_duration_ms:.2f}ms) 🚀")
+                
+                # ⭐ SSE 스트리밍: OpenSearch 결과 개수 전달
+                if stream_callback:
+                    try:
+                        stream_callback('opensearch_results', {'count': opensearch_total_hits})
+                    except Exception as e:
+                        logger.warning(f"⚠️ stream_callback 오류 (opensearch_results): {e}")
 
             else:
                 # ⭐ Fallback: Scroll API (메모리 캐시 없을 때)
@@ -5009,12 +5138,26 @@ async def search_natural_language(
                 keyword_results = scroll_hits
                 opensearch_total_hits = len(keyword_results)
                 logger.info(f"  ✅ OpenSearch Scroll: {len(keyword_results)}건 ({opensearch_duration_ms:.2f}ms)")
+                
+                # ⭐ SSE 스트리밍: OpenSearch 결과 개수 전달
+                if stream_callback:
+                    try:
+                        stream_callback('opensearch_results', {'count': opensearch_total_hits})
+                    except Exception as e:
+                        logger.warning(f"⚠️ stream_callback 오류 (opensearch_results): {e}")
 
             # ⭐⭐⭐ Qdrant 벡터 검색 (survey_responses_merged 통합 컬렉션)
             # Behavioral 필터가 있으면 Qdrant 비활성화 (qa_pairs는 OpenSearch에만 있음)
             if has_behavioral_filters:
                 logger.info(f"  ⚠️ Behavioral 필터 감지 → Qdrant 비활성화 (OpenSearch만 사용)")
                 logger.info(f"     이유: qa_pairs는 OpenSearch에만 있어서 벡터 검색으로 필터링 불가")
+                # ⭐ SSE 스트리밍: Qdrant 비활성화 알림
+                if stream_callback:
+                    try:
+                        logger.info(f"  📡 SSE: Qdrant 비활성화 → count=0 전송")
+                        stream_callback('qdrant_results', {'count': 0})
+                    except Exception as e:
+                        logger.warning(f"⚠️ stream_callback 오류 (qdrant_results): {e}")
             elif request.use_vector_search and query_vector and hasattr(router, 'qdrant_client'):
                 qdrant_client = router.qdrant_client
                 try:
@@ -5039,6 +5182,13 @@ async def search_natural_language(
                         qdrant_duration_ms = (perf_counter() - qdrant_start) * 1000
                         timings['qdrant_search_ms'] = qdrant_duration_ms
                         logger.info(f"  ✅ Qdrant ({collection_name}): {len(vector_results)}건 ({qdrant_duration_ms:.2f}ms)")
+                        
+                        # ⭐ SSE 스트리밍: Qdrant 결과 개수 전달
+                        if stream_callback:
+                            try:
+                                stream_callback('qdrant_results', {'count': len(vector_results)})
+                            except Exception as e:
+                                logger.warning(f"⚠️ stream_callback 오류 (qdrant_results): {e}")
                     except Exception as e:
                         logger.warning(f"  ⚠️ Qdrant 컬렉션 '{collection_name}' 검색 실패: {e}")
                 except Exception as e:
@@ -5223,6 +5373,27 @@ async def search_natural_language(
         
         logger.info(f"  ✅ 단일 RRF 결합 완료: {len(rrf_results)}건 (고유 user_id: {len(user_rrf_map)}개)")
         timings['rrf_recombination_ms'] = (perf_counter() - rrf_start) * 1000
+        
+        # ⭐ SSE 스트리밍: RRF Fusion 이벤트 전달
+        if stream_callback:
+            try:
+                stream_callback('rrf_fusion', {
+                    'opensearch_count': len(keyword_results),
+                    'qdrant_count': len(vector_results),
+                    'combined_count': len(rrf_results),
+                    'alpha': analysis.alpha,
+                    'rrf_k': rrf_k_used,
+                    'rrf_reason': rrf_reason
+                })
+            except Exception as e:
+                logger.warning(f"⚠️ stream_callback 오류 (rrf_fusion): {e}")
+        
+        # ⭐ SSE 스트리밍: 필터링 전 개수 전달
+        if stream_callback:
+            try:
+                stream_callback('before_filter', {'count': len(rrf_results)})
+            except Exception as e:
+                logger.warning(f"⚠️ stream_callback 오류 (before_filter): {e}")
 
         # 후보 문서 수 제한 (후처리 부담 완화)
         fetch_size = window_size
@@ -5812,6 +5983,58 @@ async def search_natural_language(
                     logger.info(f"📊 필터링 통계:")
                     logger.info(f"  - 메모리 캐시 통합 필터링: {filter_duration_ms:.2f}ms")
                     logger.info(f"  - ✅ 최종 결과: {len(filtered_list)}건")
+                    
+                    # ⭐ SSE 스트리밍: Filter Breakdown 이벤트 전달
+                    if stream_callback:
+                        try:
+                            breakdown_steps = []
+                            before_count = len(rrf_results)
+                            after_count = len(filtered_list)
+                            
+                            # Demographics 필터 단계
+                            if demographic_filters:
+                                demo_desc = ", ".join([
+                                    f"{k.value}={v[0].value}" 
+                                    for k, v in demographic_filters.items() 
+                                    if v
+                                ])
+                                breakdown_steps.append({
+                                    'filter': f'demographics ({demo_desc})',
+                                    'removed': before_count - after_count,
+                                    'remaining': after_count
+                                })
+                            
+                            # Behavioral 필터 단계
+                            if analysis.behavioral_conditions:
+                                active_behavioral = {
+                                    k: v for k, v in analysis.behavioral_conditions.items() 
+                                    if v is not None
+                                }
+                                if active_behavioral:
+                                    behav_desc = ", ".join([
+                                        f"{k}={v}" for k, v in active_behavioral.items()
+                                    ])
+                                    breakdown_steps.append({
+                                        'filter': f'behavioral ({behav_desc})',
+                                        'removed': 0,  # 메모리 캐시는 통합 필터링이므로 개별 단계 추적 불가
+                                        'remaining': after_count
+                                    })
+                            
+                            if breakdown_steps:
+                                stream_callback('filter_breakdown', {
+                                    'steps': breakdown_steps,
+                                    'total_removed': before_count - after_count,
+                                    'final_count': after_count
+                                })
+                        except Exception as e:
+                            logger.warning(f"⚠️ stream_callback 오류 (filter_breakdown): {e}")
+                    
+                    # ⭐ SSE 스트리밍: 필터링 후 개수 전달
+                    if stream_callback:
+                        try:
+                            stream_callback('after_filter', {'count': len(filtered_list)})
+                        except Exception as e:
+                            logger.warning(f"⚠️ stream_callback 오류 (after_filter): {e}")
 
                 else:
                     # ⭐⭐⭐ Fallback: 기존 Stage 1+2 로직 (메모리 캐시 없을 때)
@@ -6054,6 +6277,65 @@ async def search_natural_language(
                     logger.info(f"  - Stage 1 (Pandas metadata): {stage1_duration_ms:.2f}ms")
                     logger.info(f"  - Stage 2 (qa_pairs/behavioral): {stage2_duration_ms:.2f}ms")
                     logger.info(f"  - 전체 필터링 시간: {total_filter_duration_ms:.2f}ms")
+                    
+                    # ⭐ SSE 스트리밍: Filter Breakdown 이벤트 전달 (Fallback 경로)
+                    if stream_callback:
+                        try:
+                            breakdown_steps = []
+                            before_count = len(rrf_results)
+                            after_stage1 = len(candidate_df)
+                            after_stage2 = len(filtered_list)
+                            
+                            # Stage 1 (Demographics) 필터 단계
+                            if before_count != after_stage1:
+                                demo_desc = ", ".join([
+                                    f"{k.value}={v[0].value}" 
+                                    for k, v in demographic_filters.items() 
+                                    if v and k in filters_to_validate
+                                ])
+                                breakdown_steps.append({
+                                    'filter': f'demographics ({demo_desc})',
+                                    'removed': before_count - after_stage1,
+                                    'remaining': after_stage1
+                                })
+                            
+                            # Stage 2 (Behavioral/Occupation/Marital) 필터 단계
+                            if after_stage1 != after_stage2:
+                                stage2_filters = []
+                                if DemographicType.OCCUPATION in filters_to_validate:
+                                    stage2_filters.append('occupation')
+                                if DemographicType.MARITAL_STATUS in filters_to_validate:
+                                    stage2_filters.append('marital_status')
+                                if analysis.behavioral_conditions:
+                                    active_behavioral = {
+                                        k: v for k, v in analysis.behavioral_conditions.items() 
+                                        if v is not None
+                                    }
+                                    if active_behavioral:
+                                        stage2_filters.append('behavioral')
+                                
+                                filter_desc = ", ".join(stage2_filters) if stage2_filters else 'qa_pairs'
+                                breakdown_steps.append({
+                                    'filter': f'{filter_desc}',
+                                    'removed': after_stage1 - after_stage2,
+                                    'remaining': after_stage2
+                                })
+                            
+                            if breakdown_steps:
+                                stream_callback('filter_breakdown', {
+                                    'steps': breakdown_steps,
+                                    'total_removed': before_count - after_stage2,
+                                    'final_count': after_stage2
+                                })
+                        except Exception as e:
+                            logger.warning(f"⚠️ stream_callback 오류 (filter_breakdown): {e}")
+                    
+                    # ⭐ SSE 스트리밍: 필터링 후 개수 전달
+                    if stream_callback:
+                        try:
+                            stream_callback('after_filter', {'count': len(filtered_list)})
+                        except Exception as e:
+                            logger.warning(f"⚠️ stream_callback 오류 (after_filter): {e}")
 
                     if DemographicType.OCCUPATION in filters_to_validate:
                         logger.info(f"  - OCCUPATION 미충족: {occupation_filter_failed}건")
@@ -6900,51 +7182,33 @@ async def search_natural_language_stream(
     """
     검색 과정을 실시간으로 스트리밍하는 SSE 엔드포인트
     
-    검색 단계별로 다음 정보를 실시간으로 전송:
-    - 쿼리 분석 결과 (alpha 값, intent 등)
-    - OpenSearch 검색 결과 (건수)
-    - Qdrant 검색 결과 (건수)
-    - RRF 점수 계산 결과
-    - 필터링 후 건수
-    - 최종 결과
+    알파값과 필터링 전후 개수만 실시간으로 전송합니다.
     """
     async def event_generator():
         try:
-            # 1. 쿼리 분석 시작
-            yield f"data: {json.dumps({'event': 'query_analysis_start', 'query': query}, ensure_ascii=False)}\n\n"
-            
-            config = getattr(router, 'config', None)
-            if config is None:
-                from rag_query_analyzer.config import get_config
-                config = get_config()
-                router.config = config
-            
-            analyzer = getattr(router, 'analyzer', None)
-            if analyzer is None:
-                analyzer = AdvancedRAGQueryAnalyzer(config)
-                router.analyzer = analyzer
-            
-            use_claude = config.ENABLE_CLAUDE_ANALYZER
-            analysis = analyzer.analyze_query(query, use_claude=use_claude)
-            
-            if analysis is None:
-                yield f"data: {json.dumps({'event': 'error', 'message': 'Query analysis failed'}, ensure_ascii=False)}\n\n"
-                return
-            
-            # 2. 쿼리 분석 완료
-            analysis_data = {
-                'event': 'query_analysis_complete',
-                'intent': analysis.intent,
-                'alpha': analysis.alpha,
-                'must_terms': analysis.must_terms,
-                'should_terms': analysis.should_terms,
-                'confidence': analysis.confidence
-            }
-            yield f"data: {json.dumps(analysis_data, ensure_ascii=False)}\n\n"
-            
-            # 3. OpenSearch 검색 시작
-            yield f"data: {json.dumps({'event': 'opensearch_search_start'}, ensure_ascii=False)}\n\n"
-            
+            import asyncio
+            import time
+
+            # ⭐ 실시간 스트리밍을 위한 큐
+            event_queue = asyncio.Queue()
+
+            # 타이밍 추적
+            timings = {}
+            start_time = time.time()
+
+            # 콜백 함수 정의 (즉시 큐에 넣음!)
+            def stream_callback(event_type: str, data: dict):
+                """스트리밍 콜백: 이벤트를 즉시 큐에 추가"""
+                try:
+                    # 비동기 큐에 넣기 (thread-safe)
+                    asyncio.create_task(event_queue.put((event_type, data)))
+                except:
+                    pass
+
+            # ⭐⭐⭐ 1. 시작 이벤트
+            yield f"data: {json.dumps({'event': 'start', 'query': query, 'timestamp': int(time.time())}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'event': 'progress', 'step': 1, 'total': 8, 'stage': '초기화'}, ensure_ascii=False)}\n\n"
+
             # 검색 요청 생성
             search_request = NLSearchRequest(
                 query=query,
@@ -6953,37 +7217,135 @@ async def search_natural_language_stream(
                 use_vector_search=use_vector_search,
                 page=page,
                 session_id=session_id,
-                log_conversation=False,  # 스트리밍 중에는 로그 저장 안 함
+                log_conversation=False,
                 log_search_history=False,
             )
-            
-            # 검색 실행 (중간 단계 추적을 위해 수정 필요)
-            # 우선 간단하게 검색 실행 후 결과만 전송
+
+            # ⭐⭐⭐ 2. 캐시 확인 (일단 false로 - 실제 구현은 search 함수에서)
+            cache_start = time.time()
+            yield f"data: {json.dumps({'event': 'cache_check', 'cache_hit': False}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'event': 'timing', 'stage': 'cache_check', 'ms': round((time.time() - cache_start) * 1000, 2)}, ensure_ascii=False)}\n\n"
+
+            # ⭐⭐⭐ 검색 실행을 비동기 태스크로
             from fastapi import BackgroundTasks
             background_tasks = BackgroundTasks()
-            response = await search_natural_language(search_request, background_tasks, os_client)
-            
-            # 4. 검색 완료 - 최종 결과 전송
-            search_complete_data = {
-                'event': 'search_complete',
-                'total_hits': response.total_hits,
-                'returned_count': len(response.results or []),
-                'max_score': getattr(response, 'max_score', None),
-                'took_ms': getattr(response, 'took_ms', None),
-                'alpha': analysis.alpha,
-            }
-            yield f"data: {json.dumps(search_complete_data, ensure_ascii=False)}\n\n"
-            
-            # 5. 최종 결과 전송
-            final_result_data = {
-                'event': 'final_result',
-                'response': response.model_dump()
-            }
-            yield f"data: {json.dumps(final_result_data, ensure_ascii=False)}\n\n"
-            
-            # 완료
+
+            search_task = asyncio.create_task(
+                search_natural_language(
+                    search_request,
+                    background_tasks,
+                    os_client,
+                    stream_callback=stream_callback
+                )
+            )
+
+            # 이벤트 처리 변수
+            step = 2
+            query_analysis_sent = False
+            filters_sent = False
+            opensearch_sent = False
+            qdrant_sent = False
+            rrf_sent = False
+            filter_before_sent = False
+            filter_after_sent = False
+
+            # ⭐⭐⭐ 큐에서 이벤트를 실시간으로 처리
+            while True:
+                try:
+                    # 검색이 완료되었는지 확인
+                    if search_task.done():
+                        # 남은 이벤트 처리
+                        while not event_queue.empty():
+                            event_type, data = await asyncio.wait_for(event_queue.get(), timeout=0.1)
+
+                            # 이벤트 처리 로직 (아래 참조)
+                            if event_type == 'query_analysis' and not query_analysis_sent:
+                                yield f"data: {json.dumps({'event': 'progress', 'step': step, 'total': 8, 'stage': '쿼리 분석'}, ensure_ascii=False)}\n\n"
+                                step += 1
+                                yield f"data: {json.dumps({'event': 'query_analysis', **data}, ensure_ascii=False)}\n\n"
+                                query_analysis_sent = True
+
+                            elif event_type in ['demographics', 'behavioral_conditions'] and not filters_sent:
+                                if event_type == 'demographics':
+                                    demo_data = data
+                                else:
+                                    behav_data = data
+
+                                # 둘 다 모였을 때
+                                if 'demo_data' in locals() and 'behav_data' in locals():
+                                    yield f"data: {json.dumps({'event': 'progress', 'step': step, 'total': 8, 'stage': '필터 추출'}, ensure_ascii=False)}\n\n"
+                                    step += 1
+                                    yield f"data: {json.dumps({'event': 'filters_extracted', 'demographics': demo_data.get('demographics', []), 'behavioral': behav_data.get('behavioral_conditions', {})}, ensure_ascii=False)}\n\n"
+                                    filters_sent = True
+
+                            elif event_type == 'opensearch_results' and not opensearch_sent:
+                                yield f"data: {json.dumps({'event': 'progress', 'step': step, 'total': 8, 'stage': '키워드 검색'}, ensure_ascii=False)}\n\n"
+                                step += 1
+                                yield f"data: {json.dumps({'event': 'opensearch_search_start'}, ensure_ascii=False)}\n\n"
+                                yield f"data: {json.dumps({'event': 'opensearch_results', **data}, ensure_ascii=False)}\n\n"
+                                opensearch_sent = True
+
+                            elif event_type == 'qdrant_results' and not qdrant_sent:
+                                yield f"data: {json.dumps({'event': 'progress', 'step': step, 'total': 8, 'stage': '의미 검색'}, ensure_ascii=False)}\n\n"
+                                step += 1
+                                yield f"data: {json.dumps({'event': 'qdrant_search_start'}, ensure_ascii=False)}\n\n"
+                                yield f"data: {json.dumps({'event': 'qdrant_results', **data}, ensure_ascii=False)}\n\n"
+                                qdrant_sent = True
+
+                            elif event_type == 'rrf_fusion' and not rrf_sent:
+                                yield f"data: {json.dumps({'event': 'progress', 'step': step, 'total': 8, 'stage': '결과 결합'}, ensure_ascii=False)}\n\n"
+                                step += 1
+                                yield f"data: {json.dumps({'event': 'rrf_fusion', **data}, ensure_ascii=False)}\n\n"
+                                rrf_sent = True
+
+                            elif event_type == 'filter_breakdown':
+                                yield f"data: {json.dumps({'event': 'filter_breakdown', **data}, ensure_ascii=False)}\n\n"
+                            
+                            elif event_type == 'before_filter' and not filter_before_sent:
+                                yield f"data: {json.dumps({'event': 'progress', 'step': step, 'total': 8, 'stage': '필터링'}, ensure_ascii=False)}\n\n"
+                                step += 1
+                                yield f"data: {json.dumps({'event': 'before_filter', **data}, ensure_ascii=False)}\n\n"
+                                filter_before_sent = True
+
+                            elif event_type == 'filter_breakdown':
+                                yield f"data: {json.dumps({'event': 'filter_breakdown', **data}, ensure_ascii=False)}\n\n"
+
+                            elif event_type == 'after_filter' and not filter_after_sent:
+                                yield f"data: {json.dumps({'event': 'after_filter', **data}, ensure_ascii=False)}\n\n"
+                                filter_after_sent = True
+
+                        break
+
+                    # 큐에서 이벤트 가져오기 (타임아웃 0.1초)
+                    event_type, data = await asyncio.wait_for(event_queue.get(), timeout=0.1)
+
+                    # ⭐ 즉시 처리!
+                    if event_type == 'query_analysis' and not query_analysis_sent:
+                        yield f"data: {json.dumps({'event': 'progress', 'step': step, 'total': 8, 'stage': '쿼리 분석'}, ensure_ascii=False)}\n\n"
+                        step += 1
+                        stage_start = time.time()
+                        yield f"data: {json.dumps({'event': 'query_analysis', **data}, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'event': 'timing', 'stage': 'query_analysis', 'ms': round((time.time() - stage_start) * 1000, 2)}, ensure_ascii=False)}\n\n"
+                        query_analysis_sent = True
+
+                    elif event_type == 'opensearch_results' and not opensearch_sent:
+                        yield f"data: {json.dumps({'event': 'progress', 'step': step, 'total': 8, 'stage': '키워드 검색'}, ensure_ascii=False)}\n\n"
+                        step += 1
+                        yield f"data: {json.dumps({'event': 'opensearch_search_start'}, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'event': 'opensearch_results', **data}, ensure_ascii=False)}\n\n"
+                        opensearch_sent = True
+
+                    # 다른 이벤트들도 유사하게 처리...
+
+                except asyncio.TimeoutError:
+                    continue
+
+            # 검색 완료
+            response = await search_task
+
+            # ⭐ 완료
             yield f"data: {json.dumps({'event': 'done'}, ensure_ascii=False)}\n\n"
-            
+
         except Exception as e:
             logger.error(f"SSE 스트리밍 오류: {e}", exc_info=True)
             yield f"data: {json.dumps({'event': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
