@@ -58,17 +58,40 @@ def _get_top_user_ids_from_session(session_id: str) -> Tuple[Optional[str], List
     """
     redis_client = getattr(router, "redis_client", None)
     if not redis_client:
-        logger.warning("Redis 클라이언트가 없습니다.")
+        # 디버깅: router 속성 확인
+        logger.error("❌ Redis 클라이언트가 없습니다.")
+        logger.error(f"   router.redis_client: {getattr(router, 'redis_client', 'NOT_SET')}")
+        logger.error(f"   router 객체: {router}")
+        logger.error(f"   router 속성들: {[attr for attr in dir(router) if not attr.startswith('_')]}")
         return None, []
     
     conversation_prefix = getattr(router, "conversation_history_prefix", "chat:session")
     conversation_key = f"{conversation_prefix}:{session_id}"
     
+    logger.info(f"🔍 Redis 세션 조회: key={conversation_key}, prefix={conversation_prefix}, session_id={session_id}")
+    
     try:
+        # Redis 연결 확인
+        try:
+            redis_client.ping()
+            logger.info(f"✅ Redis 연결 확인 성공")
+        except Exception as ping_error:
+            logger.error(f"❌ Redis 연결 실패: {ping_error}")
+            return None, []
+        
         # Redis에서 최근 메시지들 가져오기 (최대 50개)
         raw_items = redis_client.lrange(conversation_key, -50, -1)
+        logger.info(f"📊 Redis 조회 결과: key={conversation_key}, items_count={len(raw_items) if raw_items else 0}")
+        
         if not raw_items:
-            logger.warning(f"세션 {session_id}의 대화 히스토리를 찾을 수 없습니다.")
+            # 디버깅: 모든 키 확인
+            try:
+                all_keys = redis_client.keys(f"{conversation_prefix}:*")
+                logger.warning(f"⚠️ 세션 {session_id}의 대화 히스토리를 찾을 수 없습니다.")
+                logger.warning(f"   조회한 키: {conversation_key}")
+                logger.warning(f"   Redis에 존재하는 유사 키들: {all_keys[:10] if all_keys else '없음'}")
+            except Exception as key_error:
+                logger.error(f"❌ Redis 키 조회 실패: {key_error}")
             return None, []
         
         previous_query = None

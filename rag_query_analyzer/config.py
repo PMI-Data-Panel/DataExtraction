@@ -63,7 +63,12 @@ class Config:
     MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", 4))
     MAX_REWRITTEN_QUERIES: int = int(os.getenv("MAX_REWRITTEN_QUERIES", 2))
     QUERY_LOG_FILE: str = os.getenv("QUERY_LOG_FILE", "query_performance.json")
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    # --- Redis 설정 ---
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "redis_cache")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+    # REDIS_URL이 명시적으로 설정되어 있으면 사용, 없으면 REDIS_HOST/PORT/DB로 구성
+    REDIS_URL: str = os.getenv("REDIS_URL", f"redis://{os.getenv('REDIS_HOST', 'redis_cache')}:{os.getenv('REDIS_PORT', '6379')}/{os.getenv('REDIS_DB', '0')}")
     SEARCH_CACHE_TTL_SECONDS: int = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "300"))
     SEARCH_CACHE_MAX_RESULTS: int = int(os.getenv("SEARCH_CACHE_MAX_RESULTS", "12000"))
     CONVERSATION_HISTORY_PREFIX: str = os.getenv("CONVERSATION_HISTORY_PREFIX", "chat:session")
