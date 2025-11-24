@@ -230,36 +230,15 @@ def _call_llm_for_refinement(
     
     model_name = getattr(config, "CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
     
-    # 프롬프트 구성
+    # 프롬프트 구성 (핵심 5줄)
     context_parts = []
     
     context_parts.append("당신은 설문조사 데이터 분석 전문가입니다. 주어진 사용자 데이터를 분석하여 질문에 대한 상세한 답변을 문장 형태로 작성해주세요.")
-    context_parts.append("")
-    
     if previous_query:
         context_parts.append(f"이전 검색 질문: {previous_query}")
-        context_parts.append("이전 검색 결과에서 추출한 사용자 데이터를 분석해주세요.")
-    else:
-        context_parts.append("다음 사용자 데이터를 분석해주세요.")
-    
-    context_parts.append("")
     context_parts.append(f"새로운 질문: {new_query}")
-    context_parts.append("")
-    
-    if instructions:
-        context_parts.append(f"추가 지침: {instructions}")
-        context_parts.append("")
-    
-    context_parts.append("사용자 데이터:")
-    context_parts.append(json.dumps(user_data, ensure_ascii=False, indent=2))
-    context_parts.append("")
-    context_parts.append("요구사항:")
-    context_parts.append("- 질문에 대한 답변을 자연스러운 문장 형태로 작성해주세요.")
-    context_parts.append("- 데이터에서 발견한 패턴, 공통점, 특징 등을 구체적으로 설명해주세요.")
-    context_parts.append("- 가능하면 비율이나 분포를 포함해주세요 (예: '대부분이...', '전체의 60%가...', '상당수가...').")
-    context_parts.append("- 간단한 키워드나 리스트가 아닌, 완전한 문장으로 작성해주세요.")
-    context_parts.append("- 답변은 200자 이상 1000자 이내로 작성해주세요.")
-    context_parts.append("- 사용자 수를 직접적으로 언급하지 마세요 (예: '5명의', '3명이' 등).")
+    context_parts.append(f"사용자 데이터: {json.dumps(user_data, ensure_ascii=False, indent=2)}")
+    context_parts.append("요구사항: 데이터 패턴과 공통점을 구체적으로 설명하고, 비율이나 분포를 포함한 자연스러운 문장으로 200-600자 이내로 작성해주세요.")
     
     prompt = "\n".join(context_parts)
     
