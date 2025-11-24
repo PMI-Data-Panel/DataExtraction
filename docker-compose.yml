@@ -117,6 +117,29 @@ services:
     networks:
       - rag_net
 
+  # 2-1. Redis Exporter (Redis 메트릭 수집)
+  redis_exporter:
+    container_name: redis_exporter
+    image: oliver006/redis_exporter:latest
+    ports:
+      - "9121:9121"
+    environment:
+      # Docker 네트워크 내부에서는 서비스 이름 사용
+      - REDIS_ADDR=redis://redis_cache:6379
+      # 비밀번호가 있는 경우 아래 주석 해제
+      # - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    networks:
+      - rag_net
+    depends_on:
+      - redis_cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9121/metrics || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
   # 3. Node Exporter (시스템 메트릭 수집: CPU, RAM, Disk 등)
   node_exporter:
     container_name: node_exporter
