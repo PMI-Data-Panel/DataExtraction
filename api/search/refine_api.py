@@ -230,15 +230,16 @@ def _call_llm_for_refinement(
     
     model_name = getattr(config, "CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
     
-    # 프롬프트 구성 (핵심 5줄)
+    # 프롬프트 구성 (핵심만, 2-3줄 답변)
     context_parts = []
     
-    context_parts.append("당신은 설문조사 데이터 분석 전문가입니다. 주어진 사용자 데이터를 분석하여 질문에 대한 상세한 답변을 문장 형태로 작성해주세요.")
+    context_parts.append("설문조사 데이터를 분석하여 질문에 답변해주세요.")
     if previous_query:
-        context_parts.append(f"이전 검색 질문: {previous_query}")
-    context_parts.append(f"새로운 질문: {new_query}")
-    context_parts.append(f"사용자 데이터: {json.dumps(user_data, ensure_ascii=False, indent=2)}")
-    context_parts.append("요구사항: 데이터 패턴과 공통점을 구체적으로 설명하고, 비율이나 분포를 포함한 자연스러운 문장으로 200-600자 이내로 작성해주세요.")
+        context_parts.append(f"이전 질문: {previous_query}")
+        context_parts.append("⚠️ 이전 질문과 중복되지 않는 새로운 관점이나 정보를 제공해주세요.")
+    context_parts.append(f"질문: {new_query}")
+    context_parts.append(f"데이터: {json.dumps(user_data, ensure_ascii=False, indent=2)}")
+    context_parts.append("핵심만 2-3줄로 간단히 작성해주세요.")
     
     prompt = "\n".join(context_parts)
     
