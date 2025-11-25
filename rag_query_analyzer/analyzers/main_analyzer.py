@@ -447,15 +447,26 @@ class AdvancedRAGQueryAnalyzer:
 
         # Demographics 추출 및 제거
         # ⭐ Claude가 이미 추출한 demographic_entities가 있으면 사용, 없으면 DemographicExtractor 사용
+        logger.info(f"🔍 Demographics 추출 시작 (명시적 표현만):")
+        logger.info(f"   📝 Query: '{query}'")
+
         if analysis.demographic_entities:
             # Claude가 추출한 demographics 사용
             demographics_list = analysis.demographic_entities
-            logger.info(f"✅ Claude가 추출한 demographics 사용: {len(demographics_list)}개")
+            logger.info(f"   ✅ Claude가 추출한 demographics: {len(demographics_list)}개")
+            if demographics_list:
+                for demo in demographics_list:
+                    logger.info(f"      * {demo.demographic_type.value}: '{demo.value}' (원본: '{demo.raw_value}')")
+            else:
+                logger.info(f"      ℹ️ 명시적 인구통계 표현 없음 (문맥어는 추출하지 않음)")
         else:
             # 폴백: DemographicExtractor 사용
             demographics = demographic_extractor.extract(query)
             demographics_list = demographics.demographics
-            logger.info(f"⚠️ Claude demographics 없음 → DemographicExtractor 사용: {len(demographics_list)}개")
+            logger.info(f"   ⚠️ Claude demographics 없음 → DemographicExtractor 사용: {len(demographics_list)}개")
+            if demographics_list:
+                for demo in demographics_list:
+                    logger.info(f"      * {demo.demographic_type.value}: '{demo.value}' (원본: '{demo.raw_value}')")
 
         demographic_tokens: Set[str] = set()
         for entity in demographics_list:
@@ -526,9 +537,13 @@ class AdvancedRAGQueryAnalyzer:
             analysis.demographic_entities = demographics_list
         analysis.removed_demographic_terms = removed_demographic_terms
 
-        logger.info(f"🔍 Demographics 최종 저장: {len(analysis.demographic_entities)}개")
+        logger.info(f"📊 Demographics 처리 완료:")
+        logger.info(f"   ✅ 최종 저장: {len(analysis.demographic_entities)}개")
         if removed_demographic_terms:
-            logger.info(f"   ❌ 제거된 Demographics 키워드: {removed_demographic_terms}")
+            logger.info(f"   🗑️ 제거된 Demographics 키워드: {removed_demographic_terms}")
+            logger.info(f"      → 이유: Demographics는 OpenSearch 필터로 처리됨 (검색어에서 제거)")
+        else:
+            logger.info(f"   ℹ️ 제거된 키워드 없음 (검색어 유지)")
 
         return analysis
 

@@ -256,6 +256,9 @@ def create_app() -> FastAPI:
                 # 환경변수로 제어: ENABLE_PANEL_PRELOAD=false로 설정 시 비활성화
                 enable_panel_preload = os.getenv("ENABLE_PANEL_PRELOAD", "true").lower() == "true"
                 
+                # 백그라운드 태스크 추적용 (shutdown 시 정리)
+                app.state.panel_preload_task = None
+                
                 if enable_panel_preload:
                     # 백그라운드 태스크로 실행하여 서버 시작을 차단하지 않음
                     import asyncio
@@ -283,12 +286,14 @@ def create_app() -> FastAPI:
                             logger.info(f"   - 로딩 시간: {panel_cache.load_time:.2f}초")
                             logger.info(f"   - 이후 검색은 0.05-0.2초 이내 응답 예상")
                             logger.info("=" * 60)
+                        except asyncio.CancelledError:
+                            logger.info("ℹ️  Panel 데이터 프리로드가 취소되었습니다 (애플리케이션 종료)")
                         except Exception as e:
                             logger.error(f"❌ Panel 데이터 프리로드 실패: {e}")
                             logger.warning("   → 기존 Scroll API 방식으로 작동합니다 (느림)")
                     
                     # 백그라운드 태스크로 실행 (서버 시작을 차단하지 않음)
-                    asyncio.create_task(preload_panel_data())
+                    app.state.panel_preload_task = asyncio.create_task(preload_panel_data())
                     logger.info("ℹ️  Panel 데이터 프리로드가 백그라운드에서 시작되었습니다. 서버는 즉시 사용 가능합니다.")
                 else:
                     logger.info("ℹ️  Panel 데이터 프리로드가 비활성화되었습니다. (ENABLE_PANEL_PRELOAD=false)")
@@ -341,20 +346,57 @@ def create_app() -> FastAPI:
             """리소스 정리"""
             import asyncio
             logger.info("🛑 애플리케이션 종료: 리소스 정리 중...")
+            
+            # 1. 진행 중인 백그라운드 태스크 취소 및 대기
+            try:
+                # Panel 데이터 프리로드 태스크 취소
+                if hasattr(app.state, 'panel_preload_task') and app.state.panel_preload_task:
+                    task = app.state.panel_preload_task
+                    if not task.done():
+                        logger.info("⏹️  Panel 데이터 프리로드 태스크 취소 중...")
+                        task.cancel()
+                        try:
+                            await asyncio.wait_for(task, timeout=3.0)
+                        except asyncio.CancelledError:
+                            logger.info("✅ Panel 데이터 프리로드 태스크 취소 완료")
+                        except asyncio.TimeoutError:
+                            logger.warning("⚠️ Panel 데이터 프리로드 태스크 취소 타임아웃")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Panel 데이터 프리로드 태스크 취소 중 오류: {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ 백그라운드 태스크 정리 중 오류: {e}")
+            
+            # 2. Async OpenSearch 클라이언트 종료
             try:
                 if async_os_client:
                     try:
-                        await asyncio.wait_for(async_os_client.close(), timeout=2.0)
-                        logger.info("[OK] Async OpenSearch 클라이언트 종료")
+                        # 세션이 이미 닫혔는지 확인
+                        if hasattr(async_os_client, 'transport') and hasattr(async_os_client.transport, 'session'):
+                            session = async_os_client.transport.session
+                            if session and not session.closed:
+                                await asyncio.wait_for(async_os_client.close(), timeout=2.0)
+                                logger.info("[OK] Async OpenSearch 클라이언트 종료")
+                            else:
+                                logger.info("[INFO] Async OpenSearch 세션이 이미 닫혔습니다")
+                        else:
+                            await asyncio.wait_for(async_os_client.close(), timeout=2.0)
+                            logger.info("[OK] Async OpenSearch 클라이언트 종료")
                     except asyncio.CancelledError:
                         logger.info("[INFO] Async OpenSearch 클라이언트 종료 취소됨")
                     except asyncio.TimeoutError:
                         logger.warning("⚠️ Async OpenSearch 클라이언트 종료 타임아웃")
+                    except RuntimeError as e:
+                        if "Session is closed" in str(e):
+                            logger.info("[INFO] Async OpenSearch 세션이 이미 닫혔습니다")
+                        else:
+                            raise
             except asyncio.CancelledError:
                 # 정상적인 종료 과정에서 발생할 수 있는 취소 에러는 무시
                 pass
             except Exception as e:
                 logger.warning(f"⚠️ Async OpenSearch 종료 실패: {e}")
+            
+            logger.info("✅ 리소스 정리 완료")
 
         # 기본 엔드포인트
         @app.get("/", summary="API 환영 메시지")

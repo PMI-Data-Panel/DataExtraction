@@ -86,19 +86,71 @@ class ClaudeAnalyzer(BaseAnalyzer):
    - semantic_search: 의미적 유사성 검색이 필요
    - hybrid: 둘 다 필요
 
-2. **인구통계 조건 추출 (Demographics)**
-   - 나이/연령: "20대", "젊은층"(20대/30대), "중년"(40대/50대), "시니어"(60대 이상)
-   - 성별: "남성", "여성", "남자", "여자"
-   - 지역: "서울", "경기", "부산" 등
-   - 직업: "학생", "직장인", "주부", "전문직" 등
-   - 결혼여부: "미혼", "기혼"
+2. **인구통계 조건 추출 (Demographics)** ⚠️ 매우 엄격하게!
 
-   예시:
-   - "젊은층" → age_groups: ["20대", "30대"]
-   - "서울, 경기" → regions: ["서울", "경기"]
-   - "중년 남성" → age_groups: ["40대", "50대"], gender: "남성"
+   **🚨 핵심 원칙: "명시적 표현만 추출" (Precision over Recall!)**
+
+   📌 **추출 규칙**:
+
+   ✅ **명시적 명사만 추출**:
+   - occupation: "직장인", "학생", "프리랜서", "주부", "은퇴자" 등이
+     **명사로 명확히 언급**된 경우만
+   - age: "20대", "30대", "젊은층"(20대/30대), "중년"(40대/50대)
+   - gender: "남성", "여성", "남자", "여자"
+   - region: "서울", "경기", "부산" 등 (행정구역명)
+   - marital: "미혼", "기혼"
+
+   ❌ **문맥어/동사구는 절대 추출 금지**:
+   - "업무로 인해" → occupation 추출 안함 (문맥어)
+   - "학교 다니는" → occupation 추출 안함 (동사구)
+   - "직장 때문에" → occupation 추출 안함 (문맥어)
+   - "일하는 사람" → occupation 추출 안함 (너무 추상적)
+   - "회사 다니는" → occupation 추출 안함 (동사구)
+   - "젊은 사람" → age 추출 안함 (애매함)
+   - "집이 강남" → region 추출 안함 (부정확)
+
+   📌 **판단 플로우**:
+   ```
+   1️⃣ 명사인가? NO → 추출 안함 ❌
+   2️⃣ 인구통계 카테고리인가? (직업/나이/성별/지역/결혼) NO → 추출 안함 ❌
+   3️⃣ 명시적으로 언급되었는가? (추론 필요 X) NO → 추출 안함 ❌
+   → 모두 YES → 추출 ✅
+   ```
+
+   ⚠️ **의심스러우면 추출하지 마세요!**
+   과추론 → 결과 0건 (치명적!)
+
+   **올바른 예시**:
+   - "30대 직장인" → age_groups: ["30대"], occupation: "직장인" ✅
+   - "젊은층" → age_groups: ["20대", "30대"] ✅
+   - "서울, 경기" → regions: ["서울", "경기"] ✅
+   - "대학생 500명" → occupation: "학생" ✅
+
+   **잘못된 예시**:
+   - "업무로 인해 스트레스" → occupation 추출 안함 ❌ (문맥어)
+   - "학교 다니는 사람" → occupation 추출 안함 ❌ (동사구)
+   - "직장인이면서 스트레스" → occupation: "직장인" ✅, Behavioral도 추출
 
 3. **행동 조건 추출 (Behavioral)** - 35개 이상의 설문 질문 기반 조건 지원
+
+   🚨 **충돌 방지 규칙** (CRITICAL!) 🚨
+
+   다음 키워드 조합이 있으면 **우선 순위**를 따르세요:
+
+   1️⃣ **"앱" 키워드가 포함되면 → most_used_app 우선**
+      - ✅ "운동 앱", "건강 앱" → most_used_app (exercises ❌)
+      - ✅ "게임 앱" → most_used_app (plays_games ❌)
+      - ✅ "금융 앱" → most_used_app (uses_financial_services ❌)
+      - ✅ "SNS 앱" → most_used_app (uses_social_media ❌)
+      - ✅ "동영상 스트리밍 앱" → most_used_app (watches_movies_dramas ❌)
+
+   2️⃣ **"스트레스" 키워드가 있으면 → has_stress 우선**
+      - ✅ "업무로 인해 스트레스" → has_stress (occupation ❌)
+      - ✅ "직장 스트레스" → has_stress (occupation ❌)
+
+   3️⃣ **"활동"/"체력 관리"가 명시되고 "앱" 없으면 → exercises**
+      - ✅ "평소 체력 관리 활동" → exercises
+      - ❌ "운동 앱" → most_used_app (앱이 있음!)
 
    기본 행동:
    - 흡연: "흡연자", "비흡연자" → smoker
@@ -107,7 +159,7 @@ class ClaudeAnalyzer(BaseAnalyzer):
    - OTT: "OTT 이용", "넷플릭스 보는" → ott_user
    - 반려동물: "반려동물 키우는", "펫" → has_pet
    - AI: "AI 사용", "챗GPT 쓰는" → ai_user
-   - 운동: "헬스하는", "운동하는" → exercises
+   - 운동: "헬스하는", "운동하는" (단, "앱" 없을 때만!) → exercises
 
    생활/소비 패턴:
    - 빠른배송: "당일배송", "새벽배송" → uses_fast_delivery
@@ -119,15 +171,15 @@ class ClaudeAnalyzer(BaseAnalyzer):
 
    디지털/미디어:
    - 구독서비스: "구독 중인" → has_subscription
-   - SNS: "인스타 하는", "소셜미디어" → uses_social_media
-   - 게임: "게임 하는" → plays_games
+   - 가장 많이 사용하는 앱: "운동 앱", "게임 앱", "금융 앱", "SNS 앱" 등 → most_used_app
+   - 게임: "게임 하는" (단, "앱" 없을 때만!) → plays_games
    - 독서: "책 읽는" → reads_books
-   - 영화/드라마: "드라마 보는" → watches_movies_dramas
+   - 영화/드라마: "드라마 보는" (단, "앱" 없을 때만!) → watches_movies_dramas
    - 음악: "음악 듣는" → streams_music
    - 온라인교육: "인강 듣는" → takes_online_courses
 
    금융/자산:
-   - 금융서비스: "투자하는", "주식" → uses_financial_services
+   - 금융서비스: "투자하는", "주식" (단, "앱" 없을 때만!) → uses_financial_services
    - 보험: "보험 가입한" → has_insurance
    - 신용카드: "카드 사용하는" → uses_credit_card
 
@@ -167,7 +219,9 @@ class ClaudeAnalyzer(BaseAnalyzer):
    - "흡연자" → behavioral_conditions: {{"smoker": true}}
    - "술 마시는" → behavioral_conditions: {{"drinker": true}}
    - "반려동물 키우는" → behavioral_conditions: {{"has_pet": true}}
+   - "운동 앱 사용하는" → behavioral_conditions: {{"most_used_app": true}} (⭐ exercises 아님!)
    - "게임 하는" → behavioral_conditions: {{"plays_games": true}}
+   - "게임 앱 사용하는" → behavioral_conditions: {{"most_used_app": true}} (⭐ plays_games 아님!)
    - "카페 자주 가는" → behavioral_conditions: {{"drinks_coffee": true}}
 
 4. 키워드 추출 (Demographics/Behavioral 제외)
@@ -220,20 +274,11 @@ JSON 형식:
     "interested_in_cars": true|false|null,
     "uses_parcel_delivery": true|false|null,
     "dines_out": true|false|null,
-<<<<<<< HEAD
     "attends_drinking_gatherings": true|false|null,
-    // ⭐ 신규 패턴
-    "cares_about_rewards": true|false|null,
-    "uses_secondhand_market": true|false|null,
-    "lifestyle_minimalist": true|false|null,
-    "privacy_conscious": true|false|null,
-    "stress_relief_method": true|false|null
-=======
-    "attends_drinking_gatherings": true|false|null
->>>>>>> 30bed4e1b5046741eeec00de15bff537a5ecb047
+    "most_used_app": true|false|null  // ⭐ 가장 많이 사용하는 앱 (CRITICAL: "앱" 키워드가 있으면 이것 선택!)
     // ⭐ null = 이 조건을 체크하지 않음 (쿼리에서 언급 안됨)
     // ⭐ true/false = 명시적으로 체크해야 함
-    // ⭐ 제거된 조건 (설문에 없음): reads_books, streams_music, takes_online_courses, gets_health_checkups, housing_type, has_insurance, uses_credit_card, uses_public_transport, works_overtime, works_remotely
+    // ⭐ 제거된 조건 (설문에 없음): uses_social_media, reads_books, streams_music, takes_online_courses, gets_health_checkups, housing_type, has_insurance, uses_credit_card, uses_public_transport, works_overtime, works_remotely
   }},
   "must_terms": ["필수키워드"],
   "should_terms": ["선택키워드"],

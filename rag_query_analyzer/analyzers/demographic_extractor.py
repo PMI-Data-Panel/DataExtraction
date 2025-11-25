@@ -31,9 +31,13 @@ class DemographicExtractor:
         "여성": {"value": "F", "synonyms": {"여성", "여자", "여"}},
     }
 
+    # ⭐⭐⭐ OCCUPATION_MAP: 명시적 명사만 포함 (문맥어/동사구 제외!)
+    # Precision over Recall: 명시적 직업 표현만 추출하여 과추론 방지
+    # ✅ 포함: "직장인", "학생", "프리랜서" (명사)
+    # ❌ 제외: "업무", "직장", "일하는", "다니는" (문맥어/동사구)
     OCCUPATION_MAP = {
         # canonical: value normalized for metadata.occupation
-        "사무직": {"value": "office", "synonyms": {"사무직", "사무원", "화이트칼라", "직장인"}},
+        "사무직": {"value": "office", "synonyms": {"사무직", "사무원", "화이트칼라", "직장인"}},  # ✅ 명사
         # ⭐ 학생 세분화 (더 구체적인 것을 먼저 배치)
         "대학생/대학원생": {"value": "university_graduate_student", "synonyms": {"대학생/대학원생"}},
         "대학원생": {"value": "graduate_student", "synonyms": {"대학원생", "석사과정", "박사과정"}},

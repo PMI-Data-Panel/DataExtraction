@@ -70,7 +70,7 @@ class Config:
     # REDIS_URL이 명시적으로 설정되어 있으면 사용, 없으면 REDIS_HOST/PORT/DB로 구성
     REDIS_URL: str = os.getenv("REDIS_URL", f"redis://{os.getenv('REDIS_HOST', 'redis_cache')}:{os.getenv('REDIS_PORT', '6379')}/{os.getenv('REDIS_DB', '0')}")
     SEARCH_CACHE_TTL_SECONDS: int = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "300"))
-    SEARCH_CACHE_MAX_RESULTS: int = int(os.getenv("SEARCH_CACHE_MAX_RESULTS", "12000"))
+    SEARCH_CACHE_MAX_RESULTS: int = int(os.getenv("SEARCH_CACHE_MAX_RESULTS", "30000"))
     CONVERSATION_HISTORY_PREFIX: str = os.getenv("CONVERSATION_HISTORY_PREFIX", "chat:session")
     CONVERSATION_HISTORY_TTL_SECONDS: int = int(os.getenv("CONVERSATION_HISTORY_TTL_SECONDS", "604800"))
     CONVERSATION_HISTORY_MAX_MESSAGES: int = int(os.getenv("CONVERSATION_HISTORY_MAX_MESSAGES", "200"))
