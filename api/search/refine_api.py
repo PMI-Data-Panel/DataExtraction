@@ -32,7 +32,7 @@ class RefineQueryRequest(BaseModel):
     """재질의 요청"""
     session_id: str = Field(..., description="세션 ID (이전 검색 결과를 가져올 세션)")
     query: str = Field(..., description="재질의 질문 (예: '이 사람들의 공통점은?', '이 중에서 흡연자는?')")
-    max_user_ids: int = Field(default=20, ge=1, le=50, description="분석할 최대 user_id 수 (기본값: 20)")
+    max_user_ids: int = Field(default=100, ge=1, le=200, description="분석할 최대 user_id 수 (기본값: 100)")
     llm_instructions: Optional[str] = Field(
         default=None,
         description="LLM 분석 시 추가 지침"

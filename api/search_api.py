@@ -709,7 +709,7 @@ def _persist_search_logs(
     search_history_max = getattr(router, "search_history_max_entries", None)
 
     top_user_ids = [
-        getattr(result, "user_id", None) for result in (response.results or [])[:5]
+        getattr(result, "user_id", None) for result in (response.results or [])[:50]
         if getattr(result, "user_id", None)
     ]
 
