@@ -63,29 +63,7 @@ class DemographicExtractor:
         "기타": {"value": "other", "synonyms": {"이혼", "사별", "별거"}},
     }
 
-    EDUCATION_MAP = {
-        "고졸": {"value": "high_school", "synonyms": {"고졸", "고등학교", "고등학교 졸업"}},
-        "대졸": {"value": "bachelor", "synonyms": {"대졸", "대학교 졸업", "대학 졸업"}},
-        "대학원": {"value": "graduate", "synonyms": {"대학원", "대학원 졸업", "석사", "박사"}},
-        "대학재학": {"value": "university_student", "synonyms": {"대학 재학", "대학교 재학"}},
-    }
 
-    INCOME_MAP = {
-        "100만원미만": {"value": "under_100", "synonyms": {"100만원 미만", "100만원미만", "월 100만원 미만"}},
-        "100~199만원": {"value": "100_199", "synonyms": {"100~199만원", "월 100~199만원"}},
-        "200~299만원": {"value": "200_299", "synonyms": {"200~299만원", "월 200~299만원"}},
-        "300~399만원": {"value": "300_399", "synonyms": {"300~399만원", "월 300~399만원"}},
-        "400~499만원": {"value": "400_499", "synonyms": {"400~499만원", "월 400~499만원"}},
-        "500만원이상": {"value": "over_500", "synonyms": {"500만원 이상", "500만원이상", "월 500만원 이상"}},
-    }
-
-    FAMILY_SIZE_MAP = {
-        "1명": {"value": "1", "synonyms": {"1명", "혼자", "독거", "1명(혼자 거주)"}},
-        "2명": {"value": "2", "synonyms": {"2명"}},
-        "3명": {"value": "3", "synonyms": {"3명"}},
-        "4명": {"value": "4", "synonyms": {"4명"}},
-        "5명이상": {"value": "5+", "synonyms": {"5명 이상", "5명이상"}},
-    }
 
     JOB_FUNCTION_MAP = {
         # welcome_2nd 직무 분류 (20,978명)
@@ -290,60 +268,49 @@ class DemographicExtractor:
                 )
             )
 
-        # Education detection
-        edu_found = self._match_education(text)
-        if edu_found is not None:
-            canon, value, synonyms = edu_found
-            demographics.append(
-                DemographicEntity(
-                    entity_type=EntityType.DEMOGRAPHIC,
-                    name="학력",
-                    canonical_form="education",
-                    demographic_type=DemographicType.EDUCATION,
-                    value=value,
-                    raw_value=canon,
-                    synonyms=set(synonyms),
-                    confidence=1.0,
-                )
-            )
+        # ⚠️ EDUCATION은 행동패턴으로 이동
+        # Education detection - 제거됨 (행동패턴으로 이동)
+        # edu_found = self._match_education(text)
+        # ...
 
-        # Income detection (범위 조건 지원)
-        income_found = self._match_income(text)
-        if income_found is not None:
-            matched_ranges, synonyms = income_found
-            # ⭐ "200만원 이상" 같은 범위 조건은 여러 구간을 매칭할 수 있음
-            for canon, value in matched_ranges:
-                demographics.append(
-                    DemographicEntity(
-                        entity_type=EntityType.DEMOGRAPHIC,
-                        name="소득",
-                        canonical_form="income",
-                        demographic_type=DemographicType.INCOME,
-                        value=value,
-                        raw_value=canon,
-                        synonyms=set(synonyms),
-                        confidence=1.0,
-                    )
-                )
+        # ⚠️ INCOME, FAMILY_SIZE는 행동패턴으로 이동 (직업/직무는 demographic 유지)
+        # Income detection (범위 조건 지원) - 제거됨 (행동패턴으로 이동)
+        # income_found = self._match_income(text)
+        # if income_found is not None:
+        #     matched_ranges, synonyms = income_found
+        #     # ⭐ "200만원 이상" 같은 범위 조건은 여러 구간을 매칭할 수 있음
+        #     for canon, value in matched_ranges:
+        #         demographics.append(
+        #             DemographicEntity(
+        #                 entity_type=EntityType.DEMOGRAPHIC,
+        #                 name="소득",
+        #                 canonical_form="income",
+        #                 demographic_type=DemographicType.INCOME,
+        #                 value=value,
+        #                 raw_value=canon,
+        #                 synonyms=set(synonyms),
+        #                 confidence=1.0,
+        #             )
+        #         )
 
-        # Family size detection
-        family_found = self._match_family_size(text)
-        if family_found is not None:
-            canon, value, synonyms = family_found
-            demographics.append(
-                DemographicEntity(
-                    entity_type=EntityType.DEMOGRAPHIC,
-                    name="가족수",
-                    canonical_form="family_size",
-                    demographic_type=DemographicType.FAMILY_SIZE,
-                    value=value,
-                    raw_value=canon,
-                    synonyms=set(synonyms),
-                    confidence=1.0,
-                )
-            )
+        # Family size detection - 제거됨 (행동패턴으로 이동)
+        # family_found = self._match_family_size(text)
+        # if family_found is not None:
+        #     canon, value, synonyms = family_found
+        #     demographics.append(
+        #         DemographicEntity(
+        #             entity_type=EntityType.DEMOGRAPHIC,
+        #             name="가족수",
+        #             canonical_form="family_size",
+        #             demographic_type=DemographicType.FAMILY_SIZE,
+        #             value=value,
+        #             raw_value=canon,
+        #             synonyms=set(synonyms),
+        #             confidence=1.0,
+        #         )
+        #     )
 
-        # Job function detection
+        # Job function detection (유지 - demographic으로 처리)
         job_func_found = self._match_job_function(text)
         if job_func_found is not None:
             canon, value, synonyms = job_func_found
@@ -677,5 +644,3 @@ class DemographicExtractor:
             sub_region = match.group(1) + match.group(2)  # "연수" + "구" = "연수구"
             return sub_region
         return None
-
-

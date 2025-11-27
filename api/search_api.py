@@ -125,11 +125,13 @@ class PanelDataCache:
                     qa_pairs = []
 
                 # ⭐ Occupation 사전 추출
-                occupation_value = None
+                # 우선순위: metadata > qa_pairs
+                occupation_value = metadata.get("occupation")
 
                 # 🔍 디버그: 첫 3개 문서의 qa_pairs 구조 확인
                 if idx < 3:
                     logger.info(f"\n🔍 [DEBUG] Document #{idx}: user_id={source.get('user_id')}")
+                    logger.info(f"   - metadata occupation: {occupation_value}")
                     logger.info(f"   - qa_pairs type: {type(qa_pairs)}")
                     logger.info(f"   - qa_pairs count: {len(qa_pairs)}")
                     if qa_pairs and len(qa_pairs) > 0:
@@ -142,13 +144,20 @@ class PanelDataCache:
                                 q_text_raw = qa.get("q_text", "") or qa.get("question", "") or qa.get("question_text", "") or ""
                                 logger.info(f"   - Q{i+1}: '{q_text_raw[:100]}'")  # 처음 100자만
 
-                if qa_pairs:
+                # ⭐ metadata에 없으면 qa_pairs에서 occupation 찾기
+                if not occupation_value and qa_pairs:
                     for qa in qa_pairs:
                         if not isinstance(qa, dict):
                             continue
                         # ⭐ 수정: 실제 키는 'q_text'
                         q_text = str(qa.get("q_text", "") or qa.get("question", "") or qa.get("question_text", "")).lower()
-                        if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
+                        # ⭐⭐⭐ occupation 키워드 확장 (더 다양한 질문 패턴 지원)
+                        occupation_keywords = (
+                            "직업", "직무", "occupation", "직종",
+                            "하고 있는 일", "무슨 일", "업종", "종사",
+                            "job", "work", "현재 직", "job_function"
+                        )
+                        if any(keyword in q_text for keyword in occupation_keywords):
                             answer = qa.get("answer") or qa.get("answer_text")
                             if answer:
                                 occupation_value = str(answer).strip()
@@ -292,7 +301,7 @@ class PanelDataCache:
         sub_region: Optional[str] = None,
         occupation: Optional[str] = None,
         marital_status: Optional[str] = None,
-        behavioral_conditions: Optional[Dict[str, Union[bool, str]]] = None,
+        behavioral_conditions: Optional[Dict[str, Union[bool, str, List[str]]]] = None,
     ) -> pd.DataFrame:
         """⚡ Pandas 벡터화 필터링 (초고속 - metadata + occupation + marital + behavioral 전부!)
 
@@ -349,9 +358,37 @@ class PanelDataCache:
                         # ⭐ Boolean 체크 (벡터화!)
                         mask &= (self.df[behavior_key] == expected_value)
                     elif isinstance(expected_value, list):
-                        # ⭐⭐⭐ 다중 값 (리스트): OR 조건 (isin 사용!)
-                        mask &= self.df[behavior_key].isin(expected_value)
-                        logger.info(f"  🔍 다중 값 필터링 (Panel cache): {behavior_key} IN {expected_value}")
+                        # ⭐⭐⭐ 다중 값 (리스트): OR 조건
+                        # 🔍 디버그: Panel cache에 저장된 고유값 확인
+                        unique_values = self.df[behavior_key].dropna().unique()
+                        logger.info(
+                            f"  🔍 [DEBUG] {behavior_key} 필터링 시작:"
+                        )
+                        logger.info(f"     - 요청된 값 (리스트): {expected_value}")
+                        logger.info(f"     - Panel cache 고유값 ({len(unique_values)}개): {list(unique_values)[:20]}")  # 처음 20개만
+
+                        # 정확 일치 먼저 시도
+                        exact_match = self.df[behavior_key].isin(expected_value)
+
+                        # 부분 매칭: 각 값에 대해 부분 매칭 시도 (OR 조건)
+                        partial_match = pd.Series([False] * len(self.df))
+                        for expected in expected_value:
+                            if expected:
+                                # 각 값에 대해 부분 매칭 시도 (OR로 결합)
+                                match_this = self.df[behavior_key].notna() & \
+                                            self.df[behavior_key].astype(str).str.contains(
+                                                str(expected), case=False, na=False, regex=False
+                                            )
+                                partial_match |= match_this
+                                logger.info(f"     - '{expected}' 부분 매칭: {match_this.sum()}건")
+
+                        # 정확 일치 OR 부분 매칭 (둘 중 하나라도 매칭되면 OK)
+                        behavior_mask = exact_match | partial_match
+                        mask &= behavior_mask  # ✅ 키 간 AND, 값 내 OR
+                        logger.info(
+                            f"  🔍 다중 값 필터링 (Panel cache): {behavior_key} IN {expected_value} "
+                            f"(정확 매칭: {exact_match.sum()}건, 부분 매칭: {partial_match.sum()}건, 총 매칭: {behavior_mask.sum()}건)"
+                        )
                     elif isinstance(expected_value, str):
                         # ⭐ 정확 매칭 먼저 시도
                         exact_match = (self.df[behavior_key] == expected_value)
@@ -2353,12 +2390,35 @@ def classify_answer_value_with_llm(
     # System prompt (스마트 다중 선택 - 빈도 기준표 포함!)
     system_prompt = f"""당신은 사용자의 입력을 정확하게 분류하는 전문가입니다.
 
-사용자의 입력이 다음 질문에 대한 답변으로 어디에 해당하는지 정확히 분류해주세요.
+⚠️ **오타 처리 규칙**:
+
+1. ⭐ **경미한 오타는 수정**: "3계" → "3개", "맥쥬" → "맥주"
+
+2. ⭐ **의미가 명확하면 인식**: "혼밥" = "혼자 식사"
+
+3. ⚠️ **숫자 오타는 신중**: "2개"와 "3개"는 다름 (문맥으로 판단)
+
+4. ⭐ **다양한 표현 허용**: "자주" = "종종" = "꽤 자주"
+
+📌 **숫자 정확도 우선**:
+
+- "2개 이상" ≠ "3개 이상" (명확히 다름)
+
+- 하지만 "2계 이상" = "2개 이상" (오타 수정)
 
 **질문**: {question_text}
 
 **가능한 답변 옵션**:
+
 {options_text}
+
+⚠️ 규칙:
+
+- 오타를 수정하여 가장 적합한 옵션 선택
+
+- 숫자는 정확히 매칭 (단, 오타는 수정)
+
+- 의미가 명확하면 표현이 달라도 매칭
 
 **🚨 분류 규칙**:
 1. ⭐ **사용자 입력의 의미를 정확히 파악**하세요.
@@ -2827,7 +2887,7 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, Union[bool, str, L
 
         # ⭐ 다중 값 (리스트) 처리: OR 조건
         if isinstance(value, list):
-            # 리스트 값: 여러 답변 중 하나라도 매칭 (OR 조건)
+            # ✅ 모든 값을 하나의 should 조건으로 통합!
             answer_should = []
             answer_values = keyword_config.get('answer_values', {})
 
@@ -2840,7 +2900,10 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, Union[bool, str, L
                     for kw in answer_values[v]:
                         answer_should.append({"match": {"qa_pairs.answer": kw}})
 
-            logger.info(f"  🔍 다중 값 필터 생성: {key} IN {value} → {len(answer_should)}개 조건")
+            logger.info(
+                f"  🔍 다중 값 필터 생성: {key} IN {value} "
+                f"→ {len(answer_should)}개 OR 조건"
+            )
 
         # ⭐ 단일 문자열 값 처리
         elif isinstance(value, str):
@@ -2873,7 +2936,8 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, Union[bool, str, L
                     for kw in negative_keywords
                 ]
 
-        # OpenSearch nested 필터 생성 (must_not 제거)
+        # ✅ 하나의 nested 필터로 통합 (내부는 OR)
+        # 각 behavior_key는 별도의 nested 필터로 생성 → 키 간 AND 조건
         filters.append({
             "nested": {
                 "path": "qa_pairs",
@@ -2888,7 +2952,7 @@ def build_behavioral_filters(behavioral_conditions: Dict[str, Union[bool, str, L
                             },
                             {
                                 "bool": {
-                                    "should": answer_should,
+                                    "should": answer_should,  # ✅ 모든 값이 OR
                                     "minimum_should_match": 1
                                 }
                             }
@@ -3191,7 +3255,7 @@ class NLSearchRequest(BaseModel):
         default="survey_responses_merged",
         description="검색할 인덱스 이름 (기본값: survey_responses_merged; 와일드카드 사용 가능)"
     )
-    size: int = Field(default=30000, ge=1, le=50000, description="반환할 결과 개수 (쿼리에서 추출된 인원 수가 없을 때 사용, 전체 데이터 약 35000개)")
+    size: int = Field(default=35000, ge=1, le=50000, description="반환할 결과 개수 (쿼리에서 추출된 인원 수가 없을 때 사용, 전체 데이터 약 35000개)")
     use_vector_search: bool = Field(default=True, description="벡터 검색 사용 여부")
     page: int = Field(default=1, ge=1, description="요청할 페이지 번호 (1부터 시작)")
     use_claude_analyzer: Optional[bool] = Field(
@@ -3562,7 +3626,7 @@ async def search_natural_language(
        
         extracted_entities, requested_size = extractor.extract_with_size(
             request.query, 
-            default_size=getattr(request, "size", 30000),  
+            default_size=getattr(request, "size", 35000),  
             max_size=60000
         )
 
@@ -3647,10 +3711,10 @@ async def search_natural_language(
 
         # ⭐ page_size 결정: 
         # 1. 쿼리에서 명시적으로 인원 수를 추출한 경우 (예: "300명") → 추출된 값 사용
-        # 2. 쿼리에서 인원 수를 추출하지 못한 경우 → request.size 사용 (기본값 30000)
+        # 2. 쿼리에서 인원 수를 추출하지 못한 경우 → request.size 사용 (기본값 35000)
         # 
         # requested_size가 request.size와 같으면 쿼리에서 추출하지 못한 것으로 간주
-        request_size = getattr(request, "size", 30000)
+        request_size = getattr(request, "size", 35000)
         if requested_size is not None and requested_size > 0:
             # 쿼리에서 명시적으로 추출한 경우 (request.size와 다름)
             if requested_size != request_size:
@@ -3827,9 +3891,9 @@ async def search_natural_language(
             # match_all/match_none/None 제거
             removed_type = "None" if existing_query is None else ("match_all" if existing_query == {"match_all": {}} else "match_none")
             
-            # ⭐ 키워드가 있으면 키워드 쿼리 생성 (필터만 있는 경우를 위해)
+           
             if analysis.must_terms or analysis.should_terms:
-                # 키워드 쿼리 재생성
+               
                 keyword_queries = []
                 if analysis.must_terms:
                     for term in analysis.must_terms:
@@ -4940,7 +5004,7 @@ async def search_natural_language(
                                 normalized_answers = {normalize_value(ans) for ans in answers if ans}
 
                                 if q_text and normalized_answers:
-                                    if any(keyword in q_text_raw for keyword in ("직업", "직무", "occupation")):
+                                    if any(keyword in q_text_raw for keyword in ("직업", "occupation", "직종")):
                                         # ⭐ occupation 정규화: 괄호 이전 부분만 추출
                                         # 예: "전문직 (의사, 간호사...)" → "전문직"
                                         cleaned_occupations = set()
@@ -4996,7 +5060,7 @@ async def search_natural_language(
 
                             # Occupation 찾기
                             if needs_occupation and not display_occupation:
-                                if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
+                                if any(keyword in q_text for keyword in ("직업", "occupation", "직종")):
                                     answer = qa.get("answer")
                                     if answer is None:
                                         answer = qa.get("answer_text")
@@ -5617,7 +5681,7 @@ async def search_natural_language(
                             answer_text = qa.get("answer") or qa.get("answer_text")
                             if not answer_text:
                                 continue
-                            if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
+                            if any(keyword in q_text for keyword in ("직업", "occupation", "직종")):
                                 normalized_answer = normalize_value(answer_text)
                                 if normalized_answer:
                                     doc_values[DemographicType.OCCUPATION].add(normalized_answer)
@@ -5746,13 +5810,13 @@ async def search_natural_language(
                             qa_sources: List[List[Dict[str, Any]]] = []
                             if isinstance(source, dict):
                                 qa_sources.append(source.get("qa_pairs", []) or [])
-                            # ⭐ survey_responses_merged만 사용하므로 welcome_2nd_doc_full 제거
+                            
                             for qa_pairs in qa_sources:
                                 for qa in qa_pairs:
                                     if not isinstance(qa, dict):
                                         continue
                                     q_text = str(qa.get("q_text", "")).lower()
-                                    if not any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")):
+                                    if not any(keyword in q_text for keyword in ("직업", "occupation", "직종")):
                                         continue
                                     answer = qa.get("answer")
                                     if answer is None:
@@ -5923,9 +5987,17 @@ async def search_natural_language(
                     if answer is None:
                         continue
                     answer_str = str(answer)
-                    if any(keyword in q_text for keyword in ("직업", "직무", "occupation", "직종")) and occupation_matches(answer_str):
-                        demographic_info["occupation"] = answer_str
-                        break
+                    # ⭐ occupation_expected가 있으면 필터링, 없으면 그냥 사용
+                    if any(keyword in q_text for keyword in ("직업", "occupation", "직종")):
+                        if occupation_expected:
+                            # 필터링이 있을 때만 occupation_matches 체크
+                            if occupation_matches(answer_str):
+                                demographic_info["occupation"] = answer_str
+                                break
+                        else:
+                            # 필터링이 없으면 그냥 사용
+                            demographic_info["occupation"] = answer_str
+                            break
 
             # marital_status를 qa_pairs에서 찾기
             if ("marital_status" not in demographic_info or not demographic_info["marital_status"]) and isinstance(source, dict):
@@ -6069,12 +6141,12 @@ async def search_natural_language(
         # ⭐ requested_count 설정:
         # - 쿼리에서 size가 명시되면 (예: "전문직 100명") → requested_size 값
         #   단, 실제 반환된 결과 수(total_hits)보다 크면 total_hits로 제한
-        # - size가 없으면 (예: "전문직") → page_size 사용 (기본값 30000)
+        # - size가 없으면 (예: "전문직") → page_size 사용 (기본값 35000)
         if requested_size is not None and requested_size > 0:
             # 실제 반환된 결과 수를 초과하지 않도록 제한
             requested_count = min(requested_size, total_hits)
         else:
-            # size가 없으면 page_size 사용 (기본값 30000)
+            # size가 없으면 page_size 사용 (기본값 35000)
             requested_count = min(page_size, total_hits)
         
         if cache_enabled and cache_key and stored_items:

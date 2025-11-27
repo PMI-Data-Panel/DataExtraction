@@ -335,40 +335,11 @@ class DemographicEntity(BaseEntity):
                     "군", "시", "세부지역", "어느 구"
                 ]
             },
-            DemographicType.EDUCATION: {
-                "field": "metadata.education.keyword",
-                "qa_questions": [
-                    "최종학력",  # welcome_2nd: "최종학력"
-                    "학력", "education", "학위"
-                ]
-            },
             DemographicType.MARITAL_STATUS: {
                 "field": "metadata.marital_status.keyword",
                 "qa_questions": [
                     "결혼여부",  # welcome_2nd: "결혼여부"
                     "결혼 여부", "혼인", "marital"
-                ]
-            },
-            DemographicType.INCOME: {
-                "field": "metadata.income.keyword",
-                "qa_questions": [
-                    "월평균 개인소득",  # welcome_2nd: "월평균 개인소득"
-                    "월평균 가구소득",  # welcome_2nd: "월평균 가구소득"
-                    "소득", "income", "급여", "연봉"
-                ]
-            },
-            DemographicType.FAMILY_SIZE: {
-                "field": "metadata.family_size.keyword",
-                "qa_questions": [
-                    "가족수",  # welcome_2nd: "가족수"
-                    "가족 수", "family_size", "가구원수"
-                ]
-            },
-            DemographicType.CHILDREN_COUNT: {
-                "field": "metadata.children_count.keyword",
-                "qa_questions": [
-                    "자녀수",  # welcome_2nd: "자녀수"
-                    "자녀 수", "children", "아이 수"
                 ]
             },
         }
